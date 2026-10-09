@@ -1,0 +1,541 @@
+# CI for the public repository, on GitHub-hosted runners only.
+#
+# Pull requests from forks run this workflow, so it must never run on a
+# self-hosted runner. Every job gets a read-only token, no job pushes or
+# publishes anything, and the one secret (the name denylist) is read by one
+# step, which pull requests without repository secrets skip. What each job
+# runs, and the same commands locally: docs/ops/verification.md.
+#
+# Every action is pinned to a full commit sha, the comment naming its
+# release, and each service image to a digest.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A new push to a pull request supersedes its older run. A run on main is
+  # never cancelled, so every commit on main is checked in full.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The uv that wrote uv.lock. `uv sync --locked` fails when the lockfile does
+  # not match pyproject.toml, and installs exactly the versions it pins.
+  UV_VERSION: "0.11.17"
+
+jobs:
+  backend:
+    name: Backend Lint & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16.6-alpine@sha256:1d04b9ba1d4996401f2552b51beda8187f175c0645c091e4781134fc9c9a3eef
+        env:
+          POSTGRES_USER: embry0
+          POSTGRES_PASSWORD: embry0_ci
+          POSTGRES_DB: embry0_unit_test
+        # Over TCP: on first start the image runs a socket-only server, which
+        # a bare pg_isready reports as ready before the real server starts.
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U embry0 -d embry0_unit_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      # The fixtures drop and recreate the public schema for each test, so
+      # this must be a database nothing else uses: here, the job's own service.
+      TEST_DATABASE_URL: postgresql://embry0:embry0_ci@localhost:5432/embry0_unit_test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Ruff check
+        run: uv run --no-sync ruff check .
+
+      - name: Ruff format check
+        run: uv run --no-sync ruff format --check .
+
+      - name: Verify app imports
+        run: uv run --no-sync python -c "from embry0.api.app import create_app; print('OK')"
+
+      - name: Run unit tests
+        run: uv run --no-sync pytest tests/unit/ -v --tb=short --timeout=30
+
+  build-images:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: orchestrator
+            dockerfile: infra/Dockerfile.orchestrator
+            context: .
+          - name: sandbox
+            dockerfile: infra/Dockerfile.sandbox
+            context: .
+          - name: proxy
+            dockerfile: infra/Dockerfile.proxy
+            context: .
+          - name: frontend
+            dockerfile: frontend/Dockerfile
+            context: frontend
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # Images stay on the runner (push: false). The layer cache is the
+      # Actions cache, where a pull request's run writes only its own scope.
+      - name: Build ${{ matrix.name }}
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          tags: embry0-${{ matrix.name }}:ci
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  build-qa-sandbox-image:
+    name: Build QA sandbox image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build embry0-sandbox-qa
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: infra/Dockerfile.sandbox.qa
+          tags: embry0-sandbox-qa:latest
+          push: false
+          load: true
+          cache-from: type=gha,scope=sandbox-qa
+          cache-to: type=gha,mode=max,scope=sandbox-qa
+
+      - name: Smoke-test runtimes
+        run: |
+          docker run --rm embry0-sandbox-qa:latest bash -c '
+            java -version 2>&1 &&
+            node --version &&
+            python --version &&
+            docker --version &&
+            docker compose version &&
+            playwright --version &&
+            vibium --version
+          '
+
+      - name: Smoke-test vibium headless browser (no egress)
+        # Proves the vibium backend can drive its baked Chrome for Testing
+        # with zero network access (sandboxes have no internet egress at job
+        # time), both as the default non-root agent user (the real runtime
+        # path — the daemon chmods its socket dir, which therefore must be
+        # agent-OWNED, not merely a+rwX; see the Dockerfile) and as root
+        # (worst case in DinD; needs --no-sandbox, injected per job by the
+        # orchestrator — see browser_backends.py).
+        run: |
+          smoke() {
+            docker run --rm --network none "$@" \
+              -e VIBIUM_CHROME_ARGS=--no-sandbox \
+              embry0-sandbox-qa:latest bash -c '
+              echo "<h1>embry0 vibium smoke ($(whoami))</h1>" > /tmp/smoke.html &&
+              vibium --headless screenshot file:///tmp/smoke.html -o /tmp/smoke.png &&
+              test -s /tmp/smoke.png
+            '
+          }
+          smoke              # the image's default user
+          smoke --user root
+
+      - name: Smoke-test embry0-trust-ca (private CA, public CAs still trusted)
+        # Spec 1A 3.2. Mints a throwaway CA, feeds it to the helper on stdin
+        # exactly as SandboxManager does, and asserts the result is the SYSTEM
+        # bundle plus that one cert — not the cert alone. GIT_SSL_CAINFO
+        # replaces git's trust store, so "private CA trusted" and "github.com
+        # still trusted" are two separate claims and both are checked: the
+        # ls-remote runs with the merged bundle as git's only trust root.
+        run: |
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout /dev/null \
+            -out /tmp/embry0-ci-ca.pem -days 1 -subj "/CN=embry0-ci-test-ca" 2>/dev/null
+          docker run --rm -i -e GIT_TERMINAL_PROMPT=0 embry0-sandbox-qa:latest bash -c '
+            set -euo pipefail
+            bundle="$(embry0-trust-ca)"
+            test "$bundle" = /home/agent/.embry0/ca-bundle.pem
+            test "$(stat -c %U "$bundle")" = agent
+            test "$(stat -c %a "$bundle")" = 644
+            system=$(grep -c "BEGIN CERTIFICATE" /etc/ssl/certs/ca-certificates.crt)
+            merged=$(grep -c "BEGIN CERTIFICATE" "$bundle")
+            test "$merged" -eq "$((system + 1))"
+            openssl crl2pkcs7 -nocrl -certfile "$bundle" \
+              | openssl pkcs7 -print_certs -noout \
+              | grep -q "embry0-ci-test-ca"
+            GIT_SSL_CAINFO="$bundle" git ls-remote https://github.com/octocat/Hello-World.git HEAD >/dev/null
+            echo "embry0-trust-ca smoke OK"
+          ' < /tmp/embry0-ci-ca.pem
+
+  alert-rules:
+    name: Alert rule tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: promtool test rules
+        run: >-
+          docker run --rm -v "$PWD/infra/prometheus:/rules:ro" -w /rules --entrypoint promtool
+          prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+          test rules offhost-backup.rules.test.yml
+
+  mypy:
+    name: Mypy type-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Mypy
+        run: uv run --no-sync mypy embry0 embry0_mcp
+
+  tofu:
+    name: OpenTofu modules
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: 1.13.1
+          tofu_wrapper: false
+
+      - name: Format
+        run: tofu fmt -check -recursive infra/tofu
+
+      - name: Validate
+        run: |
+          for d in infra/tofu/modules/* infra/tofu/examples; do
+            (cd "$d" && tofu init -backend=false -input=false >/dev/null && tofu validate) || exit 1
+          done
+
+      # Mocked providers: no credentials, nothing contacts Cloudflare or Proxmox.
+      - name: Test
+        run: |
+          (cd infra/tofu/modules/cloudflare-tunnel && tofu test)
+          (cd infra/tofu/modules/proxmox-vm && tofu test)
+          (cd infra/tofu/examples && tofu test -var-file=terraform.tfvars.example)
+
+  frontend:
+    name: Frontend Build & Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # tsconfig.json only references tsconfig.app.json (files: []), so a
+      # plain `tsc --noEmit` checks no file. Build mode follows the reference.
+      - name: TypeScript check
+        run: npx tsc -b
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm run test -- --run
+
+      - name: Build
+        run: npm run build
+
+  security:
+    name: Security scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [build-images]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0  # gitleaks needs full history
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # Re-build images from cache (fast; GHA cache populated by build-images job)
+      - name: Restore orchestrator image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: infra/Dockerfile.orchestrator
+          push: false
+          tags: embry0-orchestrator:ci
+          load: true
+          cache-from: type=gha,scope=orchestrator
+
+      - name: Restore sandbox image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: infra/Dockerfile.sandbox
+          push: false
+          tags: embry0-sandbox:ci
+          load: true
+          cache-from: type=gha,scope=sandbox
+
+      - name: Restore proxy image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: infra/Dockerfile.proxy
+          push: false
+          tags: embry0-proxy:ci
+          load: true
+          cache-from: type=gha,scope=proxy
+
+      - name: Restore frontend image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: frontend
+          file: frontend/Dockerfile
+          push: false
+          tags: embry0-frontend:ci
+          load: true
+          cache-from: type=gha,scope=frontend
+
+      - name: Hadolint — orchestrator
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: infra/Dockerfile.orchestrator
+          config: .hadolint.yaml
+          failure-threshold: warning
+
+      - name: Hadolint — sandbox
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: infra/Dockerfile.sandbox
+          config: .hadolint.yaml
+          failure-threshold: warning
+
+      - name: Hadolint — proxy
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: infra/Dockerfile.proxy
+          config: .hadolint.yaml
+          failure-threshold: warning
+
+      - name: Hadolint — frontend
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: frontend/Dockerfile
+          config: .hadolint.yaml
+          failure-threshold: warning
+
+      - name: Trivy — orchestrator
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: embry0-orchestrator:ci
+          format: table
+          # Gate on fixable CRITICALs only: ignore-unfixed drops distro
+          # will-not-fix CVEs (perl, zlib1g); fixable HIGHs are dependency
+          # bumps handled as their own work, not merge blockers.
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL
+
+      - name: Trivy — sandbox
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: embry0-sandbox:ci
+          format: table
+          # Gate on fixable CRITICALs only: ignore-unfixed drops distro
+          # will-not-fix CVEs (perl, zlib1g); fixable HIGHs are dependency
+          # bumps handled as their own work, not merge blockers.
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL
+
+      - name: Trivy — proxy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: embry0-proxy:ci
+          format: table
+          # Gate on fixable CRITICALs only: ignore-unfixed drops distro
+          # will-not-fix CVEs (perl, zlib1g); fixable HIGHs are dependency
+          # bumps handled as their own work, not merge blockers.
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL
+
+      - name: Trivy — frontend
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: embry0-frontend:ci
+          format: table
+          # Gate on fixable CRITICALs only: ignore-unfixed drops distro
+          # will-not-fix CVEs (perl, zlib1g); fixable HIGHs are dependency
+          # bumps handled as their own work, not merge blockers.
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL
+
+      # gitleaks/gitleaks-action@v2 requires a paid license for org accounts.
+      # Run the open-source CLI directly instead — same scanner, no license.
+      # The download must match the sha256 the release's checksums file gives.
+      - name: gitleaks (open-source CLI)
+        env:
+          GITLEAKS_VERSION: 8.18.4
+          GITLEAKS_SHA256: ba6dbb656933921c775ee5a2d1c13a91046e7952e9d919f9bac4cec61d628e7d
+        run: |
+          set -euo pipefail
+          tarball="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -sSfL -o "$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum --check --strict
+          tar -xzf "$tarball" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" detect \
+            --config .gitleaks.toml \
+            --source . \
+            --redact \
+            --no-banner \
+            --verbose
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [build-images]
+    services:
+      postgres:
+        image: postgres:16.6-alpine@sha256:1d04b9ba1d4996401f2552b51beda8187f175c0645c091e4781134fc9c9a3eef
+        env:
+          POSTGRES_USER: embry0
+          POSTGRES_PASSWORD: embry0_ci
+          POSTGRES_DB: embry0_integration_test
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U embry0 -d embry0_integration_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      TEST_DATABASE_URL: postgresql://embry0:embry0_ci@localhost:5432/embry0_integration_test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # The requires_docker tests run this image on the runner's own daemon.
+      - name: Restore proxy image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: infra/Dockerfile.proxy
+          push: false
+          tags: embry0-proxy:latest
+          load: true
+          cache-from: type=gha,scope=proxy
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      # Tests that need MinIO, a DinD endpoint, a throwaway isolation daemon
+      # or the JVM sandbox image skip, each with its reason in the log.
+      - name: Run integration tests
+        run: uv run --no-sync pytest tests/integration/ -v --tb=short --timeout=120
+
+  denylist:
+    name: Name denylist
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # GitHub gives no repository secrets to a pull request from a fork or
+      # from Dependabot, so there the check would find no denylist and exit 2.
+      # Those runs skip it and say so in a notice. A push to main always runs
+      # it, and so does a pull request from a branch of this repository.
+      NO_SECRETS: >-
+        ${{ github.event_name == 'pull_request' &&
+        (github.event.pull_request.head.repo.full_name != github.repository ||
+        github.event.pull_request.user.login == 'dependabot[bot]') }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Name denylist skipped (pull request without repository secrets)
+        if: env.NO_SECRETS == 'true'
+        run: >-
+          echo "::notice title=Name denylist not run::A pull request from a fork or from
+          Dependabot gets no repository secrets, so the name denylist did not run.
+          It runs on every push to main."
+
+      - name: Name denylist
+        if: env.NO_SECRETS != 'true'
+        env:
+          DENYLIST: ${{ secrets.EMBRY0_DENYLIST }}
+        # Exit 2 (nothing checked, e.g. the secret is unset) fails the step,
+        # as a match does.
+        run: |
+          umask 077
+          printf '%s\n' "$DENYLIST" > "$RUNNER_TEMP/denylist.txt"
+          EMBRY0_DENYLIST_FILE="$RUNNER_TEMP/denylist.txt" python3 scripts/check_denylist.py

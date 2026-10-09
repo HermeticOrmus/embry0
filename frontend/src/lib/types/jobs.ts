@@ -1,0 +1,142 @@
+export type JobStatus = "pending" | "running" | "completed" | "failed" | "partial" | "cancelled" | "awaiting_input" | "pr_merged" | "pr_closed" | "paused" | "expired";
+export type TraceResult = "pass" | "fail" | "partial" | "error" | "timeout" | "budget_exceeded";
+
+/** Every JobStatus, in board-lane order. The `satisfies` + Record guard makes
+ * adding a status to the union a build error HERE instead of a silently stale
+ * filter dropdown (the pre-RAV-1058 failure mode: JobsPage and ConsolePage
+ * each hand-rolled diverging lists). */
+export const ALL_JOB_STATUSES = [
+  "awaiting_input",
+  "paused",
+  "pending",
+  "running",
+  "completed",
+  "pr_merged",
+  "failed",
+  "partial",
+  "cancelled",
+  "expired",
+  "pr_closed",
+] as const satisfies readonly JobStatus[];
+// Exhaustiveness: fails to typecheck if ALL_JOB_STATUSES misses a union member.
+type _MissingStatuses = Exclude<JobStatus, (typeof ALL_JOB_STATUSES)[number]>;
+const _exhaustive: _MissingStatuses extends never ? true : never = true;
+void _exhaustive;
+
+/** Mirrors the backend `JobResponse` (embry0/api/schemas/__init__.py) —
+ * RAV-1058 staleness sweep dropped the phantom fields the API never returned
+ * (tier, provider_mode, model, attempts, validation_summary, pipeline_graph,
+ * pipeline_source, template_id). */
+export type DeliveryState = "none" | "pr_open" | "merged" | "closed";
+
+export interface JobResponse {
+  job_id: string;
+  status: JobStatus;
+  /** Null for non-git jobs (http/local/none contexts). */
+  repo: string | null;
+  task: string;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  issue_number: number | null;
+  // Internal issues-table FK. NULL means the job did not originate from an
+  // embry0 issue (operator/API dispatch) — the Console board's explicit
+  // operator-job signal.
+  issue_id?: string | null;
+  // Latest workflow stage persisted by the executor at each node transition.
+  // NULL for legacy rows and jobs that never streamed one. Lets board cards
+  // show a stage badge from the poll alone when the WS is down.
+  current_stage?: string | null;
+  pipeline_template?: string | null;
+  sandbox_profile?: string | null;
+  pr_url: string | null;
+  /**
+   * What became of the job's pull request — independent of `status` (#280).
+   * A string, not a union: an unknown value from a newer backend must render,
+   * not crash. Optional for back-compat with cached responses.
+   */
+  delivery_state?: DeliveryState | (string & {});
+  /** The forge's time of that state; null until merge sync has confirmed it. */
+  delivery_state_at?: string | null;
+  error_message: string | null;
+  error_code?: string | null;
+  total_cost_usd: number;
+  budget_overrun_usd?: number;
+  pipeline_config?: Record<string, unknown> | null;
+  trace_id?: string | null;
+  job_kind?: string | null;
+  result_summary?: string | null;
+  /** Per-(agent, model) rollup from traces (GET /jobs/{id} only). EMB-35 adds token sums. */
+  cost_breakdown?: CostBreakdownEntry[];
+  /** #281: the job's most recent errored agent runs (GET /jobs/{id} only). */
+  agent_failures?: AgentFailure[];
+}
+
+/** Why one agent run errored. `stderr_tail` is redacted and capped server-side. */
+export interface AgentFailure {
+  trace_id: string;
+  agent_type: string;
+  model?: string | null;
+  // Plain string, not a union: the server adds codes faster than the UI ships.
+  error_code?: string | null;
+  result_summary?: string | null;
+  stderr_tail?: string | null;
+  created_at?: string | null;
+}
+
+export interface CostBreakdownEntry {
+  agent_type: string;
+  model: string;
+  runs: number;
+  cost_usd: number;
+  duration_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+}
+
+export interface JobListResponse {
+  jobs: JobResponse[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+/** What a job operates on — mirrors the backend `JobContext` schema
+ * (embry0/api/schemas/__init__.py). Per-type field rules are enforced
+ * server-side: git needs `repo` (ref optional), http needs an http(s) `url`,
+ * local needs an absolute `path`, none takes no fields. */
+export type JobContextType = "git" | "http" | "local" | "none";
+
+export interface JobContext {
+  type: JobContextType;
+  repo?: string | null;
+  ref?: string | null;
+  url?: string | null;
+  path?: string | null;
+}
+
+/** Mirrors the backend `JobCreateRequest` (RAV-1058: the old shape carried
+ * fields the API never accepted — labels, provider_mode, pipeline_graph…). */
+export interface JobCreateRequest {
+  repo?: string | null;
+  task?: string | null;
+  issue_number?: number | null;
+  pipeline?: "issue-to-pr" | "qa" | "onboard" | null;
+  branch?: string | null;
+  context?: JobContext | null;
+  pipeline_template?: string | null;
+  sandbox_profile?: string | null;
+  max_budget_usd?: number | null;
+  additional_context?: string | null;
+  /** Per-agent model override: agent type → model id. Outranks triage. */
+  agent_models?: Record<string, string> | null;
+}
+
+export interface JobFilters {
+  status?: string;
+  repo?: string;
+  limit?: number;
+  offset?: number;
+}

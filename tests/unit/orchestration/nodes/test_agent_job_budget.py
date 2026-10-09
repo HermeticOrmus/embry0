@@ -1,0 +1,262 @@
+"""Per-job budget cap enforced inside run_agent_node (#246).
+
+`soft` records the overrun and lets the caller's routing stop the pipeline;
+`hard` aborts the run at the ceiling with ERR_BUDGET_OVERRUN.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from embry0.execution.agent_runner import AgentOutput
+from embry0.orchestration.budget import BudgetOverrunError
+from embry0.orchestration.nodes.agent import load_budget_policy, run_agent_node
+from embry0.safety.error_codes import ErrorCode, error_code_for_exception
+
+
+class _Runner:
+    def __init__(self, cost: float) -> None:
+        self._cost = cost
+
+    async def run(self, **kwargs: Any) -> AgentOutput:
+        return AgentOutput(agent_type="developer", output="done", cost_usd=self._cost)
+
+
+class _Settings:
+    def __init__(self, mode: str, ceiling: float = 0.0) -> None:
+        self.budget_overrun_mode = mode
+        self.max_budget_usd = ceiling
+
+
+def _config(mode: str, db: Any = None, ceiling: float = 0.0) -> dict[str, Any]:
+    return {"configurable": {"job_id": "J", "embry0_config": _Settings(mode, ceiling), "db": db}}
+
+
+async def _run(
+    mode: str,
+    *,
+    spent: float,
+    cost: float,
+    cap: float = 10.0,
+    db: Any = None,
+    job_mode: str | None = None,
+) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "sandbox_container_id": "c1",
+        "total_cost_usd": spent,
+        "pipeline_config": {"budget_usd": cap},
+    }
+    if job_mode is not None:
+        state["budget_overrun_mode_override"] = job_mode
+    return await run_agent_node(
+        state=state,
+        agent_runner=_Runner(cost),
+        agent_type="developer",
+        prompt="implement",
+        credentials={"api_key": "", "oauth_token": "oauth-xyz"},
+        config=_config(mode, db),
+    )
+
+
+@pytest.mark.asyncio
+async def test_within_cap_records_no_overrun() -> None:
+    updates = await _run("hard", spent=1.0, cost=0.5)
+    assert updates["total_cost_usd"] == pytest.approx(1.5)
+    assert "budget_overrun_usd" not in updates
+
+
+@pytest.mark.asyncio
+async def test_soft_mode_records_the_overrun_and_continues() -> None:
+    updates = await _run("soft", spent=9.5, cost=1.0)
+    assert updates["total_cost_usd"] == pytest.approx(10.5)
+    assert updates["budget_overrun_usd"] == pytest.approx(0.5)
+    assert updates["current_stage"] == "developer_complete"
+
+
+@pytest.mark.asyncio
+async def test_hard_mode_aborts_at_the_ceiling() -> None:
+    with pytest.raises(BudgetOverrunError) as excinfo:
+        await _run("hard", spent=9.5, cost=1.0)
+    assert excinfo.value.current_cost == pytest.approx(10.5)
+    assert excinfo.value.max_budget == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_a_job_pinned_to_hard_aborts_under_a_soft_fleet_mode() -> None:
+    """#275: an unattended job opts itself into the hard stop."""
+    with pytest.raises(BudgetOverrunError):
+        await _run("soft", spent=9.5, cost=1.0, job_mode="hard")
+    with pytest.raises(BudgetOverrunError):
+        await _run("soft", spent=9.5, cost=1.0, job_mode="hard", db=_ConfigRow("soft"))
+
+
+async def _run_watcher_shaped(*, spent: float, cost: float, cap: float, ceiling: float = 0.0) -> dict[str, Any]:
+    """State as the watcher's job carries it into the triage turn: the cap
+    rides ``max_budget_usd`` and no triage ``pipeline_config`` exists yet."""
+    return await run_agent_node(
+        state={
+            "sandbox_container_id": "c1",
+            "total_cost_usd": spent,
+            "max_budget_usd": cap,
+            "budget_overrun_mode_override": "hard",
+        },
+        agent_runner=_Runner(cost),
+        agent_type="triage",
+        prompt="classify",
+        credentials={"api_key": "", "oauth_token": "oauth-xyz"},
+        config=_config("soft", ceiling=ceiling),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_watcher_shaped_job_stops_at_its_own_cap_before_triage_config_exists() -> None:
+    """#275: far under the $10 default, soft fleet mode, no pipeline_config."""
+    updates = await _run_watcher_shaped(spent=0.5, cost=1.0, cap=2.0)
+    assert "budget_overrun_usd" not in updates
+    with pytest.raises(BudgetOverrunError) as excinfo:
+        await _run_watcher_shaped(spent=1.5, cost=1.0, cap=2.0)
+    assert excinfo.value.max_budget == pytest.approx(2.0)
+    assert excinfo.value.current_cost == pytest.approx(2.5)
+
+
+@pytest.mark.asyncio
+async def test_the_lower_of_watcher_cap_and_fleet_ceiling_wins() -> None:
+    with pytest.raises(BudgetOverrunError) as excinfo:
+        await _run_watcher_shaped(spent=0.75, cost=0.5, cap=2.0, ceiling=1.0)
+    assert excinfo.value.max_budget == pytest.approx(1.0)
+    with pytest.raises(BudgetOverrunError) as excinfo:
+        await _run_watcher_shaped(spent=1.75, cost=0.5, cap=2.0, ceiling=5.0)
+    assert excinfo.value.max_budget == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_a_job_cannot_loosen_a_hard_fleet_mode() -> None:
+    """The override only tightens: `soft` (or junk) on the job is ignored."""
+    for job_mode in ("soft", "off", ""):
+        with pytest.raises(BudgetOverrunError):
+            await _run("hard", spent=9.5, cost=1.0, job_mode=job_mode)
+
+
+@pytest.mark.asyncio
+async def test_a_junk_job_mode_leaves_a_soft_fleet_mode_soft() -> None:
+    updates = await _run("soft", spent=9.5, cost=1.0, job_mode="HARDER")
+    assert updates["budget_overrun_usd"] == pytest.approx(0.5)
+
+
+def test_budget_overrun_error_maps_to_the_error_code() -> None:
+    assert error_code_for_exception(BudgetOverrunError(11.0, 10.0)) is ErrorCode.BUDGET_OVERRUN
+
+
+class _ConfigRow:
+    """Stands in for the DatabasePool BudgetConfigRepository reads through."""
+
+    def __init__(self, mode: str | None, ceiling: float = 0.0) -> None:
+        self._mode = mode
+        self._ceiling = ceiling
+
+    async def fetchrow(self, *_args: Any) -> dict[str, Any] | None:
+        if self._mode is None:
+            return None
+        return {"id": "default", "overrun_mode": self._mode, "max_budget_per_job_usd": self._ceiling}
+
+
+@pytest.mark.asyncio
+async def test_policy_prefers_the_operator_edited_row() -> None:
+    """budget_config is what the settings UI writes — it wins over env."""
+    ceiling, mode = await load_budget_policy(_config("soft", db=_ConfigRow("hard", 4.0)))
+    assert (ceiling, mode) == (4.0, "hard")
+
+
+@pytest.mark.asyncio
+async def test_policy_falls_back_to_the_app_config(monkeypatch) -> None:
+    """No DB (tests, legacy callers) → Settings.{max_budget_usd,budget_overrun_mode}."""
+    monkeypatch.delenv("BUDGET_OVERRUN_MODE", raising=False)
+    assert await load_budget_policy(_config("hard", db=None, ceiling=3.0)) == (3.0, "hard")
+
+
+@pytest.mark.asyncio
+async def test_policy_uses_the_env_defaults_when_no_row_is_saved(monkeypatch) -> None:
+    """budget_config.get() already resolves the env defaults for an empty table."""
+    monkeypatch.setenv("BUDGET_OVERRUN_MODE", "hard")
+    monkeypatch.setenv("MAX_BUDGET_USD", "6.0")
+    assert await load_budget_policy(_config("soft", db=_ConfigRow(None))) == (6.0, "hard")
+
+
+@pytest.mark.asyncio
+async def test_policy_defaults_to_soft_and_no_ceiling_without_config() -> None:
+    assert await load_budget_policy({"configurable": {}}) == (0.0, "soft")
+    assert await load_budget_policy(None) == (0.0, "soft")
+
+
+@pytest.mark.asyncio
+async def test_the_fleet_ceiling_bounds_a_larger_per_job_cap() -> None:
+    """An operator lowering max_budget_per_job_usd must outrank triage's pick."""
+    with pytest.raises(BudgetOverrunError) as excinfo:
+        await _run("hard", spent=3.5, cost=1.0, cap=50.0, db=_ConfigRow("hard", 4.0))
+    assert excinfo.value.max_budget == pytest.approx(4.0)
+
+
+@pytest.mark.asyncio
+async def test_db_row_drives_the_hard_abort(monkeypatch) -> None:
+    """End to end: the row alone flips enforcement, with app config on soft."""
+    monkeypatch.delenv("BUDGET_OVERRUN_MODE", raising=False)
+    with pytest.raises(BudgetOverrunError):
+        await _run("soft", spent=9.5, cost=1.0, db=_ConfigRow("hard"))
+
+
+@pytest.mark.asyncio
+async def test_runner_error_code_rides_the_output_entry_not_the_state_key() -> None:
+    """#304: the code must not land on state["error_code"] — that key is
+    terminal for the whole job, and a later retry may well recover."""
+
+    class _StaleRunner:
+        async def run(self, **kwargs: Any) -> AgentOutput:
+            return AgentOutput(
+                agent_type="developer",
+                is_error=True,
+                error_message="stale image",
+                error_code=ErrorCode.SANDBOX_IMAGE_STALE.value,
+            )
+
+    updates = await run_agent_node(
+        state={"sandbox_container_id": "c1", "total_cost_usd": 0.0, "pipeline_config": {"budget_usd": 10.0}},
+        agent_runner=_StaleRunner(),
+        agent_type="developer",
+        prompt="implement",
+        credentials={"api_key": "", "oauth_token": "oauth-xyz"},
+        config=_config("soft"),
+    )
+
+    assert updates["agent_outputs"][0]["error_code"] == ErrorCode.SANDBOX_IMAGE_STALE.value
+    assert "error_code" not in updates
+
+
+@pytest.mark.asyncio
+async def test_hard_budget_abort_outranks_a_runner_error_code() -> None:
+    """Where the two meet (#304 × #322): an errored run that also crosses the
+    hard cap aborts with BudgetOverrunError → ERR_BUDGET_OVERRUN. The runner's
+    code rides the update dict, which a raise never delivers to state."""
+
+    class _CostlyStalledRunner:
+        async def run(self, **kwargs: Any) -> AgentOutput:
+            return AgentOutput(
+                agent_type="developer",
+                is_error=True,
+                error_message="exec stalled",
+                cost_usd=1.0,
+                error_code=ErrorCode.SANDBOX_EXEC_STALLED.value,
+            )
+
+    with pytest.raises(BudgetOverrunError) as excinfo:
+        await run_agent_node(
+            state={"sandbox_container_id": "c1", "total_cost_usd": 9.5, "pipeline_config": {"budget_usd": 10.0}},
+            agent_runner=_CostlyStalledRunner(),
+            agent_type="developer",
+            prompt="implement",
+            credentials={"api_key": "", "oauth_token": "oauth-xyz"},
+            config=_config("hard"),
+        )
+
+    assert error_code_for_exception(excinfo.value) == ErrorCode.BUDGET_OVERRUN

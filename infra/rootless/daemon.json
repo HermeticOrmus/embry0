@@ -1,0 +1,23 @@
+{
+  "hosts": [
+    "unix:///run/embry0-sandbox/docker.sock"
+  ],
+  "group": "0",
+  "exec-opts": [
+    "native.cgroupdriver=systemd"
+  ],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "5"
+  },
+  "live-restore": false,
+  "default-address-pools": [
+    {
+      "base": "10.213.0.0/16",
+      "size": 24
+    }
+  ],
+  "bip": "10.213.255.1/24",
+  "cgroup-parent": "embry0-sandboxes.slice"
+}

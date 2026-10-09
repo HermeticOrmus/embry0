@@ -1,0 +1,61 @@
+import { api } from "./client";
+import type {
+  CreateIssueRequest,
+  IssueDispatchResponse,
+  IssueDetailResponse,
+  IssueFilters,
+  IssueListResponse,
+  NotificationChannel,
+  UpdateIssueRequest,
+  ActivityEntry,
+} from "@/lib/types";
+
+export async function fetchIssues(filters: IssueFilters = {}): Promise<IssueListResponse> {
+  const { data } = await api.get("/issues", { params: filters });
+  return data;
+}
+
+export async function fetchIssue(issueId: string): Promise<IssueDetailResponse> {
+  const { data } = await api.get(`/issues/${issueId}`);
+  return data;
+}
+
+export async function createIssue(req: CreateIssueRequest): Promise<IssueDispatchResponse> {
+  const { data } = await api.post("/issues", req);
+  return data;
+}
+
+export async function updateIssue(issueId: string, req: UpdateIssueRequest): Promise<IssueDetailResponse> {
+  const { data } = await api.put(`/issues/${issueId}`, req);
+  return data;
+}
+
+// Targeted setter for the per-issue notification channels. Goes through the
+// same PUT route as updateIssue (the backend uses PUT, not PATCH), but ships
+// only the channels field to keep the payload focused.
+export async function updateIssueNotificationChannels(
+  issueId: string,
+  channels: NotificationChannel[],
+): Promise<IssueDetailResponse> {
+  const { data } = await api.put(`/issues/${issueId}`, { notification_channels: channels });
+  return data;
+}
+
+export async function deleteIssue(issueId: string): Promise<void> {
+  await api.delete(`/issues/${issueId}`);
+}
+
+export async function triageIssue(issueId: string): Promise<IssueDispatchResponse> {
+  const { data } = await api.post(`/issues/${issueId}/triage`);
+  return data;
+}
+
+export async function syncIssue(issueId: string): Promise<IssueDetailResponse> {
+  const { data } = await api.post(`/issues/${issueId}/sync`);
+  return data;
+}
+
+export async function fetchIssueActivity(issueId: string): Promise<ActivityEntry[]> {
+  const { data } = await api.get(`/issues/${issueId}/activity`);
+  return data;
+}

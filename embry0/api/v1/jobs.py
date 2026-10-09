@@ -1,0 +1,350 @@
+"""Jobs API — create, list, get, cancel jobs."""
+
+import uuid
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel
+
+from embry0.api.deps import get_jobs_repo, request_actor
+from embry0.api.schemas import JobCreateRequest, JobListResponse, JobResponse, QAJobOverrides
+from embry0.api.schemas.jobs import JobResumeRequest
+from embry0.audit.helpers import emit_audit
+from embry0.services.answer_recorder import record_answer
+from embry0.storage.repositories.jobs import JobsRepository
+
+router = APIRouter()
+
+
+class AnswerJobInputRequest(BaseModel):
+    answer: str
+
+
+@router.post("/jobs", status_code=201)
+async def create_job(
+    req: JobCreateRequest, request: Request, jobs: JobsRepository = Depends(get_jobs_repo)
+) -> dict[str, Any]:
+    # RAV-1297: explicit per-agent model overrides must name enabled models —
+    # a clear 422 at submit beats the runtime tier-fallback substituting one.
+    # Fail-open when the repo isn't wired (minimal test apps).
+    provider_repo = getattr(request.app.state, "provider_repo", None)
+    if req.agent_models and provider_repo is not None:
+        from embry0.services.model_enablement import DisabledModelError, ensure_models_enabled
+
+        try:
+            await ensure_models_enabled(req.agent_models.values(), provider_repo)
+        except DisabledModelError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # QA pipeline takes a different code path: no triage, no issue, dispatched
+    # via IssueExecutor.start_job which seeds the QA initial state.
+    if req.pipeline == "qa":
+        if not req.branch:
+            raise HTTPException(status_code=400, detail="qa pipeline requires 'branch'")
+        executor = getattr(request.app.state, "issue_executor", None)
+        if executor is None:
+            raise HTTPException(status_code=503, detail="executor not initialized")
+        qa_overrides = (req.qa or QAJobOverrides()).model_dump()
+        try:
+            job_id = await executor.start_job(
+                repo=req.repo,
+                branch=req.branch,
+                pipeline="qa",
+                qa_overrides=qa_overrides,
+                agent_models=req.agent_models,
+                dispatched_by=request_actor(request),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        config = request.app.state.config
+        await emit_audit(
+            getattr(request.app.state, "db", None),
+            "qa_job_created",
+            actor=request_actor(request),
+            details={"job_id": job_id, "repo": req.repo, "branch": req.branch},
+            audit_log_path=config.audit_log_path,
+        )
+        job = await jobs.get(job_id)
+        return job or {"job_id": job_id}
+
+    # EMB-50: onboard pipeline — analyze the repo + generate its qa.yaml into
+    # the external config store. Issue-less, like qa; branch defaults to main.
+    if req.pipeline == "onboard":
+        executor = getattr(request.app.state, "issue_executor", None)
+        if executor is None:
+            raise HTTPException(status_code=503, detail="executor not initialized")
+        branch = req.branch or "main"
+        try:
+            job_id = await executor.start_onboard_job(
+                repo=req.repo,
+                branch=branch,
+                skip_smoke=req.skip_smoke,
+                agent_models=req.agent_models,
+                dispatched_by=request_actor(request),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        config = request.app.state.config
+        await emit_audit(
+            getattr(request.app.state, "db", None),
+            "onboard_job_created",
+            actor=request_actor(request),
+            details={"job_id": job_id, "repo": req.repo, "branch": branch},
+            audit_log_path=config.audit_log_path,
+        )
+        job = await jobs.get(job_id)
+        return job or {"job_id": job_id}
+
+    # Legacy issue-to-pr path. ``task`` non-empty is enforced at the schema
+    # layer (JobCreateRequest._enforce_task_for_non_qa) — assertion below is a
+    # safety net for type checkers.
+    assert req.task is not None  # noqa: S101 — schema-enforced
+
+    # Merge per-job overrides into pipeline_config so triage/dispatch can
+    # honour them downstream (see IssueExecutor._run_workflow + agent node).
+    # RAV-1058: max_budget_usd and the execution/auth mode overrides used to be
+    # accepted by the schema and silently dropped here — linear_dispatch and
+    # the dashboard both send them expecting effect.
+    effective_config = dict(req.pipeline_config) if req.pipeline_config else None
+    if req.agent_models:
+        effective_config = {**(effective_config or {}), "agent_models_override": req.agent_models}
+    if req.max_budget_usd is not None:
+        effective_config = {**(effective_config or {}), "max_budget_usd": req.max_budget_usd}
+    if req.execution_mode_override:
+        effective_config = {**(effective_config or {}), "execution_mode_override": req.execution_mode_override}
+    if req.auth_mode_override:
+        effective_config = {**(effective_config or {}), "auth_mode_override": req.auth_mode_override}
+
+    trace_id = f"trc-{uuid.uuid4().hex[:12]}"
+    job_id = await jobs.create(
+        repo=req.repo,
+        task=req.task,
+        issue_number=req.issue_number,
+        pipeline_template=req.pipeline_template,
+        pipeline_config=effective_config,
+        sandbox_profile=req.sandbox_profile,
+        trace_id=trace_id,
+        context=req.context.model_dump() if req.context else None,
+        # #246: the API principal is this job's actor — the identity the
+        # dispatch rate limit buckets on.
+        dispatched_by=request_actor(request),
+    )
+    config = request.app.state.config
+    db = getattr(request.app.state, "db", None)
+    await emit_audit(
+        db,
+        "job_created",
+        actor=request_actor(request),
+        details={"job_id": job_id, "repo": req.repo},
+        audit_log_path=config.audit_log_path,
+    )
+
+    # Dispatch the issue-to-pr workflow in the background. Without this the row
+    # would sit in `pending` forever: the direct POST /jobs path created the job
+    # but never ran it (only the issues path dispatched the workflow). The
+    # workflow tolerates a null issue_id for an issue-less, API-submitted job.
+    executor = getattr(request.app.state, "issue_executor", None)
+    if executor is None:
+        raise HTTPException(status_code=503, detail="executor not initialized")
+    executor.submit_job(
+        job_id,
+        repo=req.repo,
+        title=req.task,
+        github_number=req.issue_number,
+        additional_context=req.additional_context or "",
+    )
+
+    job = await jobs.get(job_id)
+    return job or {"job_id": job_id}
+
+
+@router.get("/jobs")
+async def list_jobs(
+    status: str | None = None,
+    repo: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    jobs: JobsRepository = Depends(get_jobs_repo),
+) -> JobListResponse:
+    rows, total = await jobs.list_all(status=status, repo=repo, limit=limit, offset=offset)
+    return JobListResponse(jobs=[JobResponse(**r) for r in rows], total=total, offset=offset, limit=limit)
+
+
+@router.get("/jobs/{job_id}")
+async def get_job(job_id: str, request: Request, jobs: JobsRepository = Depends(get_jobs_repo)) -> dict[str, Any]:
+    job = await jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    # Per-agent cost breakdown (E7 lean variant — aggregates existing traces rows).
+    traces_repo = getattr(request.app.state, "traces_repo", None)
+    if traces_repo is not None:
+        try:
+            job["cost_breakdown"] = await traces_repo.sum_by_agent_for_job(job_id)
+        except Exception:
+            import structlog
+
+            structlog.get_logger(__name__).warning("cost_breakdown_query_failed", job_id=job_id, exc_info=True)
+            job["cost_breakdown"] = []
+        # #281: why each errored run failed — diagnosis + redacted stderr tail.
+        # Served here (dashboard, MCP job_get) and nowhere public.
+        try:
+            job["agent_failures"] = await traces_repo.failures_for_job(job_id)
+        except Exception:
+            import structlog
+
+            structlog.get_logger(__name__).warning("agent_failures_query_failed", job_id=job_id, exc_info=True)
+            job["agent_failures"] = []
+    return job
+
+
+@router.get("/jobs/{job_id}/inputs")
+async def get_job_inputs(job_id: str, request: Request) -> list[Any]:
+    """Get all inputs (questions) for a job."""
+    inputs_repo = request.app.state.inputs_repo
+    result: list[Any] = await inputs_repo.list_by_job(job_id)
+    return result
+
+
+@router.get("/jobs/{job_id}/logs/events")
+async def get_job_log_events(job_id: str, jobs: JobsRepository = Depends(get_jobs_repo)) -> dict[str, Any]:
+    """Get persisted pipeline events for a job."""
+    events = await jobs.get_log_events(job_id)
+    # Extract the parsed payload from each row
+    result = []
+    for e in events:
+        payload = e.get("payload", {})
+        if isinstance(payload, dict):
+            result.append(payload)
+    return {"events": result}
+
+
+@router.post("/jobs/{job_id}/events-token")
+async def create_events_token(job_id: str, request: Request) -> dict[str, Any]:
+    """Mint a short-lived, single-job WS token for browser event streams.
+
+    Authenticated with the normal Bearer header (router-level deps); the
+    returned token is the only credential the browser puts in the WS
+    subprotocol — the raw API key never rides the handshake. The SSE
+    events token works the same way.
+    """
+    # RAV-1070; the SSE events-token precedent is RAV-1060.
+    from embry0.api.scoped_tokens import mint_scoped_token, signing_material
+
+    token, expires_in = mint_scoped_token(signing_material(request.app.state.config), f"ws:{job_id}")
+    return {"token": token, "expires_in": expires_in}
+
+
+@router.post("/jobs/{job_id}/inputs/{input_id}/answer")
+async def answer_job_input(
+    job_id: str,
+    input_id: str,
+    req: AnswerJobInputRequest,
+    request: Request,
+    jobs: JobsRepository = Depends(get_jobs_repo),
+) -> dict[str, Any]:
+    """Answer an agent question on a job — the issue-less-job path.
+
+    Direct POST /jobs runs have no issue row, so the issue-scoped answer
+    endpoint cannot serve them. Mirrors its contract: records the answer,
+    and when no blocking questions remain pending for the job, resumes the
+    workflow from its checkpoint with the accumulated Q&A as context.
+    Issue-backed inputs should keep using the issues endpoint (its resume
+    path also updates the issue row), but this one tolerates them.
+    """
+    # EMB-43.
+    job = await jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    inputs_repo = request.app.state.inputs_repo
+    inp = await inputs_repo.get(input_id)
+    if not inp or inp["job_id"] != job_id:
+        raise HTTPException(status_code=404, detail="Input not found")
+    # RAV-1059: auto_answered rows stay answerable — a human answer overrides
+    # the orchestrator's auto-answer post-hoc (the state.py contract). The
+    # override lands in the accumulated Q&A context the agent sees on its
+    # next resume; only a real human answer is final.
+    if inp["status"] == "answered":
+        raise HTTPException(status_code=409, detail="Input has already been answered")
+
+    # RAV-1076: shared record path — persists the answer, mirrors it to the
+    # Telegram question message, and posts the Q&A on the linked Linear issue.
+    # answered_by carries the real principal (session email / key name), not
+    # the historical hardcoded "user".
+    await record_answer(
+        inp=inp,
+        answer=req.answer,
+        answered_by=request_actor(request),
+        channel="api",
+        inputs_repo=inputs_repo,
+        issues_repo=getattr(request.app.state, "issues_repo", None),
+        tracker_channels=getattr(request.app.state, "tracker_channels", None),
+        config=getattr(request.app.state, "config", None),
+    )
+
+    pending = await inputs_repo.count_pending_blocking_for_job(job_id)
+    if pending == 0:
+        fresh = await jobs.get(job_id)
+        if fresh and fresh["status"] == "awaiting_input":
+            answered = await inputs_repo.list_all_answered_for_job(job_id)
+            context_lines = [
+                f"Q: {a['question']}\nA: {a.get('answer') or a.get('auto_answer') or ''}" for a in answered
+            ]
+            executor = request.app.state.issue_executor
+            executor.schedule_resume(
+                inp.get("issue_id") or None,
+                job_id,
+                "\n\n".join(context_lines),
+                kind="resume_via_job_answer",
+            )
+
+    updated = await inputs_repo.get(input_id)
+    return dict(updated or {})
+
+
+@router.post("/jobs/{job_id}/resume")
+async def resume_job(
+    job_id: str,
+    req: JobResumeRequest,
+    request: Request,
+    jobs: JobsRepository = Depends(get_jobs_repo),
+) -> dict[str, Any]:
+    """Resume a paused job with optional guidance."""
+    job = await jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] != "paused":
+        raise HTTPException(status_code=409, detail=f"Job is {job['status']}, not paused")
+
+    executor = request.app.state.issue_executor
+    # issue_id is None for issue-less, API-submitted jobs (POST /jobs with a
+    # task string). The workflow tolerates that on first run (submit_job
+    # dispatches with a null issue_id from create_job) and
+    # IssuesRepository.update() no-ops on a missing issue, so resume must
+    # tolerate it too — otherwise every paused API job is unrecoverable (its
+    # interrupt options can never be exercised; only /cancel works).
+    issue_id = job.get("issue_id") or None
+
+    executor.schedule_resume(
+        issue_id,
+        job_id,
+        {"choice": req.choice, "guidance": req.guidance},
+        kind="resume_via_api",
+    )
+
+    return {"job_id": job_id, "status": "resuming", "choice": req.choice}
+
+
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str, request: Request, jobs: JobsRepository = Depends(get_jobs_repo)) -> dict[str, Any]:
+    job = await jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] not in ("pending", "running", "awaiting_input", "paused"):
+        raise HTTPException(status_code=409, detail=f"Cannot cancel job in {job['status']} state")
+
+    executor = request.app.state.issue_executor
+    actor = request_actor(request)
+    await executor.cancel_job(job_id, actor=actor)
+
+    return {"job_id": job_id, "status": "cancelled"}

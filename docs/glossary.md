@@ -1,0 +1,208 @@
+# embry0 Glossary
+
+> Single-paragraph definitions for every operator, scope, and node type embry0 exposes. Cross-referenced; entries link to one another so a reader can chase any thread without re-reading the docs.
+>
+> **When to update this file:** when you add a new operation, agent type, node type, pipeline primitive, or sandbox/scope concept. When a term gains a stable ID, record it here. When semantics change, bump the entry's date stamp.
+>
+> **Inspiration:** the Definiciones section of a hermetic practice protocol — a long-form glossary that makes every operator unambiguous. This is embry0's equivalent.
+
+---
+
+## Core Concepts
+
+### embry0
+The alchemical furnace. The product. A self-hosted, container-isolated agent platform that takes an issue + a repository and produces a reviewed pull request through a configurable [pipeline](#pipeline) of [agents](#agents). The name is literal: an embry0 is the slow, sustained-temperature furnace medieval alchemists used for transmutation work that needed days or weeks. The product is named for the patience and isolation it provides — not for spectacle.
+
+### Job
+A single end-to-end run of a [pipeline](#pipeline) against a specific [issue](#issue) and repository. Owns its own [sandbox](#sandbox), trajectory, logs, and final artifact ([Caja de Regalos](#caja-de-regalos)). Identified by a stable job ID. Re-runnable via [Replay-N](#replay-n).
+
+### Pipeline
+An ordered, possibly-branching graph of [agents](#agents), [functions](#function), and [commands](#command) that define how a [job](#job) progresses from intake to artifact. Edited via the [PipelineEditor](#pipelineeditor). Stored as a `PipelineGraph` with nodes, edges, and `metadata`. May carry an [operation](#the-seven-operations) tag in its metadata to declare its alchemical character.
+
+### Sandbox
+A container-isolated execution environment created per [job](#job). Mirrors the Practice's [Contenedor](#contenedor) concept: a unit-of-work with its own boundary, its own inputs/outputs, and (once cleaned/sealed) immutability against further mutation. Sandboxes are spun up on the DinD layer with read-write rootfs (Claude CLI requires it), restricted network through credential proxies, and explicit per-sandbox bearer tokens for proxy enrollment.
+
+### Issue
+The unit of work that enters embry0. Originates from a webhook ([forge](#forge) issue events or a Linear [tracker](#tracker) event) or manual API call. Pre-pipeline state. Becomes a [job](#job) when a [pipeline](#pipeline) is selected and dispatched.
+
+### Forge
+The platform that hosts a repository's git remote and its change-request surface — GitHub or GitLab. The word is the industry term for an SCM host (SourceForge begat it), chosen over "provider" (overloaded by model providers) and "platform" (means nothing). A repo has exactly **one** forge, recorded as the `forge` discriminator on the `repos` table (#162); it decides which credential proxy a sandbox enrolls with, whether job completion opens a pull request or a merge request (`_open_change_request`), and which API client comments on the change. Not the same thing as a [tracker](#tracker): a repo's code can live on one forge while its issues live in a separate tracker. (2026-08)
+
+### Tracker
+The system an [issue](#issue) originates from and is written back to — GitHub Issues, GitLab Issues, or Linear. Recorded per-issue as the generic `tracker` / `tracker_key` / `tracker_url` columns (migration 60): `tracker_key` is TEXT so Linear's `ENG-123` identifiers fold in alongside the forges' integer numbers. A [forge](#forge) always implies a same-named tracker, but a tracker need not be a forge — Linear hosts no git remotes, which is exactly why the two concepts are separate. (2026-08)
+
+### Credential
+One account embry0 acts as: a forge token (GitHub or GitLab), an LLM OAuth token or API key, or an SSH key. Stored encrypted in `credentials` with a label, a host, an optional git author, and a status (`ok`, `disabled`, `quarantined`). Never read from the environment by new code; see ADR 0006. (2026-09)
+
+### Binding
+The link from a scope — a repo, an owner or group, a [forge](#forge) host, or the whole deployment — to a [credential](#credential) for one role (`forge`, `llm`, `deploy`). The resolver walks repo, owner, host, global, then the environment. A `pinned` LLM binding never falls back to the pool. (2026-09)
+
+### Pool
+The global-scope LLM bindings of one provider. A job with no repo or owner binding takes the first `ok` member by priority, then least recently used. Quarantine removes a member until its `quarantined_until` passes or an operator clears it. (2026-09)
+
+### Healing case
+The one lifecycle record for a finding, from detection to a healed verdict (#278). A case links `signature → watcher run → tracker ticket → issue → jobs[] → PRs[] → merge sha → deploy marker → healed verdict` with real foreign keys, plus an `origin` (watcher / human / webhook / alert / ci) and a `resolution_path` (embry0 / out_of_band / cancelled / non_code / self_resolved / abandoned). Its `stage` walks `detected → tracked → accepted → pr_open → merged → deployed → verified → closed`; the rules are the pure state machine in `embry0/services/healing/lifecycle.py`, which tolerates redelivered, reordered and stage-skipping events (an out-of-band human merge takes a `tracked` case straight to `merged`). Two events move a case back: `pr_closed` (its last open PR closed unmerged → `accepted`) and `reopened` (a `not_healed` verdict earns a retry). One event ends a case that never shipped anything: `abandoned` (#410) closes an `accepted` case as `resolution_path=abandoned` — a person answered "abandon" at the retry pause and no PR came of it. It is deliberately narrow in both directions: only that choice raises it (a job that merely *failed* leaves its case open, because the acceptance stands and an undelivered acceptance is what `Embry0HealingAcceptedCaseNotDispatched` is for), and it closes only from `accepted` (past `pr_open` the change request outlives the job, so the event is history and the data is *held*, never written). Before it there was no terminal state for an accepted case at all: it sat at `accepted` forever, nothing could move it, and that critical alert paged on a decision already made — masking any genuinely undispatched acceptance behind it. `closed` is terminal — what arrives afterwards is kept as history only, and a later regression, reopened ticket or reused ticket is a **new** case pointing at the old one via `parent_case_id` (a ticket has at most one *open* case). A case keeps every PR it ever had (`healing_case_prs`, each with its own outcome) and the **first** deploy carrying its merge as the confirm-healed anchor. **`verified` does not mean a fix shipped:** a verdict needs no merge, because findings also heal by themselves or outside the code. "A fix is deployed" is `lifecycle.fix_deployed` — a merge sha, and a deploy that is not older than the merge — exposed by the API as the `fix_deployed` field and list filter; never a comparison of stages. A deploy is never refused: one that arrives before its merge is kept in the history and becomes the anchor when the merge lands, and `reopen` clears merge and anchor so a retry is never judged from the failed attempt's deploy — a redelivered merge of the discarded attempt (its PR already merged, its sha already reported, or its time not later than the reopen) is kept as history and never becomes the retry's merge. Replacing the anchor with an earlier deploy voids a verdict measured from the old one (back to `pending`). Timestamps on every write must be timezone-aware and not in the future; the executable `signature` is refused when over-long, never truncated. A `healed` verdict on a case nothing resolved sets `resolution_path=self_resolved` at once; with a merge, healing is credited to the merge's path, and a merge that turns up later replaces `self_resolved` — so `self_resolved` always means "no merge". **Evidence is counts and queries, never raw log lines:** history rows copy the call's data and the API serves them, so `verdict_evidence` is refused above 16 KiB and human-readable free text (`title`, `note`, reopen `reason`) is truncated at the service boundary. Every write goes through `HealingCaseService`; each history row stores its exact column change, so the case row can be rebuilt from `healing_case_events`. Reads are `GET /api/v1/cases[/{id}]` and the `case_list` / `case_get` MCP tools. "Which drafts is someone still to answer?" is the list's `awaiting_decision` filter (the dashboard's Proposals list, and the same flag on `case_list`) — not `open_only`, which is every case short of `closed`, and not `stage=tracked`. The two writes a human makes are `POST /cases/{id}/accept` (dispatch the fix, #378) and `POST /cases/{id}/close` (settle it, #410 — `resolution_path` required unless the case already has one, refused 409 on a closed case, exposed as MCP `case_close`); everything else on a case is written by the pipeline. Tables: `healing_cases`, `healing_case_jobs`, `healing_case_prs`, `healing_case_events` (migration 69). **Writers (part 2):** the pipeline reports through the fail-open `CaseRecorder` (`embry0/services/healing/recorder.py`) — a ledger error is logged with the ids to repair and never stops a ticket, a dispatch or a PR; every call carries an `event_key` from a stable id. The watcher opens a case per proposal (and counts a `skipped_duplicate` tick as a recurrence, and closes a draft cancelled in Linear as `cancelled`); `IssueExecutor.execute` — where every dispatch ends — links each job, accepting the case, and opens an `origin=human` case for a labelled Linear ticket nobody opened one for; a job's PR is attached where `pr_url` is first persisted. A PR's `opened_at` is the FORGE's (`GitHubPrTimes` reads `created_at`), never the moment the job that opened it finished — readers judge staleness by it; when the forge cannot say, the job's start is used as a bound that is never later than the truth, and the gap is logged. A PR is matched across every spelling of a renamed repo (`repo_url_variants`), because nothing rewrites stored URLs after a rename: a row written before it keeps the old slug. Deploy markers (`deployed <sha>: <services>` under `WATCHER_DEPLOY_LOGQL`) are reported by `DeployLedgerSync` only after the forge confirms ancestry — `GET /repos/{repo}/compare/{deployed}...{merge}` must say `behind`/`identical` AND name the merge as the merge base; anything undetermined is not reported. (2026-09)
+
+### Delivery state
+What became of the pull request a job produced — `none` / `pr_open` / `merged` / `closed` (`jobs.delivery_state`, #280) — kept apart from the job's `status`, which says how the JOB ended. The two are independent: a job can end `failed` (a late stage broke, a budget ran out) after opening a PR that a human then finished and merged, and that is delivered work, not a failure. `status` values keep their meaning: `pr_merged` / `pr_closed` are a job that `completed` and whose PR was then merged / closed unmerged, so `status = pr_merged` implies `delivery_state = merged` but never the reverse; `failed`, `cancelled`, `partial` and `expired` never change because of a PR. One code path maintains both — `services/merge_sync` (`DeliveryRecorder`), fed by the `pull_request` webhook, the periodic GitHub sweep and the backfill CLI. A PR is matched to jobs by its stored URL (renamed-repo forms included) and, for jobs that never stored one, by the branch the job pushes to, re-derived from the job row. `delivery_state_at` is the FORGE's time of the state (`merged_at` / `closed_at` / `updated_at`), which is what orders redelivered and out-of-order webhooks: a merge is final, otherwise the newer fact wins. `/stats` reports both outcomes: `job_success_rate` (status only), `delivery` (counts per state, `merged_despite_job_status`, `merge_rate`) and `success_rate` (completed OR PR merged). (2026-09)
+
+### Verification (tier, test gate, human-merge-only)
+The agent-free `verify` step after an approved review (#298, #299; `docs/verification.md`). The **tier** is a pure classification of the diff — `neutral_only`, `backend_only`, `frontend`; a path that matches no rule, or an unknown diff, is the stricter `frontend`. The **test gate** is the orchestrator itself running the repo's stored test commands (`repo_preferences.verification`, never a file in the target repo) on the base commit and on the job's head in the dev sandbox: only failures that are *new* on head fail the job (`ERR_VERIFY_NEW_TEST_FAILURES`); red-on-base-too is *pre-existing*, red-then-green is *flaky*, both recorded and not blocking. **Human-merge-only** is the result's one bit for auto-merge: embry0 did not verify the change well enough for a machine to merge it (a frontend change with no branch-booted QA app, a gate that could not run or is not configured, a base too red to compare). A **branch job never QAs a `target: deployed` app** — the deployed site does not contain the branch; deployed-target QA is for standalone QA jobs. One result per job lives in `job_verifications` (migration 72), looked up by head sha. (2026-09)
+
+### Deferred finding
+A watcher proposal made while the draft cap was full (#283): the tick is recorded as `deferred`, and the finding is a [healing case](#healing-case) at `detected` with **no tracker ticket** — so it holds no slot of the cap, which counts only open, unaccepted watcher cases that have a ticket (`count_open_unaccepted_watcher_cases`). The cap defers *filing*, never *looking*: a full cap still fetches and analyses the window. When a slot frees, the oldest deferred finding is filed — at most one per tick, in place of that tick's own filing — from the proposal its own analysis job wrote (no second analysis), and its run row becomes the `proposed` row of the new ticket. One not seen again for a whole `WATCHER_PROPOSAL_WINDOW_DAYS` is closed as `cancelled` instead. At most `WATCHER_MAX_DEFERRED_FINDINGS` (3) wait; with the cap and that queue both full the paid analysis is skipped (`skipped_backlog`, with the window's line count). **Spend:** a full cap used to end the tick before Loki was queried, so it was also the de-facto daily spend cap; the analyses it now pays for have their own — `WATCHER_MAX_FULL_CAP_ANALYSES_PER_DAY` (6) per rolling 24 h, counted durably from `watcher_runs.analysed_under_full_cap` (migration 70) so a restart cannot refill it, and failing CLOSED when the counter cannot answer. A tick that runs out records `skipped_analysis_cap` — never a silent `no_issue`. Ordinary ticks are neither counted nor limited. (2026-09)
+
+### Template
+A reusable, parametric [pipeline](#pipeline) shape. The [seven operations](#the-seven-operations) ship as templates plus three composite templates (`opus-full-cycle`, `op-refactor-suite`, `op-triage-and-decompose`). User-editable: clone, modify, save-as. Lives in the `pipeline_templates` table; loaded via the [TemplateDrawer](#templatedrawer).
+
+---
+
+## Pipeline Library — Building Blocks
+
+The [PipelineEditor](#pipelineeditor) lets operators compose pipelines from four kinds of building block, ordered from atomic to composite:
+
+### Energy
+The atomic unit. A single capability, skill reference, or data value. Examples: a specific [agent](#agents) type, a specific tool (lint, typecheck), a specific environment variable. Identified by a stable [original ID](#stable-id) (e.g. `OP04` for the conjoin operation, `SP0014` for a superpowers skill). Energies are the leaves of pipeline graphs.
+
+### Function
+A pure, side-effect-light transform over a [container](#contenedor). Takes inputs, returns diagnostics or a transformed value, does not mutate persistent state. Examples (proposed): `f_lint(target)`, `f_typecheck(target)`, `f_test(target)`, `f_search(query)`, `f_format(target)`. Functions can be chained; a function's output is another function's input. Mirrors the Practice's `f_luz()`, `f_conocimiento()`.
+
+### Command
+A named, idempotent operation with explicit guards/preconditions. Mutates state. Safe to retry. Examples (proposed): `Cleanup(scope)`, `Migrate(scope)`, `Deploy(scope)`, [`Replay-N`](#replay-n). Mirrors the Practice's `Limpieza()`, `Salud()`, `Repito los N Comandos`. Distinguished from [Functions](#function) by mutation; distinguished from [Templates](#template) by atomicity.
+
+### Template
+See [above](#template). The composite of the four — a parametric pipeline assembled from energies, functions, commands, and other templates.
+
+---
+
+## The Seven Operations
+
+The canonical alchemical operations, used as opinionated [pipeline templates](#template). Defined in `frontend/src/components/divine/operations.ts`. Each carries a stable [ID](#stable-id) (`OP01`–`OP07`), a Roman numeral position, an element, and a one-sentence coding meaning.
+
+| ID | Operation | Coding meaning |
+|---|---|---|
+| `OP01` | [Calcinate](#calcinate) | Burn down a feature spec to its essential intent |
+| `OP02` | [Dissolve](#dissolve) | Decompose a monolith into independent units |
+| `OP03` | [Separate](#separate) | Separate concerns inside a chunk of code |
+| `OP04` | [Conjoin](#conjoin) | Merge two divergent things into one |
+| `OP05` | [Ferment](#ferment) | Let a change cook in CI / staging |
+| `OP06` | [Distill](#distill) | Extract reusable essence from a successful job |
+| `OP07` | [Coagulate](#coagulate) | Solidify ephemeral work into a shipped artifact |
+
+### Calcinate
+**OP01 — Fire.** The triage operation. Reduces an issue body to a 1-2 sentence statement of what + why, stripped of noise. Performed by the [triage](#triage) agent. Output: a crisp intent statement. Sigil: 🜂.
+
+### Dissolve
+**OP02 — Water.** The decomposition operation. Splits a monolithic ask into the smallest set of independent units. Performed by the [triage](#triage) agent. Output: a list of subtasks with no shared state. Sigil: 🜄.
+
+### Separate
+**OP03 — Air.** The refactor operation. Identifies mixed concerns inside a chunk of code (pure logic vs side effects, business rules vs framework, public API vs private helpers) and refactors to separate them while preserving behavior. Performed by the [developer](#developer) agent. Output: a refactor PR. Sigil: 🜁.
+
+### Conjoin
+**OP04 — Sacred Marriage.** The merge operation. Unifies two divergent things — branches, services, type systems, vendors. Performed by the [developer](#developer) agent. Output: a unified PR. Sigil: ☿☉.
+
+### Ferment
+**OP05 — Earth (salt under pressure).** The soak operation. Runs a change through the full test matrix in CI / staging and reports what broke. Does not fix — reports only. Performed by the [qa](#qa) agent. Output: pass/fail evidence. Sigil: 🜔.
+
+### Distill
+**OP06 — Aether.** The extraction operation. Reads a successful job's trajectory and emits a new pipeline template named `<auto>-distilled-N`. Performed by the [output](#output) agent as a post-completion hook. Output: a new template. Sigil: 🝫.
+
+### Coagulate
+**OP07 — Stone.** The shipping operation. Merges an approved PR and captures the outcome as the issue's closing comment; deployment itself is the target repo's own concern (registry-pull pipelines, watchtower, etc.). Performed by the [output](#output) agent. Output: a merged PR + closing receipt. Sigil: 🜃.
+
+---
+
+## Agents
+
+The five canonical agent **types**. Each is a system-prompt + tool configuration. Agents can be cloned and customized per-installation.
+
+### Triage
+The orchestrator-side agent that reads an [issue](#issue) and decides routing: which [pipeline](#pipeline), which [sandbox](#sandbox) profile, which agents downstream. Performs [Calcinate](#calcinate) and [Dissolve](#dissolve). Substance sigil: Mercury ☿.
+
+### Developer
+The agent that writes code. Performs [Separate](#separate) and [Conjoin](#conjoin). Substance sigil: Sulphur 🜍.
+
+### Reviewer
+The agent that critiques code before merge. Reads diffs, raises concerns, requests changes. Substance sigil: Salt 🜔.
+
+### QA
+The agent that exercises a change against the full test matrix. Performs [Ferment](#ferment). Reports without fixing. Drives the target app's frontend through a [browser backend](#browser-backend). Substance sigil: Antimony ⚯.
+
+### Browser Backend
+The pluggable unit that supplies the [QA](#qa) agent's browser. A backend bundles four things: an MCP stdio server config, an exact-name tool allowlist, an auth-injection mechanism for pre-seeded login state, and a system-prompt fragment teaching the agent that backend's idioms. Two exist: `playwright` (default — `@playwright/mcp`, env-var storageState injection) and `vibium` (WebDriver-BiDi Go binary, tool-call `browser_restore_storage` injection, evaluate-shim console/network diagnostics). Selected per repo/app via the `browser_backend` field in qa.yaml v2 (defaults → app → app_local), overridable per job; both coexist in the `embry0-sandbox-qa` image. Registry lives in `embry0/workflows/qa/browser_backends.py`; design record in `docs/spikes/2026-08-27-vibium-browser-backend.md`. (2026-08)
+
+### Output
+The agent that closes the loop — merges the PR, performs [Distill](#distill) (extract reusable template) and [Coagulate](#coagulate) (ship + record). Substance sigils: Aqua Vitae 🜈 (Distill), Sol ☉ (Coagulate).
+
+---
+
+## Pipeline Editor Internals
+
+### PipelineEditor
+The visual canvas for composing pipelines. Located at `frontend/src/components/pipeline-editor/`. Built on `@xyflow/react`. Supports drag-from-bar agent placement, edge inference, circular and dagre auto-arrange, feedback edges, and operation-tag display in the canvas header.
+
+### TemplateDrawer
+The slide-in drawer in the [PipelineEditor](#pipelineeditor) that lists saved [templates](#template). Cards show the template name and (when set) the [operation](#the-seven-operations) sigil + tagline. Click a card to load its `PipelineGraph` into the canvas.
+
+### AgentBar
+The horizontal bar at the bottom of the [PipelineEditor](#pipelineeditor) holding draggable agent chips. Each chip carries its substance sigil and color. Drag a chip onto the canvas to place an agent node. Filters out [triage](#triage) (orchestrator-side, not a pipeline node).
+
+### Replay-N
+A [command](#command) that re-executes the last N completed stages of a [job](#job) as a unit. Mirrors the Practice's `Repito los N Comandos`. Use case: a config or environment variable changed; you want stages 5-8 re-run with the new value, but not the entire pipeline.
+
+---
+
+## Scope & Container Concepts
+
+### Contenedor
+The Practice's term for a unit-of-work scope. embry0's [sandbox](#sandbox) is a Contenedor. So is a [job](#job). The Contenedor pattern includes auto-encapsulation: once the work inside is complete and validated, the boundary becomes immutable. This maps to embry0's run records — once a job is done, its trajectory and artifacts are sealed.
+
+### Conjunto
+The Practice's term for a composite scope built by explicit inclusion. Each inclusion is a guarded clause: "Que no exista la posibilidad de que haya X que no esté Y." embry0's [pipelines](#pipeline) and [templates](#template) should adopt this pattern: explicit declaration of what's in scope, guarded by preconditions, rather than implicit globals.
+
+### Caja de Regalos
+The Practice's term for a wrapped output artifact: a labeled box, a ribbon, an [Armadura](#armadura), and an explicit sender. Maps to embry0's per-job output envelope:
+
+- **Label** — commit subject + embry0 run-ID
+- **Ribbon** — PR description (auto-generated from the spec)
+- **Armadura** — integrity hash + signing tag (bidirectional protection: run can't be modified post-hoc, source spec can't be retroactively edited without invalidating the run)
+- **Sender** — explicit `agent_id` (e.g., `developer-v2.3 + qa-v1.7`) recorded on the run
+
+### Armadura
+Bidirectional integrity envelope. The Practice's pattern: "nada de afuera afecte adentro y nada de adentro afecte afuera." Applied to embry0's audit log: protects the run record from retroactive modification AND protects the source spec from edits that would invalidate the run.
+
+---
+
+## Identifiers
+
+### Stable ID
+A prefix-disambiguated, sequence-numbered identifier that survives renames. Format: `<PREFIX>##` (e.g., `OP04` for the conjoin operation, `SP0014` for a superpowers skill). The slug (`conjoin`, `tdd`) is the human handle; the stable ID is the durable reference cited in audit logs, PR metadata, and cross-document references. Borrowed from the Practice's `A0050`, `P0007`, `M_00` pattern. Pairs with [Revision Date](#revision-date).
+
+Current ID prefixes:
+
+| Prefix | Domain | Example |
+|---|---|---|
+| `OP` | Operations | `OP04` (conjoin) |
+| `SP` | Superpowers skills | `SP0014` (planned) |
+
+### Revision Date
+ISO-8601 (`YYYY-MM-DD`) date marking the last semantic change to a [stable-ID](#stable-id) entity. Bump when behavior changes, not on cosmetic edits. Together, `(id, rev)` answers "what version of OP04 was this pipeline built against?" and lets the system flag drift when an old pipeline is loaded against a newer operation definition.
+
+---
+
+## Conventions
+
+### "Practice" not "Ceremony"
+A project rule: never use "ceremony" — use "practice". No ritualistic, new-age, or woo-woo framing. The rule covers all docs, UI copy, and skill text. Hermetic vocabulary stays in the [divine layer](#divine-layer) where it's an aesthetic choice; functional language stays plain.
+
+### Divine Layer
+The atmospheric SVG/sigil layer that gives embry0 its alchemical identity. Lives in `frontend/src/components/divine/`. Strict rules in `frontend/src/components/divine/CLAUDE.md`: pure SVG only, `currentColor` stroke, animation suppressed by default, escape hatch via `<body data-divine="off">`, never on operator-critical paths (errors, destructive confirms, latency-sensitive lists), never combine more than one divine element per component instance.
+
+---
+
+## See also
+
+- [`frontend/src/components/divine/operations.ts`](../frontend/src/components/divine/operations.ts) — operation definitions and stable IDs
+- [`frontend/src/components/divine/CLAUDE.md`](../frontend/src/components/divine/CLAUDE.md) — divine layer hard rules
+- [`docs/architecture.md`](architecture.md) — system architecture
+- [`CLAUDE.md`](../CLAUDE.md) — project rules

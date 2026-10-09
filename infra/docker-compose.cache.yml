@@ -1,0 +1,34 @@
+# Self-hosted Turbo remote cache server (ducktors/turborepo-remote-cache).
+# Deploy alongside embry0's main stack with:
+#   docker compose -f infra/docker-compose.yml -f infra/docker-compose.cache.yml up -d
+#
+# Configure embry0 to use it by setting these env vars in embry0's
+# secret store under qa-cache config:
+#   TURBO_API   = http://turbo-cache:3000
+#   TURBO_TEAM  = embry0 (or your team name)
+#   TURBO_TOKEN = <strong-random-token>  # must match TURBO_TOKEN below
+
+services:
+  turbo-cache:
+    # Pinned by digest (#582): `:latest` let an unattended pull change this
+    # service under a running deployment. 2.14.1 is the newest release at
+    # least two weeks old on 2026-10-08; the digest is its multi-arch index.
+    # To bump: pick a release, then
+    #   docker buildx imagetools inspect ducktors/turborepo-remote-cache:<tag>
+    # and take the index Digest.
+    image: ducktors/turborepo-remote-cache:2.14.1@sha256:8aa1c158d885757149fa953e92c0c8da544cf4a1e9a19b7feb684e59cf7b4bb0
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      TURBO_TOKEN: "${TURBO_REMOTE_CACHE_TOKEN:-}"
+      STORAGE_PROVIDER: "local"
+      STORAGE_PATH: "/data"
+    volumes:
+      - turbo_cache_data:/data
+    # `backend` is defined by the main infra/docker-compose.yml; this overlay
+    # is only valid in merged mode (both -f flags, see header).
+    networks:
+      - backend
+
+volumes:
+  turbo_cache_data:

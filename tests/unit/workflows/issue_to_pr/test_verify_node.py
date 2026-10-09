@@ -1,0 +1,329 @@
+"""verify node — tiers + the base-vs-head gate, wired into the graph (#298, #299)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from langgraph.graph import END
+
+from embry0.safety.error_codes import ErrorCode
+from embry0.workflows.issue_to_pr.nodes._verify import should_verify, verification_mode, verify_node
+from embry0.workflows.verification.gate import GateReport, TargetRun, build_report, compare_target
+
+JAVA = "platform/api/src/main/java/Lead.java"
+TSX = "frontend/apps/leads/src/Todo.tsx"
+FULL_PLAN = [
+    {"agent_type": "developer", "node_id": "developer", "config": {}},
+    {"agent_type": "reviewer", "node_id": "reviewer", "config": {}},
+    {"agent_type": "qa", "node_id": "qa", "config": {}},
+    {"agent_type": "output", "node_id": "output", "config": {}},
+]
+_CORPUS = Path(__file__).parents[3] / "fixtures" / "qa-yaml-corpus" / "v2"
+DEPLOYED_ONLY_QA = (_CORPUS / "deployed-target.yaml").read_text()
+MANAGED_QA = (_CORPUS / "single-app.yaml").read_text()
+VERIFICATION = {"test_targets": [{"name": "jvm", "paths": ["platform/**"], "command": "cd platform && ./mvnw test"}]}
+
+
+def _gate(head: str, base: str, failed: list[str] | None = None) -> GateReport:
+    def run(side: str, outcome: str) -> TargetRun:
+        names = failed if outcome == "failed" and side == "head" else None
+        return TargetRun("jvm", side, 1, outcome, 0 if outcome == "passed" else 1, 5, names, None, "")  # type: ignore[arg-type]
+
+    h, b = run("head", head), run("base", base)
+    return build_report(
+        targets=[compare_target([h], b)], runs=[h, b], base_sha="b" * 40, head_sha="h" * 40, base_ref="main"
+    )
+
+
+def _state(files: list[str], **extra: Any) -> dict[str, Any]:
+    return {
+        "job_id": "job-1",
+        "repo": "acme/backend",
+        "sandbox_container_id": "c1",
+        "base_branch": "main",
+        "base_branch_source": "preference",
+        "changed_files": files,
+        "route_plan": FULL_PLAN,
+        "route_cursor": 2,  # review approved: the cursor is on the qa step
+        "current_stage": "review_passed",
+        "qa": {"needs_qa": True, "qa_required_reason": "qa_required=always"},
+        **extra,
+    }
+
+
+def _config(
+    *, verification: Any = VERIFICATION, qa_yaml: str | None = DEPLOYED_ONLY_QA, mode: str = "on"
+) -> tuple[dict[str, Any], MagicMock]:
+    prefs = MagicMock()
+    prefs.get = AsyncMock(return_value={"verification": verification})
+    qa_configs = MagicMock()
+    qa_configs.get = AsyncMock(return_value={"yaml_text": qa_yaml} if qa_yaml else None)
+    verifications = MagicMock()
+    verifications.upsert = AsyncMock()
+    configurable = {
+        "docker": MagicMock(),
+        "repo_preferences_repo": prefs,
+        "qa_configs_repo": qa_configs,
+        "job_verifications_repo": verifications,
+        "embry0_config": SimpleNamespace(verification_mode=mode),
+    }
+    return {"configurable": configurable}, verifications
+
+
+async def _run(state: dict[str, Any], config: dict[str, Any], gate: GateReport | Exception | None):
+    run_gate = AsyncMock(side_effect=gate) if isinstance(gate, Exception) else AsyncMock(return_value=gate)
+    with (
+        patch("embry0.workflows.issue_to_pr.nodes.get_stream_writer", return_value=lambda _e: None),
+        patch("embry0.workflows.issue_to_pr.nodes._verify.run_gate", new=run_gate),
+        patch("embry0.execution.workspace_diff.resolve_base_branch", new=AsyncMock(return_value="main")),
+    ):
+        return await verify_node(state, config), run_gate  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_backend_only_runs_the_gate_and_skips_browser_qa() -> None:
+    config, stored = _config()
+    cmd, run_gate = await _run(_state([JAVA]), config, _gate("passed", "passed"))
+    assert run_gate.await_args.kwargs["base_ref"] == "main"
+    assert run_gate.await_args.kwargs["changed_files"] == [JAVA]
+    assert cmd.goto == "finalize_output"  # the qa step was pruned, output is next
+    assert cmd.update["qa"]["needs_qa"] is False
+    assert "backend_only" in cmd.update["qa"]["qa_required_reason"]
+    assert cmd.update["verification"]["human_merge_only"] is False
+    assert "error_code" not in cmd.update
+    stored.upsert.assert_awaited_once()
+    assert stored.upsert.await_args.kwargs["result"]["gate"]["verdict"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_output_tails_go_to_the_database_not_into_checkpoints() -> None:
+    config, stored = _config()
+    gate = _gate("passed", "passed")
+    gate = GateReport.from_dict(
+        {**gate.to_dict(), "runs": [{**r, "output_tail": "x" * 500} for r in gate.to_dict()["runs"]]}
+    )
+    cmd, _ = await _run(_state([JAVA]), config, gate)
+    assert {r["output_tail"] for r in cmd.update["verification"]["gate"]["runs"]} == {""}
+    assert {len(r["output_tail"]) for r in stored.upsert.await_args.kwargs["result"]["gate"]["runs"]} == {500}
+
+
+@pytest.mark.asyncio
+async def test_new_failures_end_the_job_with_their_own_error_code() -> None:
+    config, stored = _config()
+    cmd, _ = await _run(_state([JAVA]), config, _gate("failed", "passed", ["LeadTest.idleTimer"]))
+    assert cmd.goto == END
+    assert cmd.update["error_code"] == ErrorCode.VERIFY_NEW_TEST_FAILURES.value
+    assert cmd.update["current_stage"] == "verify_failed"
+    assert "LeadTest.idleTimer" in cmd.update["result_summary"]
+    stored.upsert.assert_awaited_once()  # stored even though the job fails
+
+
+@pytest.mark.asyncio
+async def test_a_red_baseline_does_not_fail_the_job() -> None:
+    config, _ = _config()
+    cmd, _ = await _run(_state([JAVA]), config, _gate("failed", "failed"))
+    assert cmd.goto == "finalize_output"
+    assert "error_code" not in cmd.update
+    assert cmd.update["verification"]["gate"]["verdict"] == "unstable"
+
+
+@pytest.mark.asyncio
+async def test_frontend_with_only_a_deployed_qa_target_never_enters_qa() -> None:
+    """The 7-job failure mode: QA against the deployed site as a branch gate."""
+    config, _ = _config()
+    cmd, _ = await _run(_state([TSX, JAVA]), config, _gate("passed", "passed"))
+    assert cmd.goto == "finalize_output"
+    assert cmd.update["qa"]["needs_qa"] is False
+    result = cmd.update["verification"]
+    assert result["browser_qa"] == {"planned": "skipped", "reason_code": "no_branch_stack"}
+    assert result["human_merge_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_frontend_with_a_branch_booted_app_still_goes_to_qa() -> None:
+    config, _ = _config(qa_yaml=MANAGED_QA)
+    cmd, _ = await _run(_state([TSX]), config, _gate("passed", "passed"))
+    assert cmd.goto == "init_orchestrator"
+    assert "qa" not in cmd.update
+    assert cmd.update["verification"]["human_merge_only"] is False
+
+
+@pytest.mark.asyncio
+async def test_no_stored_config_reports_not_configured_and_does_not_block() -> None:
+    config, _ = _config(verification=None)
+    cmd, run_gate = await _run(_state([JAVA]), config, None)
+    run_gate.assert_not_awaited()
+    assert cmd.goto == "finalize_output"
+    assert cmd.update["verification"]["gate"]["verdict"] == "not_configured"
+    assert cmd.update["verification"]["human_merge_reasons"] == ["gate_not_configured"]
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_stored_config_degrades_instead_of_failing() -> None:
+    config, _ = _config(verification={"test_targets": "nope"})
+    cmd, run_gate = await _run(_state([JAVA]), config, None)
+    run_gate.assert_not_awaited()
+    assert cmd.update["verification"]["gate"]["verdict"] == "not_configured"
+    assert "invalid" in cmd.update["verification"]["config_error"]
+    assert "error_code" not in cmd.update
+
+
+@pytest.mark.asyncio
+async def test_a_crashing_gate_is_recorded_not_raised() -> None:
+    config, _ = _config()
+    cmd, _ = await _run(_state([JAVA]), config, RuntimeError("boom"))
+    assert cmd.update["verification"]["gate"]["verdict"] == "error"
+    assert cmd.update["verification"]["human_merge_only"] is True
+    assert "error_code" not in cmd.update
+
+
+@pytest.mark.asyncio
+async def test_a_failing_result_store_does_not_fail_the_job() -> None:
+    config, stored = _config()
+    stored.upsert = AsyncMock(side_effect=RuntimeError("db down"))
+    cmd, _ = await _run(_state([JAVA]), config, _gate("passed", "passed"))
+    assert cmd.goto == "finalize_output"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_diff_is_treated_as_frontend() -> None:
+    config, _ = _config()
+    with patch("embry0.execution.workspace_diff.compute_changed_files_via_diff", new=AsyncMock(return_value=[])):
+        cmd, _ = await _run(_state([]), config, _gate("passed", "passed"))
+    assert cmd.update["verification"]["tier"]["tier"] == "frontend"
+    assert cmd.update["verification"]["human_merge_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_records_and_changes_nothing() -> None:
+    config, stored = _config(mode="shadow")
+    cmd, _ = await _run(_state([JAVA]), config, _gate("failed", "passed", ["T.a"]))
+    assert cmd.goto == "init_orchestrator"  # exactly where review would have sent it
+    assert "error_code" not in cmd.update
+    assert "qa" not in cmd.update
+    assert stored.upsert.await_args.kwargs["result"]["mode"] == "shadow"
+    assert stored.upsert.await_args.kwargs["result"]["blocking"] is True
+
+
+def test_the_qa_fixtures_are_what_the_tests_say_they_are() -> None:
+    from embry0.workflows.qa.qa_yaml_v2 import parse_qa_yaml_v2
+
+    deployed, managed = parse_qa_yaml_v2(DEPLOYED_ONLY_QA), parse_qa_yaml_v2(MANAGED_QA)
+    assert deployed.deployed_app_names() and not deployed.managed_app_names()
+    assert managed.managed_app_names() and not managed.deployed_app_names()
+
+
+def test_mode_parsing_never_raises_and_fails_safe() -> None:
+    assert verification_mode(SimpleNamespace(verification_mode="ON ")) == "on"
+    assert verification_mode(SimpleNamespace(verification_mode="of")) == "shadow"
+    # No config at all is not a licence to act (review of #341).
+    assert verification_mode(None) == "shadow"
+    assert verification_mode(SimpleNamespace(verification_mode="")) == "shadow"
+
+
+def test_the_shipped_default_is_shadow() -> None:
+    from embry0.config import Embry0Config
+
+    assert Embry0Config(_env_file=None).verification_mode == "shadow"
+
+
+def test_only_jobs_that_produce_a_change_are_verified() -> None:
+    on = SimpleNamespace(verification_mode="on")
+    assert should_verify({"route_plan": FULL_PLAN}, on) is True
+    assert should_verify({}, on) is True  # legacy chain without a plan
+    assert should_verify({"route_plan": [{"agent_type": "reviewer"}]}, on) is False  # review-only
+    assert should_verify({"route_plan": FULL_PLAN}, SimpleNamespace(verification_mode="off")) is False
+
+
+def test_graph_wires_verify_between_review_and_the_route_plan() -> None:
+    from embry0.workflows.issue_to_pr.graph import IssueToprWorkflow
+
+    graph = IssueToprWorkflow().compile().get_graph()
+    edges = {(e.source, e.target) for e in graph.edges}
+    assert ("review", "verify") in edges
+    for target in ("init_orchestrator", "finalize_output", "__end__"):
+        assert ("verify", target) in edges
+
+
+# ── the real compiled graph ──────────────────────────────────────────────
+
+
+async def _drive_real_graph(
+    monkeypatch: pytest.MonkeyPatch, files: list[str], gate: GateReport
+) -> tuple[dict, list[str]]:
+    """The real issue-to-PR graph and the real verify node; agents stubbed.
+
+    Returns (final state, QA/output nodes that ran).
+    """
+    from langgraph.types import Command
+
+    import embry0.workflows.issue_to_pr.graph as graph_mod
+
+    visited: list[str] = []
+
+    async def _init(state):
+        return {"current_stage": "init"}
+
+    async def _triage(state):
+        update = {"route_plan": FULL_PLAN, "route_cursor": 0, "qa": {"needs_qa": True}}
+        return Command(goto="developer", update=update)
+
+    async def _developer(state):
+        return Command(goto="review", update={"route_cursor": 1, "branch_name": "embry0/job-1"})
+
+    async def _review(state):
+        update = {"current_stage": "review_passed", "route_cursor": 2, "changed_files": files}
+        return Command(goto="verify", update=update)
+
+    def _recorder(name: str, result: dict):
+        async def _node(state, config=None):
+            visited.append(name)
+            return result
+
+        return _node
+
+    for name, stub in {
+        "init_node": _init,
+        "triage_node": _triage,
+        "developer_node": _developer,
+        "review_node": _review,
+        "init_orchestrator_node": _recorder("init_orchestrator", {}),
+        "_branch_qa_orchestrator_node": _recorder("orchestrate_qa", {"qa": {"final_status": "failed"}}),
+        "qa_report_node": _recorder("qa_report", {}),
+        "finalize_output_node": _recorder("finalize_output", {"result_summary": "done"}),
+    }.items():
+        monkeypatch.setattr(graph_mod, name, stub)
+
+    config, _ = _config()
+    with (
+        patch("embry0.workflows.issue_to_pr.nodes._verify.run_gate", new=AsyncMock(return_value=gate)),
+        patch("embry0.execution.workspace_diff.resolve_base_branch", new=AsyncMock(return_value="main")),
+    ):
+        final = (
+            await graph_mod.IssueToprWorkflow()
+            .compile()
+            .ainvoke({"job_id": "job-1", "repo": "acme/backend", "sandbox_container_id": "c1"}, config)
+        )
+    return final, visited
+
+
+@pytest.mark.asyncio
+async def test_real_graph_an_approved_frontend_change_completes_without_deployed_qa(monkeypatch) -> None:
+    """job-5877820e5175 replayed: frontend + backend diff, QA config deployed-only."""
+    final, visited = await _drive_real_graph(monkeypatch, [TSX, JAVA], _gate("passed", "passed"))
+    assert visited == ["finalize_output"]
+    assert final.get("error_code") is None
+    assert final["verification"]["human_merge_only"] is True
+    assert final["qa"]["needs_qa"] is False
+
+
+@pytest.mark.asyncio
+async def test_real_graph_new_test_failures_end_the_job_before_qa_or_output(monkeypatch) -> None:
+    final, visited = await _drive_real_graph(monkeypatch, [JAVA], _gate("failed", "passed", ["LeadTest.x"]))
+    assert visited == []
+    assert final["error_code"] == ErrorCode.VERIFY_NEW_TEST_FAILURES.value
+    assert final["current_stage"] == "verify_failed"

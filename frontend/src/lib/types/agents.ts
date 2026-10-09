@@ -1,0 +1,61 @@
+export interface AgentFieldInfo {
+  name: string;
+  description: string;
+}
+
+export interface AgentTypeInfo {
+  type: string;
+  description: string;
+  phase: string;
+  default_model: string;
+  default_tools: string[];
+  default_skills: string[];
+  inputs: AgentFieldInfo[];
+  outputs: AgentFieldInfo[];
+  responsibilities: string[];
+}
+
+/** null = defer to the resolver's global default (embry0/agents/resolver.py). */
+export type AgentExecutionMode = "sdk" | "cli";
+export type AgentAuthMode = "api_key" | "oauth";
+
+/** New format from GET /agents */
+export interface AgentDefinition {
+  type: string;
+  description: string;
+  model: string;
+  tools: string[];
+  skills: string[];
+  system_prompt: string;
+  execution_mode?: AgentExecutionMode | null;
+  auth_mode?: AgentAuthMode | null;
+  mcp_servers?: Record<string, unknown> | null;
+  is_builtin: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface AgentCreateRequest {
+  type: string;
+  description: string;
+  model: string;
+  tools?: string[];
+  skills?: string[];
+  system_prompt?: string;
+  execution_mode?: AgentExecutionMode | null;
+  auth_mode?: AgentAuthMode | null;
+  mcp_servers?: Record<string, unknown>;
+}
+
+/** PUT semantics (RAV-1058): omitted fields stay untouched; an explicitly-sent
+ * null CLEARS the column (backend uses exclude_unset). */
+export interface AgentUpdateRequest {
+  description?: string;
+  model?: string;
+  tools?: string[];
+  skills?: string[];
+  system_prompt?: string;
+  execution_mode?: AgentExecutionMode | null;
+  auth_mode?: AgentAuthMode | null;
+  mcp_servers?: Record<string, unknown> | null;
+}

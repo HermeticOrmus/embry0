@@ -1,0 +1,47 @@
+# Changelog
+
+All notable changes to embry0 are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version
+numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) as
+[docs/releasing.md](docs/releasing.md) applies it to embry0.
+
+## [Unreleased]
+
+Nothing yet. Until `v0.1.0` is tagged, everything on `main` is part of 0.1.0.
+
+## [0.1.0] - not yet tagged
+
+The first public release. Nothing was released before it, so this entry
+describes what embry0 does rather than listing changes.
+
+### Added
+
+- **Issue-to-PR pipeline.** A triage agent plans each job, a developer agent
+  writes the code and opens the pull request, and a reviewer agent gates it.
+  Orchestration runs on LangGraph and the agents on the Claude Agent SDK, with
+  grok models available through xAI ([docs/providers.md](docs/providers.md)).
+- **QA gate.** Optionally boots the target application's compose stack inside
+  Docker-in-Docker and checks its acceptance criteria in a headless browser,
+  with Playwright or vibium. Screenshots, console, network and container logs
+  are kept as evidence. Each repository's QA config (`qa.yaml` v2) is stored in
+  embry0's database ([docs/qa-yaml-reference.md](docs/qa-yaml-reference.md)).
+- **Sandboxes and credential proxies.** Every job runs in its own Docker
+  container. Forge tokens stay in proxies that each sandbox enrolls with
+  separately, and git reaches only the job's repository.
+  [SECURITY.md](SECURITY.md) is the threat model, including what it does not
+  protect.
+- **Triggers.** GitHub and GitLab webhooks, a Linear label, the REST API and
+  the dashboard ([docs/webhooks.md](docs/webhooks.md)).
+- **Questions to a human.** An agent can pause a job to ask; the answer can come
+  from the dashboard, Telegram or a GitHub comment.
+- **Dashboard.** A React app with an issue tracker that syncs both ways with
+  GitHub, and live agent activity, costs and QA evidence over WebSocket. SSO is
+  optional ([docs/sso.md](docs/sso.md)).
+- **Budget caps** per job, per day and per month.
+- **Credential registry** for forge tokens and LLM accounts
+  ([docs/credentials.md](docs/credentials.md)).
+- **Log watcher and merge approvals.** The watcher turns faults in a
+  deployment's logs into draft issues ([docs/self-watching.md](docs/self-watching.md));
+  merge approvals ask a human in a chat before embry0 merges a pull request it
+  opened ([docs/merge-approvals.md](docs/merge-approvals.md)).
+- **MCP server** (`embry0-mcp`, and `embry0-mcp-http` for the hosted endpoint).

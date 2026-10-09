@@ -1,0 +1,151 @@
+# Public dashboard vhost: the origin a tunnel or reverse proxy publishes to
+# the internet. Rendered into conf.d by 40-dashboard-public-vhost.sh only when
+# DASHBOARD_PUBLIC_HOSTNAME is set. That variable's placeholder is the only
+# substitution; nginx's own variables are left alone. Every other Host is
+# served by the LAN vhost in default.conf.
+#
+# What this vhost adds over the LAN one:
+#   - X-Forwarded-Proto is HARDCODED to https. TLS terminates at the edge and
+#     the edge-to-nginx hop is plain http, so $scheme would say http and break
+#     the OAuth2 redirect and callback URLs.
+#   - Webhook, telegram and internal API paths are refused. They have their
+#     own ingress (the webhooks tunnel) or sandbox-only auth, and must not
+#     gain a second, browser-adjacent one.
+#   - Content-Security-Policy and Strict-Transport-Security.
+#
+# The CSP allows exactly what the built dashboard loads: its own scripts,
+# styles, images, /api, the /ws WebSocket and the SSE streams; Google Fonts,
+# which index.html links and src/index.css imports; blob: images (QA
+# artifact thumbnails); and inline <style> elements, which the toast library
+# injects at runtime. Scripts stay 'self' only. Auth0 is reached by
+# full-page navigation, which CSP does not govern. Adding a third-party
+# resource to the dashboard means adding its origin here.
+#
+# HSTS leaves out includeSubDomains: the hostname may be an apex whose other
+# subdomains this deployment does not own.
+#
+# nginx gotcha: add_header directives are inherited from the server block
+# only by location blocks that declare NO add_header of their own. /assets/
+# and / declare Cache-Control, so they repeat every security header.
+
+map $host $dashboard_public_csp {
+    default "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' blob:; connect-src 'self' wss://${DASHBOARD_PUBLIC_HOSTNAME}; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'";
+}
+
+server {
+    listen 80;
+    server_name ${DASHBOARD_PUBLIC_HOSTNAME};
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Security headers
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header Content-Security-Policy $dashboard_public_csp always;
+
+    # Gzip compression
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml text/javascript;
+    gzip_min_length 1000;
+
+    # Paths with their own dedicated ingress or sandbox-only auth are not
+    # served on the public dashboard origin.
+    location /api/v1/webhook {
+        return 404;
+    }
+    location /api/v1/telegram/ {
+        return 404;
+    }
+    location /api/v1/internal/ {
+        return 404;
+    }
+
+    # Hosted MCP endpoint — streamable HTTP to the mcp service. Bearer-auth
+    # enforced by the service itself (401 without a key).
+    location /mcp {
+        # Resolve at request time via Docker DNS so nginx boots (and the rest
+        # of the dashboard serves) even when the mcp service is not running.
+        resolver 127.0.0.11 valid=10s;
+        set $mcp_upstream http://mcp:9200;
+        proxy_pass $mcp_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 300s;
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
+    }
+
+    # API proxy — all remaining /api/* requests go to orchestrator
+    location /api/ {
+        proxy_pass http://orchestrator:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 300s;
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
+    }
+
+    # WebSocket proxy — /ws/* with protocol upgrade
+    location /ws/ {
+        proxy_pass http://orchestrator:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # Liveness probe for the tunnel.
+    location /health {
+        proxy_pass http://orchestrator:8000;
+        proxy_set_header Host $host;
+    }
+
+    # Hashed build output is immutable — a changed file always has a new name.
+    # Declares Cache-Control, so it re-states every security header (see the
+    # inheritance note at the top).
+    location /assets/ {
+        add_header X-Frame-Options "DENY" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header Content-Security-Policy $dashboard_public_csp always;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        try_files $uri =404;
+    }
+
+    # SPA fallback — all other routes serve index.html for client-side routing.
+    # index.html must be revalidated every time: it is the only file naming the
+    # current hashed bundles, so a cached copy pins a browser to the previous
+    # build after a deploy. Without an explicit Cache-Control, browsers apply
+    # heuristic freshness from Last-Modified and do exactly that.
+    location / {
+        add_header X-Frame-Options "DENY" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header Content-Security-Policy $dashboard_public_csp always;
+        add_header Cache-Control "no-cache" always;
+        try_files $uri $uri/ /index.html;
+    }
+}

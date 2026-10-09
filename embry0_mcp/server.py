@@ -1,0 +1,758 @@
+"""MCP server exposing the embry0 orchestrator API as MCP tools.
+
+Run via the ``embry0-mcp`` console script (stdio transport). Configure with
+``EMBRY0_API_URL`` (default ``http://localhost:8200``) and ``EMBRY0_API_KEY``.
+
+Destructive or mutating-sensitive tools (``job_cancel``, ``job_resume``,
+``job_answer``, ``agent_update``, ``agent_reset``, ``env_set``, ``env_delete``,
+``merge_decide``, ``case_accept``, ``case_close``, ``repo_register``,
+``qa_config_set``, ``credential_bind``) require ``confirm=true``; without it
+they return an instructive refusal instead of acting.
+"""
+
+from __future__ import annotations
+
+import functools
+import importlib.metadata
+import re
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+
+from embry0_mcp.client import Embry0APIError, Embry0Client
+
+mcp = MCPServer(
+    "embry0",
+    # mcp 1.x reported its own package version as the server's; mcp 2 reports ""
+    # unless told. Keep the 1.x value rather than send an empty version.
+    version=importlib.metadata.version("mcp"),
+    instructions=(
+        "Tools for driving the embry0 issue-to-PR / QA / research automation platform: "
+        "issues, jobs (create/wait/logs/deliverables), agent definitions, pipeline "
+        "templates, the log watcher, healing cases, merge approvals, per-repo environment "
+        "variables, and forge credentials (list, resolve, bind). "
+        "Destructive tools require confirm=true after explicit user approval. "
+        'Two lists answer "what is open?", and they are different things: '
+        'issue_list(status="open") is the work on the Issues page of the dashboard; '
+        "case_list(awaiting_decision=true) is the watcher's draft tickets waiting for a "
+        "person to accept or reject. case_list(open_only=true) is neither: it is every "
+        "finding not yet closed, including ones already merged, deployed and verified."
+    ),
+)
+
+_client: Embry0Client | None = None
+
+
+def _get_client() -> Embry0Client:
+    global _client
+    if _client is None:
+        _client = Embry0Client()
+    return _client
+
+
+def _confirmation_refusal(tool: str, action: str) -> dict[str, Any]:
+    return {
+        "error": "confirmation_required",
+        "message": (
+            f"Refused to {action}: {tool} is a destructive or mutating operation and was "
+            f"called without confirm=true. Ask the user to explicitly approve this exact "
+            f"action, then call {tool} again with confirm=true. Do not set confirm=true "
+            f"on the user's behalf without their approval."
+        ),
+    }
+
+
+def _tool[ToolFn: Callable[..., Awaitable[Any]]](fn: ToolFn) -> ToolFn:
+    """Register ``fn`` as an MCP tool whose embry0 API errors reach the caller.
+
+    mcp 2 answers any exception other than ``ToolError`` with a bare "Error
+    executing tool <name>" and keeps its text in the server log. An
+    ``Embry0APIError`` is the API's own answer (401 for a bad key, 403 for a
+    missing scope, 404, 409, a validation detail), which the caller needs in
+    order to act, so it is re-raised as ``ToolError`` and reaches the client as
+    "Error executing tool <name>: embry0 API error <status>: <detail>", exactly
+    as under mcp 1. Any other exception stays a crash: logged, not sent.
+
+    The registered wrapper keeps ``fn``'s name, docstring and signature, so the
+    tool's schema and description are unchanged; ``fn`` itself is returned, so a
+    direct call still raises ``Embry0APIError``.
+    """
+
+    @functools.wraps(fn)
+    async def call(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await fn(*args, **kwargs)
+        except Embry0APIError as exc:
+            raise ToolError(str(exc)) from exc
+
+    mcp.add_tool(call)
+    return fn
+
+
+# ------------------------------------------------------------- health / stats
+
+
+# ------------------------------------------------------- readable job output
+#
+# The API echoes a job's full `task` prompt back on every read. For a
+# multi-paragraph brief that is thousands of tokens of noise per call, and it
+# buries the five fields a caller actually reads: status, stage, spend, PR,
+# error. These helpers keep the structured payload intact (callers still get
+# every field) while adding a one-line `summary`, and trade the echoed prompt
+# for a bounded `task_preview`.
+
+_TASK_PREVIEW_CHARS = 220
+
+
+def _short_pr(url: str | None) -> str:
+    """`.../pull/211` -> `#211`; anything else passes through."""
+    if not url:
+        return "-"
+    match = re.search(r"/pull/(\d+)/?$", url)
+    return f"#{match.group(1)}" if match else url
+
+
+def _job_summary(job: dict[str, Any]) -> str:
+    """One glanceable line: id, status, stage, spend vs budget, repo, PR, error."""
+    budget = (job.get("pipeline_config") or {}).get("max_budget_usd")
+    spend = job.get("total_cost_usd") or 0.0
+    cost = f"${spend:.2f}" + (f"/${budget:g}" if budget else "")
+    stage = job.get("current_stage") or "-"
+    parts = [str(job.get("job_id", "?")), str(job.get("status", "?")), f"stage={stage}", cost]
+    if job.get("repo"):
+        parts.append(str(job["repo"]))
+    pr = _short_pr(job.get("pr_url"))
+    if pr != "-":
+        parts.append(f"PR {pr}")
+    error = job.get("error_message")
+    if error:
+        parts.append(f"ERROR: {str(error)[:120]}")
+    return " \u00b7 ".join(parts)
+
+
+def _compact_job(job: dict[str, Any]) -> dict[str, Any]:
+    """Add `summary`; swap the echoed `task` for a bounded preview. A non-dict is returned unchanged."""
+    if not isinstance(job, dict):
+        return job
+    out = dict(job)
+    task = out.get("task")
+    if isinstance(task, str) and len(task) > _TASK_PREVIEW_CHARS:
+        out["task_preview"] = task[:_TASK_PREVIEW_CHARS].rstrip() + "\u2026"
+        out["task_chars"] = len(task)
+        del out["task"]
+    out["summary"] = _job_summary(out)
+    return out
+
+
+def _compact_jobs(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Compact each job in a list envelope and add an aligned `board` table. Anything else is returned unchanged."""
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("jobs"), list):
+        return envelope
+    out = dict(envelope)
+    out["jobs"] = [_compact_job(j) for j in envelope["jobs"]]
+    rows = [
+        (
+            str(j.get("job_id", "?")),
+            str(j.get("status", "?")),
+            str(j.get("current_stage") or "-"),
+            f"{j.get('total_cost_usd') or 0:.2f}",
+            _short_pr(j.get("pr_url")),
+        )
+        for j in out["jobs"]
+        if isinstance(j, dict)
+    ]
+    if rows:
+        head = ("JOB", "STATUS", "STAGE", "COST", "PR")
+        widths = [max(len(r[i]) for r in (*rows, head)) for i in range(len(head))]
+        fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+        out["board"] = "\n".join([fmt.format(*head), *(fmt.format(*r) for r in rows)])
+    return out
+
+
+@_tool
+async def health() -> dict[str, Any]:
+    """Check embry0 orchestrator health (API reachability + database status)."""
+    return await _get_client().health()
+
+
+@_tool
+async def stats() -> dict[str, Any]:
+    """Platform statistics: issue/job counts, success rate, costs, queue depth, token usage."""
+    return await _get_client().stats()
+
+
+# ------------------------------------------------------------------- issues
+
+
+@_tool
+async def issue_list(
+    status: str | None = None,
+    priority: str | None = None,
+    repo: str | None = None,
+    labels: str | None = None,
+    search: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """List embry0 issues — the dashboard's Issues page (paginated envelope: issues,
+    total, offset, limit). With no status every issue is returned, closed ones too.
+
+    For "what is open?" pass status="open": issues that are neither running nor done —
+    new ones, and ones whose last job failed (a failed job returns its issue to open so
+    it can be retried). Watcher drafts nobody has accepted yet are not issues; they are
+    case_list(awaiting_decision=true).
+
+    Filters: status (open|triaging|in_progress|awaiting_input|closed|cancelled),
+    priority (critical|high|medium|low), repo ("group/name", or a GitLab subgroup path
+    like "group/subgroup/project"), labels, free-text search.
+    """
+    return await _get_client().issue_list(
+        status=status, priority=priority, repo=repo, labels=labels, search=search, limit=limit, offset=offset
+    )
+
+
+@_tool
+async def issue_get(issue_id: str) -> dict[str, Any]:
+    """Get one issue with its children and associated jobs."""
+    return await _get_client().issue_get(issue_id)
+
+
+@_tool
+async def issue_create(
+    title: str,
+    body: str = "",
+    labels: list[str] | None = None,
+    priority: str = "medium",
+    repo: str | None = None,
+    auto_triage: bool = True,
+) -> dict[str, Any]:
+    """Create an embry0 issue. Labels drive auto-dispatch; with auto_triage=true (default)
+    the issue is immediately triaged and a pipeline job may be dispatched from it.
+    The result carries job_id (the started job), dispatch_error_code and
+    dispatch_error: a non-null dispatch_error_code (ERR_DISPATCH_FAILED) means the
+    issue was created but NO job started — report it rather than assuming a run.
+
+    priority: critical|high|medium|low. repo: the path of an onboarded repository —
+    "group/name", or a GitLab subgroup path like "group/subgroup/project".
+    """
+    return await _get_client().issue_create(
+        title, body=body, labels=labels, priority=priority, repo=repo, auto_triage=auto_triage
+    )
+
+
+# --------------------------------------------------------------------- jobs
+
+
+@_tool
+async def job_list(
+    status: str | None = None,
+    repo: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """List jobs (paginated envelope: jobs, total, offset, limit). Filter by status
+    (pending|running|awaiting_input|paused|completed|failed|cancelled|partial|expired|pr_merged|pr_closed)
+    and/or repo ("group/name", or a GitLab subgroup path like "group/subgroup/project")."""
+    return _compact_jobs(await _get_client().job_list(status=status, repo=repo, limit=limit, offset=offset))
+
+
+@_tool
+async def job_get(job_id: str) -> dict[str, Any]:
+    """Get one job: status, current stage, costs (with per-agent breakdown), PR URL,
+    error details, result summary."""
+    return _compact_job(await _get_client().job_get(job_id))
+
+
+@_tool
+async def job_create(
+    task: str | None = None,
+    repo: str | None = None,
+    pipeline: str | None = None,
+    issue_number: int | None = None,
+    branch: str | None = None,
+    context: dict[str, Any] | None = None,
+    pipeline_template: str | None = None,
+    pipeline_config: dict[str, Any] | None = None,
+    sandbox_profile: str | None = None,
+    max_budget_usd: float | None = None,
+    additional_context: str | None = None,
+    agent_models: dict[str, str] | None = None,
+    qa: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a pipeline job. Returns the created job (poll with job_wait).
+
+    - Code job: task + repo — "group/name", or a GitLab subgroup path like
+      "group/subgroup/project" (any depth).
+      Pass the project's full path exactly as the forge spells it; never shorten it
+      to two segments. The repo must already be registered (repo_register).
+    - Research job over a URL: task + context={"type": "http", "url": "https://..."}.
+    - Repo-less job: task alone (context defaults to {"type": "none"}).
+    - QA pipeline: pipeline="qa" + repo + branch (optional qa overrides object).
+    - Onboard: pipeline="onboard" + repo.
+    task is required for every pipeline except qa/onboard.
+    """
+    return await _get_client().job_create(
+        task=task,
+        repo=repo,
+        pipeline=pipeline,
+        issue_number=issue_number,
+        branch=branch,
+        context=context,
+        pipeline_template=pipeline_template,
+        pipeline_config=pipeline_config,
+        sandbox_profile=sandbox_profile,
+        max_budget_usd=max_budget_usd,
+        additional_context=additional_context,
+        agent_models=agent_models,
+        qa=qa,
+    )
+
+
+@_tool
+async def job_wait(job_id: str, timeout: float = 600.0, poll_interval: float = 5.0) -> dict[str, Any]:
+    """Wait server-side until a job reaches a terminal status (completed|failed|cancelled|
+    partial|expired) or timeout (seconds) elapses. On timeout the current job state is
+    returned with wait_timed_out=true. Use this instead of polling job_get in a loop."""
+    return await _get_client().job_wait(job_id, timeout=timeout, poll_interval=poll_interval)
+
+
+@_tool
+async def job_resume(job_id: str, choice: str, guidance: str = "", confirm: bool = False) -> dict[str, Any]:
+    """Resume a paused job. choice: continue_retrying | merge_as_is | abandon; optional
+    guidance text for the agents. Requires confirm=true (mutates job state)."""
+    if not confirm:
+        return _confirmation_refusal("job_resume", f"resume job {job_id} with choice={choice!r}")
+    return await _get_client().job_resume(job_id, choice, guidance=guidance)
+
+
+@_tool
+async def job_inputs(job_id: str) -> list[dict[str, Any]]:
+    """List agent questions (inputs) for a job: question text, asking agent, importance,
+    status (pending|answered|auto_answered|skipped), and any recorded answer. Use on an
+    awaiting_input job to find the pending question ids before calling job_answer."""
+    return await _get_client().job_inputs(job_id)
+
+
+@_tool
+async def job_answer(job_id: str, input_id: str, answer: str, confirm: bool = False) -> dict[str, Any]:
+    """Answer a pending agent question on a job. When no blocking questions remain the
+    workflow resumes from its checkpoint with the accumulated Q&A as context. The Q&A pair
+    is also recorded as a comment on the linked Linear issue. Requires confirm=true
+    (mutates job state) — echo the exact answer to the user for approval first."""
+    if not confirm:
+        return _confirmation_refusal("job_answer", f"answer input {input_id} on job {job_id}")
+    return await _get_client().job_input_answer(job_id, input_id, answer)
+
+
+@_tool
+async def job_cancel(job_id: str, confirm: bool = False) -> dict[str, Any]:
+    """Cancel a pending/running/awaiting_input/paused job. Requires confirm=true
+    (destructive: the job's work is abandoned)."""
+    if not confirm:
+        return _confirmation_refusal("job_cancel", f"cancel job {job_id}")
+    return await _get_client().job_cancel(job_id)
+
+
+@_tool
+async def job_logs(job_id: str, tail: int = 50) -> dict[str, Any]:
+    """Pipeline event log for a job ({"events": [...]}). tail limits to the most recent
+    N events (0 = all — can be large)."""
+    data = await _get_client().job_logs(job_id)
+    events = data.get("events")
+    if tail > 0 and isinstance(events, list) and len(events) > tail:
+        return {"events": events[-tail:], "truncated": True, "total_events": len(events)}
+    return data
+
+
+@_tool
+async def job_deliverables(job_id: str) -> list[dict[str, Any]]:
+    """List a job's deliverables. Report/text deliverables carry their content inline;
+    artifact deliverables get a download_url (binary passthrough endpoint)."""
+    return await _get_client().job_deliverables(job_id)
+
+
+# ------------------------------------------------------------------- agents
+
+
+@_tool
+async def agent_list() -> list[dict[str, Any]]:
+    """List all agent definitions (type, description, model, tools, skills, execution mode)."""
+    return await _get_client().agent_list()
+
+
+@_tool
+async def agent_get(agent_type: str) -> dict[str, Any]:
+    """Get one agent definition, including its system prompt and MCP server config."""
+    return await _get_client().agent_get(agent_type)
+
+
+@_tool
+async def agent_update(
+    agent_type: str,
+    description: str | None = None,
+    model: str | None = None,
+    tools: list[str] | None = None,
+    skills: list[str] | None = None,
+    system_prompt: str | None = None,
+    execution_mode: str | None = None,
+    auth_mode: str | None = None,
+    mcp_servers: dict[str, Any] | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Update an agent definition (only provided fields change). execution_mode: sdk|cli;
+    auth_mode: api_key|oauth. Requires confirm=true (changes live pipeline behavior)."""
+    if not confirm:
+        return _confirmation_refusal("agent_update", f"update agent definition {agent_type!r}")
+    return await _get_client().agent_update(
+        agent_type,
+        description=description,
+        model=model,
+        tools=tools,
+        skills=skills,
+        system_prompt=system_prompt,
+        execution_mode=execution_mode,
+        auth_mode=auth_mode,
+        mcp_servers=mcp_servers,
+    )
+
+
+@_tool
+async def agent_reset(agent_type: str, confirm: bool = False) -> dict[str, Any]:
+    """Reset an agent definition to its built-in defaults, discarding customizations.
+    Requires confirm=true (destructive)."""
+    if not confirm:
+        return _confirmation_refusal("agent_reset", f"reset agent definition {agent_type!r} to defaults")
+    return await _get_client().agent_reset(agent_type)
+
+
+# ---------------------------------------------------------------- templates
+
+
+@_tool
+async def template_list() -> list[dict[str, Any]]:
+    """List pipeline templates (custom agent graphs)."""
+    return await _get_client().template_list()
+
+
+@_tool
+async def template_get(template_id: str) -> dict[str, Any]:
+    """Get one pipeline template, including its graph definition and agent model map."""
+    return await _get_client().template_get(template_id)
+
+
+@_tool
+async def template_validate(graph: dict[str, Any]) -> dict[str, Any]:
+    """Validate a pipeline graph definition without saving it.
+    Returns {"valid": bool, "errors": [...]}."""
+    return await _get_client().template_validate(graph)
+
+
+# ------------------------------------------------------------------ watcher
+
+
+@_tool
+async def logs_query(
+    container: str | None = None,
+    search: str | None = None,
+    since_minutes: int = 60,
+    limit: int = 200,
+    logql: str | None = None,
+) -> dict[str, Any]:
+    """Read production container logs (Loki), newest first — for on-demand bug
+    investigation. container: Docker container name substring (e.g. "api");
+    search: regex line filter (e.g. "(?i)error|exception"); since_minutes: lookback
+    window (max 1440); limit: max lines (default 200, max 1000); logql: raw LogQL
+    override for advanced queries. Keep limit modest — lines land in your context."""
+    return await _get_client().logs_query(
+        container=container, search=search, since_minutes=since_minutes, limit=limit, logql=logql
+    )
+
+
+@_tool
+async def watcher_runs(limit: int = 50) -> list[dict[str, Any]]:
+    """List recent log-watcher runs (anomaly scans that file draft tickets)."""
+    return await _get_client().watcher_runs(limit=limit)
+
+
+@_tool
+async def watcher_trigger(timeout: float = 900.0) -> dict[str, Any]:
+    """Trigger one log-watcher tick now and return its summary. Safe: proposal caps,
+    dedup, and the human gate still apply. A tick runs an LLM analysis job
+    synchronously and takes minutes — timeout (seconds) bounds the wait; the tick
+    keeps running server-side even if it elapses."""
+    return await _get_client().watcher_trigger(timeout=timeout)
+
+
+# -------------------------------------------------------------------- cases
+
+
+@_tool
+async def case_list(
+    repo: str | None = None,
+    stage: str | None = None,
+    origin: str | None = None,
+    resolution_path: str | None = None,
+    healed_verdict: str | None = None,
+    fix_deployed: bool | None = None,
+    open_only: bool = False,
+    awaiting_decision: bool = False,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """List healing cases — one lifecycle record per finding, newest first (envelope:
+    cases, total, limit, next_cursor — pass next_cursor back as cursor for the next page). A case links the watcher run, tracker
+    ticket, embry0 issue, PRs, merge, deploy marker and healed verdict for one finding.
+    fix_deployed says whether a merged fix is running; do NOT infer that from stage — a
+    case can be verified or closed with no fix at all (self_resolved, non_code).
+
+    Filters: repo ("group/name"), stage (detected|tracked|accepted|pr_open|merged|
+    deployed|verified|closed), origin (watcher|human|webhook|alert|ci), resolution_path
+    (embry0|out_of_band|cancelled|non_code|self_resolved|abandoned), healed_verdict
+    (pending|healed|not_healed|inconclusive|regressed), fix_deployed (true/false — use
+    THIS, not stage=verified, to find findings a shipped fix healed), awaiting_decision
+    (use THIS for "what needs a decision?": watcher drafts with a ticket that nobody has
+    accepted or rejected), open_only (every case whose stage is not closed — that
+    includes merged, deployed and verified cases, alerts and findings with no ticket, so
+    it answers neither "what is open on the dashboard?", which is
+    issue_list(status="open"), nor "what needs a decision?"). limit max 200."""
+    return await _get_client().case_list(
+        repo=repo,
+        stage=stage,
+        origin=origin,
+        resolution_path=resolution_path,
+        healed_verdict=healed_verdict,
+        fix_deployed=fix_deployed,
+        open_only=open_only,
+        awaiting_decision=awaiting_decision,
+        limit=limit,
+        cursor=cursor,
+    )
+
+
+@_tool
+async def case_get(case_id: str) -> dict[str, Any]:
+    """Get one healing case ("hc-...") with its linked jobs, every PR it had, and full stage history."""
+    return await _get_client().case_get(case_id)
+
+
+# ---------------------------------------------------------- merge approvals
+
+
+@_tool
+async def case_accept(case_id: str, accepted_by: str, confirm: bool = False) -> dict[str, Any]:
+    """Accept a watcher finding ("hc-...") and dispatch the fix pipeline on its draft
+    ticket — what adding the trigger label in the tracker does. accepted_by: the name of
+    the person who said yes.
+
+    Works for a GitHub draft and for a Linear draft. For a Linear draft embry0 puts the
+    trigger label on the ticket itself and then dispatches it, so the ticket shows the
+    acceptance; nobody needs to label it by hand. A GitLab draft is still accepted by
+    adding the label in GitLab (409 here).
+
+    embry0 refuses (409/403) anything that is not a watcher finding at stage "tracked"
+    on a stack this orchestrator watches, and a Linear ticket that cannot take a job
+    (finished, already dispatched, or belonging to another repo than the finding's). An
+    error says what was done to the ticket; read it out — in the rare case where the
+    label went on and could not be taken off again it asks for the label to be removed
+    in Linear. Returns the job_id it started; there is no success without one. Requires
+    confirm=true."""
+    if not confirm:
+        return _confirmation_refusal("case_accept", f"accept finding {case_id} and dispatch its fix")
+    return await _get_client().case_accept(case_id, accepted_by=accepted_by)
+
+
+@_tool
+async def case_close(
+    case_id: str,
+    closed_by: str,
+    resolution_path: str | None = None,
+    note: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Close a healing case ("hc-...") a human has decided is settled — the mirror of
+    case_accept, for a finding nobody will ship a fix for. closed_by: the name of the
+    person who decided. note: why, for the ledger.
+
+    resolution_path says what really happened and is required unless the case already
+    carries one: "out_of_band" (fixed outside embry0), "abandoned" (accepted, looked at,
+    given up), "non_code" (nothing to change in code), "cancelled" (the finding was
+    withdrawn), "self_resolved" (it stopped by itself), "embry0" (embry0's own merge).
+    embry0 refuses (409) a case that is already closed. Closing is terminal but keeps
+    history: a later recurrence opens a new case pointing at this one. Requires
+    confirm=true."""
+    if not confirm:
+        return _confirmation_refusal("case_close", f"close case {case_id} as {resolution_path or 'its existing path'}")
+    return await _get_client().case_close(case_id, resolution_path=resolution_path, note=note, closed_by=closed_by)
+
+
+@_tool
+async def merge_approval_list(status: str | None = None, limit: int = 20) -> dict[str, Any]:
+    """List "merge this PR?" asks, newest first. status: pending|approved|rejected|merged|
+    failed|stale|closed|expired (closed = the PR was merged or closed on GitHub; expired =
+    nobody answered in time). `mode` in the envelope says whether a decision would really merge (on)
+    or only record "would merge" (dry_run)."""
+    return await _get_client().merge_approval_list(status=status, limit=limit)
+
+
+@_tool
+async def merge_approval_get(approval_id: str) -> dict[str, Any]:
+    """Get one merge ask ("mrg-..."): the PR, the head commit it was asked about, the
+    denylisted paths and verification verdict shown with it, and its status."""
+    return await _get_client().merge_approval_get(approval_id)
+
+
+@_tool
+async def merge_decide(
+    approval_id: str, decision: str, decided_by: str, chat_id: str, confirm: bool = False
+) -> dict[str, Any]:
+    """Relay a human's answer to a "merge this PR?" ask. decision: "approve" or "reject".
+    decided_by: the name of the person who answered. chat_id: the id of the chat the
+    answer came from, exactly as you received it — embry0 refuses answers from any chat
+    but the approval chat.
+
+    embry0 then re-checks everything itself: the PR head must still be the commit that
+    was asked about (otherwise the ask goes stale and a fresh one is posted), every CI
+    check must have passed, the verification gate must not have found new failures, and
+    GitHub must say the PR merges cleanly. A refused approval comes back with
+    outcome="refused" and the reason; the same ask can be approved again later. outcome
+    "would_merge" means dry-run mode: nothing was merged. Requires confirm=true."""
+    if not confirm:
+        return _confirmation_refusal("merge_decide", f"{decision} merge approval {approval_id}")
+    return await _get_client().merge_decide(approval_id, decision=decision, decided_by=decided_by, chat_id=chat_id)
+
+
+# -------------------------------------------------------------- environment
+
+
+@_tool
+async def env_list(repo: str | None = None) -> dict[str, Any]:
+    """List environment variables — global set by default, or a repo's set when repo
+    ("group/name", or a GitLab subgroup path like "group/subgroup/project") is given.
+    Secret values are always masked as "****"; there is no tool to read secret values."""
+    return await _get_client().env_list(repo=repo)
+
+
+@_tool
+async def env_set(
+    key: str,
+    value: str,
+    var_type: str = "config",
+    description: str = "",
+    required: bool = False,
+    scope: str = "app",
+    repo: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Create or update one environment variable (write-only: values are never readable
+    back through MCP). var_type: config|secret; scope: app|qa (qa keys must start with
+    QA_); repo=None targets the global set. Requires confirm=true."""
+    if not confirm:
+        scope_desc = f"repo {repo!r}" if repo else "the global scope"
+        return _confirmation_refusal("env_set", f"set environment variable {key!r} in {scope_desc}")
+    return await _get_client().env_set(
+        key, value, var_type=var_type, description=description, required=required, scope=scope, repo=repo
+    )
+
+
+@_tool
+async def env_delete(key: str, repo: str | None = None, confirm: bool = False) -> dict[str, Any]:
+    """Delete one environment variable from the global set (repo=None) or a repo's set.
+    Requires confirm=true (destructive: secret values are not recoverable)."""
+    if not confirm:
+        scope_desc = f"repo {repo!r}" if repo else "the global scope"
+        return _confirmation_refusal("env_delete", f"delete environment variable {key!r} from {scope_desc}")
+    return await _get_client().env_delete(key, repo=repo)
+
+
+@_tool
+async def repo_list(include_inactive: bool = False) -> list[dict[str, Any]]:
+    """List registered target repos (the embry0 repo registry) with a
+    has_qa_config flag per repo. include_inactive=true also shows deactivated repos."""
+    return await _get_client().repo_list(include_inactive=include_inactive)
+
+
+@_tool
+async def repo_get(repo: str) -> dict[str, Any]:
+    """Unified view of one registered repo — "group/name", or a GitLab
+    subgroup path like "group/subgroup/project": registry row, has_qa_config
+    + last config update, preferences (sandbox profile etc.), and env
+    var/secret counts. 404s when the repo is not registered."""
+    return await _get_client().repo_get(repo)
+
+
+@_tool
+async def repo_register(repo: str, notes: str = "", forge: str = "", confirm: bool = False) -> dict[str, Any]:
+    """Register a repo in the embry0 registry — "group/name", or a GitLab
+    subgroup path like "group/subgroup/project". ``forge`` is "github" or
+    "gitlab"; it decides the clone origin for every sandbox and whether
+    embry0 opens a PR or an MR. Leave it empty to inherit the server's
+    DEFAULT_FORGE — a server configured with no default refuses the
+    registration rather than guessing, so pass it explicitly there.
+    Idempotent. Requires confirm=true (creates platform state)."""
+    if not confirm:
+        return _confirmation_refusal(
+            "repo_register", f"register repo {repo!r} on {forge or 'the server default forge'}"
+        )
+    return await _get_client().repo_register(repo, notes=notes, forge=forge)
+
+
+@_tool
+async def qa_config_get(repo: str) -> dict[str, Any]:
+    """The stored qa.yaml v2 document for a repo ("group/name", or a GitLab subgroup
+    path like "group/subgroup/project") — the DB is the source of truth;
+    target repos carry no config file."""
+    text = await _get_client().qa_config_get(repo)
+    return {"repo": repo, "yaml_text": text}
+
+
+@_tool
+async def qa_config_set(repo: str, yaml_text: str, confirm: bool = False) -> dict[str, Any]:
+    """Create or replace a repo's stored qa.yaml v2 document (schema-validated
+    server-side; auto-registers the repo). Requires confirm=true — this changes
+    how every future QA run judges the repo."""
+    if not confirm:
+        return _confirmation_refusal("qa_config_set", f"replace the stored QA config for {repo!r}")
+    return await _get_client().qa_config_set(repo, yaml_text)
+
+
+@_tool
+async def credential_list() -> list[dict[str, Any]]:
+    """Registered forge accounts (id, label, provider, host, masked preview, status, binding count).
+    Never returns a secret."""
+    return await _get_client().credential_list()
+
+
+@_tool
+async def credential_resolve(repo: str, role: str = "forge") -> dict[str, Any]:
+    """Dry run: which account a job on this repo would use for `role`, with the precedence
+    trace (repo > owner > host > global > env). Never returns a secret.
+
+    repo is "group/name", or a GitLab subgroup path like "group/subgroup/project".
+    """
+    return await _get_client().credential_resolve(repo, role)
+
+
+@_tool
+async def credential_bind(
+    repo: str, credential_id: str, role: str = "forge", pinned: bool = False, confirm: bool = False
+) -> dict[str, Any]:
+    """Bind a registered credential to a repo for `role` (replacing that role's binding, keeping
+    others). Requires confirm=true and an admin-scope key — it changes which account every future
+    job on the repo pushes and opens PRs as. Never returns a secret.
+
+    repo is "group/name", or a GitLab subgroup path like "group/subgroup/project".
+    """
+    if not confirm:
+        return _confirmation_refusal("credential_bind", f"bind {credential_id!r} to {repo!r} for role {role!r}")
+    return await _get_client().credential_bind(repo, credential_id, role, pinned)
+
+
+def main() -> None:
+    """Console entry point: run the MCP server over stdio."""
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()

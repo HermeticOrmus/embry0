@@ -1,0 +1,117 @@
+"""Global audit read API (RAV-1056 Phase C).
+
+Mounted behind the normal operator+ auth; tier logic lives in-handler:
+admins (admin session, master key, admin-scope key) see every row, while
+operator/read callers see only rows whose ``actor`` matches the strings
+they could have produced via ``request_actor`` (session email, key-owner
+email, or ``key:<name>`` for service keys).
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+
+from fastapi import APIRouter, Depends, Query, Request
+from pydantic import BaseModel
+
+from embry0.api.deps import get_audit_repo, unidentified_caller_tier
+from embry0.api.session import TIER_ADMIN
+from embry0.storage.repositories.audit import AuditRepository
+
+router = APIRouter()
+
+_SENSITIVE_KEY_PARTS = ("key", "token", "secret", "password")
+
+
+class AuditEntry(BaseModel):
+    id: int
+    action: str
+    actor: str
+    details: dict[str, Any]
+    issue_id: str | None = None
+    created_at: datetime
+
+
+class AuditListResponse(BaseModel):
+    entries: list[AuditEntry]
+    total: int
+
+
+def _redact(details: dict[str, Any]) -> dict[str, Any]:
+    """Shallow-recursive redaction of secret-shaped values.
+
+    Historical ``provider_config_updated`` / ``integration_config_updated``
+    rows carry raw secrets in their update payloads; never echo those to a
+    browser, even for admins.
+    """
+    out: dict[str, Any] = {}
+    for k, v in details.items():
+        if isinstance(v, dict):
+            out[k] = _redact(v)
+        elif any(part in k.lower() for part in _SENSITIVE_KEY_PARTS):
+            out[k] = "[redacted]"
+        else:
+            out[k] = v
+    return out
+
+
+async def _caller_scope(request: Request) -> tuple[str, list[str]]:
+    """Resolve ``(tier, own_actor_strings)`` for row filtering.
+
+    Mirrors the api_keys ``_caller`` pattern: session state wins, then key
+    principal, then the AUTH_DEV_MODE fallback (full access, no identity —
+    the unit-test conftest relies on it). Outside AUTH_DEV_MODE a caller with
+    neither is refused (#518).
+    """
+    session = getattr(request.state, "session", None)
+    if session is not None:
+        return session.tier, [session.email]
+    principal = getattr(request.state, "principal", None)
+    if principal is not None:
+        if principal.kind == "master":
+            return TIER_ADMIN, []
+        own = [principal.email] if principal.email else [f"key:{principal.key_name}"]
+        return principal.tier, own
+    return unidentified_caller_tier(request), []
+
+
+@router.get("/audit")
+async def list_audit(
+    request: Request,
+    actor: str | None = None,
+    action: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    repo: AuditRepository = Depends(get_audit_repo),
+) -> AuditListResponse:
+    # asyncpg rejects naive-vs-aware comparisons against timestamptz.
+    if since is not None and since.tzinfo is None:
+        since = since.replace(tzinfo=UTC)
+    if until is not None and until.tzinfo is None:
+        until = until.replace(tzinfo=UTC)
+
+    tier, own = await _caller_scope(request)
+    if tier == TIER_ADMIN:
+        actors = [actor] if actor else None
+    else:
+        if actor and actor not in own:
+            return AuditListResponse(entries=[], total=0)
+        actors = [actor] if actor else own
+
+    rows = await repo.list_entries(actors=actors, action=action, since=since, until=until, limit=limit, offset=offset)
+    total = await repo.count_entries(actors=actors, action=action, since=since, until=until)
+    entries = [
+        AuditEntry(
+            id=r["id"],
+            action=r["action"],
+            actor=r["actor"],
+            details=_redact(r["details"] or {}),
+            issue_id=r["issue_id"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+    return AuditListResponse(entries=entries, total=total)

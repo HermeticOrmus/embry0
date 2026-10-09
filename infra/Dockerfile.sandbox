@@ -1,0 +1,135 @@
+FROM python:3.12.7-slim-bookworm AS base
+
+# Upgrade OS packages first — the pinned base tag ships a CRITICAL OpenSSL
+# (CVE-2026-31789) whose fix is already in the Debian repos.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
+# System dependencies — base + Playwright/Chromium runtime libraries.
+#
+# Without the libnss3/libgbm1/libxkbcommon0/libdrm2/etc. set, every QA
+# sub-task's agent reports `Browser automation could not be executed
+# (slim sandbox missing libglib-2.0.so.0, libX11.so.6, libgtk-3.so.0 …
+# required by Chromium and Firefox headless shells)` and falls back to
+# HTTP probing + source-code analysis. That degraded mode produces
+# inconclusive results and zero screenshots — the QA agent's whole
+# reason-for-being is browser automation, so these libs are required,
+# not optional. List drawn from `npx playwright install-deps`'s
+# bookworm package set.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates jq \
+        # Playwright / Chromium runtime
+        libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+        libdbus-1-3 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+        libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
+        libasound2 libatspi2.0-0 libxshmfence1 libx11-6 libxcb1 \
+        libxext6 libgtk-3-0 libglib2.0-0 \
+        # Fonts so headless Chromium can render text without subs
+        fonts-liberation fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js for the repositories agents work on (npm, npx). The Claude
+# CLI does not need it: the Agent SDK ships its own native CLI (below).
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    # npm self-upgrade — nodesource bundles an npm whose vendored tar carries
+    # CRITICAL CVE-2026-59873 (fixed in tar >= 7.5.19).
+    && npm install -g npm@latest
+
+# Python dependencies for sandbox
+# claude-agent-sdk is the ONE source of the Claude CLI version (#497): every
+# agent query() runs the CLI bundled in its wheel (claude_agent_sdk/_bundled,
+# 2.1.292 for 0.2.164), and embry0 never passes cli_path. There is no npm
+# @anthropic-ai/claude-code here on purpose; a CLI bump is an SDK bump.
+# langchain-core: embry0.sandbox.runner uses RunnableConfig (type hint only,
+# but imported at module load via cast()).
+RUN pip install --no-cache-dir \
+    "claude-agent-sdk==0.2.164" \
+    "anthropic>=0.69,<1" \
+    "structlog>=26.1,<27" \
+    "httpx>=0.27,<1" \
+    "langchain-core>=0.3,<1"
+
+# Sandbox code (runs inside container).
+# embry0/agents/ + the docker_client/auth_provider/agent_runner subset are
+# imported transitively from embry0.sandbox.runner -> executor_factory ->
+# SdkAgentExecutor; the sandbox runner cannot start without them.
+#
+# sandbox_manager.py is intentionally NOT copied: the runner only needs
+# AgentOutput (a dataclass) from agent_runner.py and never instantiates
+# AgentRunner. agent_runner guards its SandboxManager import behind
+# TYPE_CHECKING so loading the module does not transitively pull in
+# image_registry / cache_manager / etc. — modules that don't belong inside
+# the sandbox.
+COPY embry0/sandbox/ /app/embry0/sandbox/
+COPY embry0/safety/ /app/embry0/safety/
+COPY embry0/agents/ /app/embry0/agents/
+COPY embry0/execution/events.py /app/embry0/execution/events.py
+COPY embry0/execution/agent_runner.py /app/embry0/execution/agent_runner.py
+COPY embry0/execution/auth_provider.py /app/embry0/execution/auth_provider.py
+COPY embry0/execution/docker_client.py /app/embry0/execution/docker_client.py
+
+# Private-CA trust helper (spec 1A 3.2). Root-owned and +x; the agent user
+# runs it with the PEM on stdin, and it writes the merged bundle into $HOME.
+COPY infra/scripts/embry0-trust-ca /usr/local/bin/embry0-trust-ca
+RUN chmod 0755 /usr/local/bin/embry0-trust-ca
+
+# Make embry0 packages importable
+RUN mkdir -p /app/embry0/execution && \
+    touch /app/embry0/__init__.py /app/embry0/execution/__init__.py
+
+ENV PYTHONPATH=/app
+
+# Non-root user
+RUN useradd --create-home agent
+
+# Create writable workspace (tmpfs in docker run, but need the dir)
+RUN mkdir -p /workspace && chown agent:agent /workspace
+
+USER agent
+WORKDIR /workspace
+
+# Fail the build, not the first agent run (#497): the SDK must support the
+# Ring-3 PreToolUse hook, its bundled CLI must be the version it pins, and no
+# other `claude` version may be on PATH. Runs as the agent user, with a
+# throwaway HOME so the CLI leaves nothing in the image.
+RUN home=$(mktemp -d) && HOME="$home" python -m embry0.agents.sdk_support && rm -rf "$home"
+
+# --- dev-python -------------------------------------------------------------
+# Lean dev-check toolchain for Poetry-based Python repos. Same base as the
+# slim sandbox: no Chromium, no Docker CLI, no JDK. Repo dependencies are
+# installed per-job by the agent (`poetry install`), not baked here.
+FROM base AS dev-python
+USER root
+RUN pip install --no-cache-dir "poetry==1.8.4"
+USER agent
+WORKDIR /workspace
+
+# --- dev-jvm-python ---------------------------------------------------------
+# Dev-check toolchain for a JVM repo whose test suites are Python:
+# a Java 21 backend (backend/pom.xml) whose suites are pure pytest.
+#
+# Inherits Python 3.12, Node 22 and the Claude CLI from `base`; adds JDK 21
+# and Poetry. Poetry is the same pin as the dev-python stage so a monorepo
+# whose dev checks are Maven in one tree and Poetry in another can use one
+# image. No Maven package: the repo ships backend/mvnw, and the wrapper
+# provisions Maven itself. No Docker CLI, by design — these suites drive
+# containers only through injected seams, so a real `docker` call is a bug we
+# want to fail loudly rather than quietly satisfy.
+#
+# JDK 21 is not in Debian bookworm (main ships 17), so this uses Eclipse
+# Temurin's apt repo — the same Adoptium-signed source as Dockerfile.sandbox.qa.
+FROM base AS dev-jvm-python
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg \
+    && curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public \
+       | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb bookworm main" \
+       > /etc/apt/sources.list.d/adoptium.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        temurin-21-jdk \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir "poetry==1.8.4"
+USER agent
+WORKDIR /workspace

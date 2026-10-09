@@ -1,0 +1,10 @@
+# Placeholders. Copy to a root module outside this repository as
+# terraform.tfvars and fill in your own values.
+cloudflare_account_id          = "0123456789abcdef0123456789abcdef"
+cloudflare_zone_id             = "fedcba9876543210fedcba9876543210"
+dashboard_hostname             = "dashboard.example.com"
+dashboard_access_email_domains = ["example.com"]
+webhooks_hostname              = "webhooks.example.com"
+proxmox_node                   = "example-node"
+vm_id                          = 900
+vm_name                        = "example-embry0"

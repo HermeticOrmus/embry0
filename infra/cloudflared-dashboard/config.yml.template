@@ -1,0 +1,18 @@
+# Public-dashboard tunnel ingress (Pattern B), rendered for
+# DASHBOARD_PUBLIC_HOSTNAME by the cloudflared-dashboard-config compose
+# service, with the same script and rules as the frontend's public vhost
+# (frontend/nginx/render-dashboard-public.sh). Not mounted as is: the tunnel
+# reads only the rendered copy, and does not start until a render succeeds.
+#
+# Rule 0 sends the dashboard hostname to nginx, which serves it from its
+# hardened public vhost. Everything else gets a 404 here, never nginx's
+# permissive LAN vhost.
+#
+# No `tunnel:` key on purpose: the UUID is passed on the CLI
+# (`run ${CF_TUNNEL_ID}`), which keeps this file environment-agnostic and
+# means cloudflared never needs a login cert.pem.
+credentials-file: /etc/cloudflared/creds.json
+ingress:
+  - hostname: ${DASHBOARD_PUBLIC_HOSTNAME}
+    service: http://frontend:80
+  - service: http_status:404

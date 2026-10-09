@@ -1,0 +1,98 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+# Stray npm artifacts at repo root (the real package.json lives in frontend/)
+/package.json
+/package-lock.json
+
+# IDE
+.vscode/
+.idea/
+.claude/settings.local.json
+*.swp
+*.swo
+*~
+
+# Docker
+# Owner/deployer-local compose overlay — never committed
+infra/docker-compose.override.local.yml
+.superpowers/
+.worktrees/
+
+# OS
+.DS_Store
+Thumbs.db
+.playwright-mcp/
+*.png
+snapshot.md
+snap*.md
+# Per-machine agent handoffs: working state (worktree paths, venvs, host
+# names), not repo content. Several agents work this repo from different
+# machines, so a committed handoff describes a checkout they do not have.
+# HANDOFF* rather than HANDOFF*.md, so the HANDOFF.md.bak.* copies match too.
+HANDOFF*
+E2E-TEST-PLAN.md
+.env.qa-seed
+
+# EMB-48: external per-repo QA config store — real configs never enter git
+repo-configs/
+
+# An operator's local copy of an agent skill; it names their hosts
+infra/skill-local/
+
+# Local git worktrees (one per issue branch)
+.worktrees/
+
+# Claude Code worktrees and runtime state
+.claude/worktrees/
+.claude/checkpoints/
+.claude/mailbox/
+.claude/routines/.state/
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+.claude/agent-registry.json
+.claude/agent-memory-local
+.claude/first-run
+.claude/assistant-daemon-state.json
+
+# Key material and credentials, anywhere in the tree. The nested ignore files
+# (infra/secrets/, infra/cloudflared-dashboard/) cover their own directories;
+# these hold even if one of those files is deleted or a copy lands elsewhere.
+*.pem
+*.key
+**/creds.json
+# Contents only, so the tracked placeholder that keeps the directory stays
+# tracked and is not itself an ignored path.
+infra/secrets/*
+!infra/secrets/.gitignore
+
+# OpenTofu. Operator root modules, variables, plans and state live outside
+# this repository: state and saved plans hold tunnel secrets. Only
+# placeholder variables (*.tfvars.example) are tracked. The modules pin exact
+# provider versions, so their lock files are local only.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+infra/tofu/**/.terraform.lock.hcl

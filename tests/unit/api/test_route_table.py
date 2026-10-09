@@ -1,0 +1,96 @@
+"""The route table reads full path templates on every supported FastAPI (#502).
+
+FastAPI 0.137 keeps included routers as opaque entries in ``app.routes`` and
+leaves each included route's own ``path`` without the include prefix. These
+tests pin that the table and ``route_template`` still answer with the full
+template, which the merge-scope allowlist, the metrics exclusions and every
+route-walking test depend on.
+"""
+
+from __future__ import annotations
+
+import re
+
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.testclient import TestClient
+
+from embry0.api.app import create_app
+from embry0.api.deps import _admin_dependency, _auth_dependency
+from embry0.api.route_table import route_template
+from tests.fixtures.routes import app_routes
+
+
+def _without_convertors(path: str) -> str:
+    """``{full_repo:path}`` as the OpenAPI schema spells it: ``{full_repo}``."""
+    return re.sub(r"\{(\w+):[^}]+\}", r"{\1}", path)
+
+
+def test_the_table_has_every_operation_of_the_openapi_schema() -> None:
+    """FastAPI's own schema is an independent list of full templates."""
+    app = create_app()
+    schema = {(method.upper(), path) for path, operations in app.openapi()["paths"].items() for method in operations}
+    table = {
+        (method, _without_convertors(route.path))
+        for route in app_routes(app)
+        if route.is_api_route
+        for method in route.methods or ()
+    }
+    missing = sorted(schema - table)
+    assert not missing, f"the route table lacks operations the OpenAPI schema lists: {missing}"
+
+
+def test_a_websocket_route_of_an_included_router_keeps_its_path() -> None:
+    paths = {route.path: route.methods for route in app_routes(create_app())}
+    assert "/ws/jobs/{job_id}/events" in paths, (
+        "the job-events WebSocket route is missing from the route table: "
+        f"{sorted(p for p in paths if p.startswith('/ws'))}"
+    )
+    assert paths["/ws/jobs/{job_id}/events"] is None
+
+
+def test_a_route_carries_the_dependencies_of_its_include() -> None:
+    """``users`` gets ``require_admin`` from ``include_router``, not from its routes."""
+    routes = [route for route in app_routes(create_app()) if route.path.startswith("/api/v1/users")]
+    assert routes, "no /api/v1/users route in the route table"
+    for route in routes:
+        assert route.dependant is not None
+        calls = {d.call for d in route.dependant.dependencies}
+        assert _admin_dependency in calls, f"{route.path} lost the admin gate it is included with"
+    jobs = next(route for route in app_routes(create_app()) if route.path == "/api/v1/jobs/{job_id}")
+    assert jobs.dependant is not None
+    assert _auth_dependency in {d.call for d in jobs.dependant.dependencies}
+
+
+def _template_app() -> FastAPI:
+    inner = APIRouter(prefix="/inner")
+
+    @inner.get("/things/{thing_id}")
+    def thing(thing_id: str, request: Request) -> dict[str, str]:
+        return {"template": route_template(request)}
+
+    outer = APIRouter()
+    outer.include_router(inner, prefix="/v1")
+    app = FastAPI()
+    app.include_router(outer, prefix="/api")
+    return app
+
+
+def test_the_template_has_every_include_prefix() -> None:
+    body = TestClient(_template_app()).get("/api/v1/inner/things/7").json()
+    assert body == {"template": "/api/v1/inner/things/{thing_id}"}, f"route_template lost an include prefix: {body}"
+
+
+def test_one_router_included_twice_answers_with_the_prefix_that_served() -> None:
+    router = APIRouter()
+
+    @router.get("/items/{item_id}")
+    def item(item_id: str, request: Request) -> dict[str, str]:
+        return {"template": route_template(request)}
+
+    app = FastAPI()
+    app.include_router(router, prefix="/a")
+    app.include_router(router, prefix="/b")
+    client = TestClient(app)
+    for prefix in ("/a", "/b"):
+        body = client.get(f"{prefix}/items/1").json()
+        assert body == {"template": f"{prefix}/items/{{item_id}}"}, f"GET {prefix}/items/1 got {body}"

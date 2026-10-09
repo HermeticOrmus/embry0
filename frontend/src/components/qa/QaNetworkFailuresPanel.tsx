@@ -1,0 +1,222 @@
+/**
+ * Phase 5B: dashboard panel that surfaces network failures the QA agent
+ * captured during exploratory testing.
+ *
+ * Each artifact under `network/` is fetched and parsed as JSON. A HAR file
+ * has a top-level `log.entries[]` array with `request.url`, `request.method`,
+ * and `response.status` per entry; a sidecar `failures.json` may have a
+ * flatter `[{url, method, status}, ...]` shape. We try both.
+ *
+ * If parsing fails, we fall back to a `<pre>` of the raw body so the user can
+ * still triage rather than seeing a generic "couldn't parse" message.
+ *
+ * Fetches go through the authenticated axios client so the Bearer token is
+ * attached, and each file is wrapped in a `<details>` block: the body is only
+ * fetched after the user expands it. A failing sub-task with five HARs would
+ * otherwise fire five concurrent fetches on first card render — wasteful
+ * given that most users only inspect one or two files at a time and HARs
+ * can be multi-megabyte.
+ */
+import { useEffect, useState } from "react";
+import type { JSX } from "react";
+import { useAppArtifacts } from "@/hooks/useQaDashboard";
+import { api } from "@/api/client";
+import { artifactPath } from "@/api/qaDashboard";
+
+interface NetworkEntry {
+  url: string;
+  method: string;
+  status: number;
+}
+
+function parseNetworkBody(raw: string): NetworkEntry[] | null {
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  // HAR shape: { log: { entries: [{ request: {url, method}, response: {status} }, ...] } }
+  if (
+    json &&
+    typeof json === "object" &&
+    "log" in json &&
+    json.log &&
+    typeof json.log === "object" &&
+    "entries" in (json.log as Record<string, unknown>) &&
+    Array.isArray((json.log as { entries: unknown }).entries)
+  ) {
+    const entries = (json.log as { entries: unknown[] }).entries;
+    return entries.flatMap((e) => {
+      if (!e || typeof e !== "object") return [];
+      const request = (e as Record<string, unknown>).request as
+        | Record<string, unknown>
+        | undefined;
+      const response = (e as Record<string, unknown>).response as
+        | Record<string, unknown>
+        | undefined;
+      const url = typeof request?.url === "string" ? request.url : "";
+      const method = typeof request?.method === "string" ? request.method : "?";
+      const status = typeof response?.status === "number" ? response.status : 0;
+      return url ? [{ url, method, status }] : [];
+    });
+  }
+  // Flat-array shape
+  if (Array.isArray(json)) {
+    return (json as unknown[]).flatMap((e) => {
+      if (!e || typeof e !== "object") return [];
+      const obj = e as Record<string, unknown>;
+      const url = typeof obj.url === "string" ? obj.url : "";
+      const method = typeof obj.method === "string" ? obj.method : "?";
+      const status = typeof obj.status === "number" ? obj.status : 0;
+      return url ? [{ url, method, status }] : [];
+    });
+  }
+  return null;
+}
+
+interface NetworkEntryPanelProps {
+  runId: string;
+  app: string;
+  filename: string;
+}
+
+function NetworkEntryPanel({
+  runId,
+  app,
+  filename,
+}: NetworkEntryPanelProps): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const [raw, setRaw] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open || raw !== null || err !== null) return;
+    let cancelled = false;
+    api
+      .get<string>(artifactPath(runId, app, "network", filename), {
+        responseType: "text",
+        // axios tries to JSON-parse text/* by default; force the raw string
+        // so we can run our own parsing and surface the raw body on failure.
+        transformResponse: [(data) => data],
+      })
+      .then((r) => {
+        if (!cancelled) setRaw(typeof r.data === "string" ? r.data : String(r.data));
+      })
+      .catch((e: Error) => {
+        if (!cancelled) setErr(e.message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, runId, app, filename, raw, err]);
+
+  return (
+    <details
+      data-testid="qa-network-entry"
+      data-filename={filename}
+      className="rounded border border-white/10 bg-white/5 px-3 py-2"
+      onToggle={(e) => setOpen((e.currentTarget as HTMLDetailsElement).open)}
+    >
+      <summary className="cursor-pointer font-mono text-xs text-white/80">
+        {filename}
+      </summary>
+      {open && (
+        <div className="mt-2">
+          {err && (
+            <div className="text-xs text-destructive">
+              {filename}: failed to load — {err}
+            </div>
+          )}
+          {!err && raw === null && (
+            <div className="text-xs text-white/40">{filename}: loading…</div>
+          )}
+          {!err && raw !== null && <NetworkEntryBody raw={raw} />}
+        </div>
+      )}
+    </details>
+  );
+}
+
+function NetworkEntryBody({ raw }: { raw: string }): JSX.Element {
+  const parsed = parseNetworkBody(raw);
+  if (parsed === null) {
+    return (
+      <>
+        <div className="mb-1 text-xs text-yellow-300">
+          Unrecognised JSON shape — showing raw body.
+        </div>
+        <pre className="max-h-72 overflow-auto whitespace-pre-wrap rounded-sm bg-black/40 px-2 py-1 text-xs text-white/70">
+          {raw}
+        </pre>
+      </>
+    );
+  }
+  if (parsed.length === 0) {
+    return <div className="text-xs text-white/40">No entries.</div>;
+  }
+  return (
+    <table className="w-full table-fixed text-xs">
+      <thead>
+        <tr className="text-left text-white/50">
+          <th className="w-16">Method</th>
+          <th>URL</th>
+          <th className="w-16">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {parsed.map((row, idx) => (
+          <tr key={idx} className="border-t border-white/10">
+            <td className="font-mono text-white/80">{row.method}</td>
+            <td className="truncate font-mono text-white/70" title={row.url}>
+              {row.url}
+            </td>
+            <td
+              className={
+                row.status >= 400 ? "text-destructive" : "text-white/70"
+              }
+            >
+              {row.status}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+interface Props {
+  runId: string;
+  app: string;
+}
+
+export function QaNetworkFailuresPanel({ runId, app }: Props): JSX.Element {
+  const { data, isLoading, isError } = useAppArtifacts(runId, app, "network");
+
+  if (isLoading) {
+    return <div className="text-sm text-white/40">Loading network failures…</div>;
+  }
+  if (isError) {
+    return (
+      <div className="text-sm text-destructive">
+        Failed to load network failures.
+      </div>
+    );
+  }
+  const filenames = data ?? [];
+  if (filenames.length === 0) {
+    return (
+      <div className="text-sm text-white/40" data-testid="qa-network-empty">
+        No network failures captured.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2" data-testid="qa-network-panel">
+      {filenames.map((fn) => (
+        <NetworkEntryPanel key={fn} runId={runId} app={app} filename={fn} />
+      ))}
+    </div>
+  );
+}

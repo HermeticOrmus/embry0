@@ -1,0 +1,248 @@
+"""Git smart-HTTP proxy: the sandbox's git remote for the job's repository (#521, ADR 0007).
+
+The sandbox's git config rewrites the job repository's forge URL to
+``<proxy>/git/<repo>.git`` and sends its per-sandbox bearer to the proxy in an
+``http.extraHeader``. The proxy checks the bearer and the enrollment's grant
+(:mod:`embry0.execution.proxy.git_scope`), then forwards ``info/refs``,
+``git-upload-pack`` and ``git-receive-pack`` to the forge with the forge
+credential in ``Authorization``. Both bodies are streamed: a pack can be
+gigabytes, and nothing here holds one in memory.
+
+The forge credential never leaves this process. ``/git-credentials``, which
+used to return it to the sandbox's credential helper, now answers 410.
+
+Bearers are enrolled by the orchestrator at sandbox-create time via
+/admin/enroll (shared hardened registry: TTL, cap, admin backoff, in
+:mod:`embry0.execution.proxy.enrollment`, RAV-1070).
+"""
+
+from __future__ import annotations
+
+import base64
+from urllib.parse import urlsplit
+
+import aiohttp
+import structlog
+from aiohttp import web
+
+from embry0.execution.proxy.enrollment import check_bearer, git_identity, payload_token, register_admin_routes
+from embry0.execution.proxy.git_scope import GIT_ROUTE_PREFIX, GitGrant, GitScope, GitVerdict, git_verdict
+from embry0.execution.tls import build_ssl_context
+
+logger = structlog.get_logger(__name__)
+
+
+# Identity when a sandbox enrolled without one: every pre-#166 sandbox meant
+# GitHub. The host also binds the credential: it is sent only to an upstream
+# on this host, as git's credential helper protocol did.
+DEFAULT_GIT_HOST = "github.com"
+DEFAULT_GIT_USERNAME = "x-access-token"
+
+# Only what the git smart-HTTP protocol needs crosses the proxy. The sandbox
+# bearer, cookies, spoofed X-Forwarded-* and everything else are dropped.
+# Authorization is proxy-set, never forwarded.
+# Content-Encoding and Content-Length are not forwarded either: aiohttp's server
+# decompresses a request body before the handler reads it, so they would
+# describe the gzip bytes git sent while the proxy streams the decompressed
+# ones. The forge then rejects the request (HTTP 400, git: "expected
+# 'acknowledgments'"); the body goes upstream chunked and identity-encoded.
+_FORWARDED_REQUEST_HEADERS = frozenset(
+    {
+        "accept",
+        "accept-encoding",
+        "content-type",
+        "git-protocol",
+        "user-agent",
+    }
+)
+# Set-Cookie, WWW-Authenticate and Location never reach the sandbox.
+_FORWARDED_RESPONSE_HEADERS = ("Content-Type", "Content-Encoding", "Cache-Control", "Expires", "Pragma")
+
+_CHUNK_BYTES = 64 * 1024
+# No total timeout: a large clone legitimately takes minutes. A stalled read does not.
+_UPSTREAM_TIMEOUT = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300)
+
+_CREDENTIALS_GONE = (
+    "This git-proxy no longer hands out forge credentials. The sandbox's git uses the proxy as its "
+    "remote instead; this request comes from a sandbox configured by an orchestrator older than the "
+    "proxy image. Deploy the orchestrator together with the proxy image.\n"
+)
+
+
+def create_git_proxy_app(github_token: str, admin_token: str, *, ca_pem: str = "") -> web.Application:
+    """Create the git smart-HTTP proxy app.
+
+    Args:
+        github_token: credential used when a sandbox enrolled without its own
+            payload token (pre-#166, GitHub-only enrollments).
+        admin_token: shared secret with the orchestrator for /admin/enroll.
+        ca_pem: private CA to trust in addition to the system store, for a
+            self-managed forge behind an internal CA (spec 1A §3.2).
+    """
+    app = web.Application()
+    app["github_token"] = github_token
+    app["ca_pem"] = ca_pem
+    scope = GitScope(app, proxy_name="git_proxy")
+    register_admin_routes(
+        app,
+        proxy_name="git_proxy",
+        admin_token=admin_token,
+        accepts_payload_token=True,
+        on_unenroll=scope.forget,
+        enroll_extension=scope,
+    )
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
+    app.router.add_get("/health", _health_handler)
+    app.router.add_get("/git-credentials", _credentials_gone_handler)
+    app.router.add_route("*", GIT_ROUTE_PREFIX + "{path:.*}", _git_handler)
+    return app
+
+
+async def _on_startup(app: web.Application) -> None:
+    ca_pem = app.get("ca_pem", "")
+    connector = aiohttp.TCPConnector(ssl=build_ssl_context(ca_pem)) if ca_pem else aiohttp.TCPConnector()
+    # One session serves every sandbox, so it must not keep cookies: a forge's
+    # session cookie set for one sandbox would ride along on another's request.
+    # auto_decompress=False passes a compressed body through as it came.
+    app["http_session"] = aiohttp.ClientSession(
+        connector=connector,
+        cookie_jar=aiohttp.DummyCookieJar(),
+        auto_decompress=False,
+        timeout=_UPSTREAM_TIMEOUT,
+    )
+    if ca_pem:
+        logger.info("git_proxy_private_ca_trusted")
+
+
+async def _on_cleanup(app: web.Application) -> None:
+    session = app.get("http_session")
+    if session is not None:
+        await session.close()
+
+
+async def _health_handler(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok", "proxy": "git"})
+
+
+async def _credentials_gone_handler(request: web.Request) -> web.Response:
+    """Refuse the retired credential-helper endpoint, loudly, without a credential."""
+    sandbox_id = check_bearer(request, "git_proxy")
+    if sandbox_id is None:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    logger.warning(
+        "git_proxy_credentials_refused",
+        sandbox_id=sandbox_id,
+        detail="a credential helper asked for the forge token; the orchestrator predates the proxy image",
+    )
+    return web.Response(status=410, text=_CREDENTIALS_GONE, content_type="text/plain")
+
+
+def _refusal(status: int, message: str) -> web.Response:
+    # text/plain: git prints the body of a failed info/refs as "remote: ..."
+    return web.Response(status=status, text=f"embry0 git-proxy: {message}\n", content_type="text/plain")
+
+
+def _basic(username: str, token: str) -> str:
+    return "Basic " + base64.b64encode(f"{username}:{token}".encode()).decode("ascii")
+
+
+def _upstream_headers(request: web.Request, sandbox_id: str, verdict: GitVerdict) -> dict[str, str]:
+    headers = {k: v for k, v in request.headers.items() if k.lower() in _FORWARDED_REQUEST_HEADERS}
+    # aiohttp would otherwise ask for encodings git never offered.
+    headers.setdefault("Accept-Encoding", "identity")
+    token = payload_token(request, sandbox_id, request.app["github_token"])
+    if not token:
+        return headers
+    host, username = git_identity(request, sandbox_id) or (DEFAULT_GIT_HOST, DEFAULT_GIT_USERNAME)
+    upstream_host = urlsplit(verdict.upstream_url).hostname or ""
+    if upstream_host != host.lower():
+        logger.warning(
+            "git_proxy_credential_host_mismatch",
+            sandbox_id=sandbox_id,
+            credential_host=host,
+            upstream_host=upstream_host,
+            detail="the credential is for another host; the request is forwarded without it",
+        )
+        return headers
+    headers["Authorization"] = _basic(username, token)
+    return headers
+
+
+async def _git_handler(request: web.Request) -> web.StreamResponse:
+    """Forward one git smart-HTTP request for the sandbox's repository."""
+    sandbox_id = check_bearer(request, "git_proxy")
+    if sandbox_id is None:
+        # 403, not 401: a 401 makes git fall back to prompting for a username,
+        # which hides this message behind "could not read Username".
+        return _refusal(403, "this sandbox's proxy bearer is not enrolled (expired or revoked)")
+
+    grant: GitGrant | None = request.app["git_grant_by_id"].get(sandbox_id)
+    verdict = git_verdict(request.method, request.rel_url.raw_path, request.rel_url.raw_query_string, grant)
+    if not verdict.allowed:
+        logger.warning(
+            "git_proxy_policy_denied",
+            sandbox_id=sandbox_id,
+            method=request.method[:16],
+            path=request.rel_url.raw_path[:256],
+            reason=verdict.reason,
+        )
+        return _refusal(403, f"refused ({verdict.reason}): this proxy serves the job's own repository only")
+
+    headers = _upstream_headers(request, sandbox_id, verdict)
+    session: aiohttp.ClientSession = request.app["http_session"]
+    response: web.StreamResponse | None = None
+    try:
+        async with session.request(
+            request.method,
+            verdict.upstream_url,
+            headers=headers,
+            data=request.content if request.method == "POST" else None,
+            allow_redirects=False,
+        ) as upstream:
+            if 300 <= upstream.status < 400:
+                # Following it would take the credential wherever the forge
+                # points (a renamed repository is another path, out of scope).
+                logger.warning(
+                    "git_proxy_upstream_redirect",
+                    sandbox_id=sandbox_id,
+                    repo=verdict.repo,
+                    status=upstream.status,
+                )
+                return _refusal(502, f"the forge redirected {verdict.repo} (renamed?); redirects are not followed")
+            if upstream.status == 401:
+                logger.warning("git_proxy_upstream_unauthorized", sandbox_id=sandbox_id, repo=verdict.repo)
+                return _refusal(403, f"the forge refused the configured credential for {verdict.repo}")
+            response = web.StreamResponse(status=upstream.status)
+            for name in _FORWARDED_RESPONSE_HEADERS:
+                if name in upstream.headers:
+                    response.headers[name] = upstream.headers[name]
+            if upstream.content_length is not None:
+                response.content_length = upstream.content_length
+            await response.prepare(request)
+            async for chunk in upstream.content.iter_chunked(_CHUNK_BYTES):
+                await response.write(chunk)
+            await response.write_eof()
+    except (TimeoutError, aiohttp.ClientError) as exc:
+        logger.warning(
+            "git_proxy_upstream_failed",
+            sandbox_id=sandbox_id,
+            repo=verdict.repo,
+            service=verdict.service,
+            error=type(exc).__name__,
+            streaming=response is not None,
+        )
+        if response is not None:
+            # Headers are out: a clean end would hand git a truncated pack.
+            raise
+        status = 504 if isinstance(exc, TimeoutError) else 502
+        return _refusal(status, f"could not reach the forge for {verdict.repo}")
+    logger.info(
+        "git_proxy_forwarded",
+        sandbox_id=sandbox_id,
+        repo=verdict.repo,
+        service=verdict.service,
+        method=request.method,
+        status=response.status,
+    )
+    return response

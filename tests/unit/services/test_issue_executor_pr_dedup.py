@@ -1,0 +1,166 @@
+"""RAV-1079: _run_workflow's pre-graph open-PR dedup (skip+link policy).
+
+Harness mirrors test_job_create_overrides: executor via __new__, fake
+_execute_workflow_stream capturing initial_state. The OpenPRService fetch
+is patched at the class method so no network is ever touched.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from embry0.services.issue_executor import IssueExecutor
+
+_OPEN_PRS = [
+    {
+        "number": 366,
+        "title": "fix(msgraph): stop stub deals",
+        "head_ref": "embry0/iss-eafd1fec-eng-1066-watcher",
+        "url": "https://github.com/o/r/pull/366",
+        "author": "someone",
+        "issue_refs": ["ENG-1066"],
+        "closes_numbers": [],
+        "issue_prefix": "iss-eafd1fec",
+    }
+]
+
+
+def _executor(job_row: dict) -> tuple[IssueExecutor, dict]:
+    jobs = MagicMock()
+    jobs.get = AsyncMock(return_value=job_row)
+    jobs.update = AsyncMock()
+
+    issues = MagicMock()
+    issues.get = AsyncMock(return_value=None)
+    issues.update = AsyncMock()
+    issues.update_parent_status = AsyncMock()
+
+    captured: dict = {}
+
+    async def fake_execute_workflow_stream(input_value, issue_id, job_id, state_sink=None):
+        captured["initial_state"] = input_value
+        return None, False, None
+
+    executor = IssueExecutor.__new__(IssueExecutor)
+    executor._jobs = jobs
+    executor._issues = issues
+    executor._traces = MagicMock()
+    executor._registry = MagicMock()
+    executor._database_url = ""
+    executor._audit_log_path = None
+    executor._db = None
+    executor._inputs = None
+    executor._config = SimpleNamespace(environment_secret_key="k")
+    executor._sandbox = None
+    executor._agent_runner = None
+    executor._proxy = None
+    executor._event_bus = None
+    executor._env_repo = None
+    executor._github_token = "tok"
+    executor._background_tasks = set()
+    executor._tasks_by_job = {}
+    executor._execute_workflow_stream = fake_execute_workflow_stream  # type: ignore[assignment]
+    executor._cleanup_sandbox = AsyncMock()  # type: ignore[assignment]
+    return executor, captured
+
+
+def _patch_open_prs(prs):
+    return patch(
+        "embry0.services.github_prs.OpenPRService.list_open_prs",
+        new=AsyncMock(return_value=prs),
+    )
+
+
+@pytest.mark.asyncio
+async def test_open_prs_injected_into_state_when_no_duplicate():
+    executor, captured = _executor({"trace_id": None, "pipeline_config": None})
+    issue = {"title": "t", "body": "", "repo": "o/r", "tracker": "linear", "tracker_key": "ENG-2000"}
+    with _patch_open_prs(list(_OPEN_PRS)):
+        await executor._run_workflow("iss-00000000ffff", "job-1", issue)
+
+    state = captured["initial_state"]
+    assert state["open_prs"] == _OPEN_PRS
+    # No duplicate → the graph ran (the harness's None final_state then marks
+    # the job completed via the pre-existing path — WITHOUT a linked PR).
+    skip_calls = [c for c in executor._jobs.update.call_args_list if c.kwargs.get("pr_url")]
+    assert not skip_calls
+
+
+@pytest.mark.asyncio
+async def test_duplicate_ticket_skips_graph_and_links_pr():
+    executor, captured = _executor({"trace_id": None, "pipeline_config": None})
+    issue = {"title": "t", "body": "", "repo": "o/r", "tracker": "linear", "tracker_key": "ENG-1066"}
+    with _patch_open_prs(list(_OPEN_PRS)):
+        await executor._run_workflow("iss-00000000ffff", "job-2", issue)
+
+    # The graph never ran…
+    assert "initial_state" not in captured
+    # …and the job completed linking the existing PR.
+    final = next(c for c in executor._jobs.update.call_args_list if c.kwargs.get("status") == "completed")
+    assert final.kwargs["pr_url"] == "https://github.com/o/r/pull/366"
+    assert "open PR #366" in final.kwargs["result_summary"]
+    executor._issues.update.assert_any_call("iss-00000000ffff", status="closed")
+
+
+@pytest.mark.asyncio
+async def test_followup_jobs_with_existing_pr_are_exempt():
+    """A pr-followup job (pr_url set at dispatch, context.ref carries the
+    branch) targets its PR deliberately — no fetch, no skip, and the known
+    PR is seeded onto state for the developer prompt."""
+    executor, captured = _executor(
+        {
+            "trace_id": None,
+            "pipeline_config": None,
+            "pr_url": "https://github.com/o/r/pull/366",
+            "context": {"type": "git", "repo": "o/r", "ref": "embry0/iss-eafd1fec-eng-1066-watcher"},
+        }
+    )
+    issue = {"title": "t", "body": "", "repo": "o/r", "tracker": "linear", "tracker_key": "ENG-1066"}
+    fetch = AsyncMock(return_value=list(_OPEN_PRS))
+    with patch("embry0.services.github_prs.OpenPRService.list_open_prs", new=fetch):
+        await executor._run_workflow(None, "job-3", issue)
+
+    fetch.assert_not_awaited()
+    state = captured["initial_state"]
+    assert state["pr_url"] == "https://github.com/o/r/pull/366"
+    assert "open_prs" not in state
+
+
+@pytest.mark.asyncio
+async def test_fetch_failure_is_fail_open():
+    executor, captured = _executor({"trace_id": None, "pipeline_config": None})
+    issue = {"title": "t", "body": "", "repo": "o/r", "tracker": "linear", "tracker_key": "ENG-1066"}
+    with _patch_open_prs([]):
+        await executor._run_workflow("iss-00000000ffff", "job-4", issue)
+
+    state = captured["initial_state"]
+    assert "open_prs" not in state
+
+
+@pytest.mark.asyncio
+async def test_dedup_disabled_by_config_flag():
+    executor, captured = _executor({"trace_id": None, "pipeline_config": None})
+    executor._config = SimpleNamespace(environment_secret_key="k", pr_dedup_enabled=False)
+    issue = {"title": "t", "body": "", "repo": "o/r", "tracker": "linear", "tracker_key": "ENG-1066"}
+    fetch = AsyncMock(return_value=list(_OPEN_PRS))
+    with patch("embry0.services.github_prs.OpenPRService.list_open_prs", new=fetch):
+        await executor._run_workflow("iss-00000000ffff", "job-5", issue)
+
+    fetch.assert_not_awaited()
+    assert "open_prs" not in captured["initial_state"]
+
+
+@pytest.mark.asyncio
+async def test_no_github_token_skips_fetch():
+    """The __new__-construction contract: executors without _github_token
+    (or with an empty one) never attempt a fetch."""
+    executor, captured = _executor({"trace_id": None, "pipeline_config": None})
+    executor._github_token = ""
+    issue = {"title": "t", "body": "", "repo": "o/r", "tracker": "linear", "tracker_key": "ENG-1066"}
+    fetch = AsyncMock(return_value=list(_OPEN_PRS))
+    with patch("embry0.services.github_prs.OpenPRService.list_open_prs", new=fetch):
+        await executor._run_workflow("iss-00000000ffff", "job-6", issue)
+
+    fetch.assert_not_awaited()
+    assert "initial_state" in captured

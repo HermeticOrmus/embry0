@@ -1,0 +1,317 @@
+"""Repo registry + DB-backed qa-config endpoint tests (RAV-1251)."""
+
+from __future__ import annotations
+
+import pytest
+
+_V2_MIN = "version: 2\nqa_required: never\nworkspace_provider:\n  type: npm-workspaces-turbo\n"
+
+
+@pytest.mark.asyncio
+async def test_register_and_list(api_client) -> None:
+    r = await api_client.post("/api/v1/repos", json={"repo": "acme/widgets", "notes": "pilot"})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["repo"] == "acme/widgets"
+    assert body["active"] is True
+
+    rows = (await api_client.get("/api/v1/repos")).json()
+    entry = next(row for row in rows if row["repo"] == "acme/widgets")
+    assert entry["has_qa_config"] is False
+
+
+@pytest.mark.asyncio
+async def test_register_rejects_bad_shape(api_client) -> None:
+    assert (await api_client.post("/api/v1/repos", json={"repo": "not-a-repo"})).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_put_qa_config_auto_registers_and_serves(api_client) -> None:
+    r = await api_client.put("/api/v1/repos/acme/widgets/qa-config", content=_V2_MIN)
+    assert r.status_code == 200, r.text
+
+    got = await api_client.get("/api/v1/repos/acme/widgets/qa-config")
+    assert got.status_code == 200
+    assert got.text == _V2_MIN
+
+    detail = (await api_client.get("/api/v1/repos/acme/widgets")).json()
+    assert detail["has_qa_config"] is True
+    assert detail["qa_config_updated_by"]
+
+
+@pytest.mark.asyncio
+async def test_put_qa_config_rejects_invalid_yaml(api_client) -> None:
+    r = await api_client.put("/api/v1/repos/acme/widgets/qa-config", content="version: 1\n")
+    assert r.status_code == 422
+    assert "validation failed" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_get_qa_config_404_when_absent(api_client) -> None:
+    assert (await api_client.get("/api/v1/repos/acme/ghost/qa-config")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_qa_config_keeps_registration(api_client) -> None:
+    await api_client.put("/api/v1/repos/acme/widgets/qa-config", content=_V2_MIN)
+    assert (await api_client.delete("/api/v1/repos/acme/widgets/qa-config")).status_code == 204
+    assert (await api_client.get("/api/v1/repos/acme/widgets/qa-config")).status_code == 404
+    detail = (await api_client.get("/api/v1/repos/acme/widgets")).json()
+    assert detail["has_qa_config"] is False
+
+
+@pytest.mark.asyncio
+async def test_deactivate_hides_from_default_listing(api_client) -> None:
+    await api_client.post("/api/v1/repos", json={"repo": "acme/widgets"})
+    r = await api_client.put("/api/v1/repos/acme/widgets/active", json={"active": False})
+    assert r.status_code == 200
+    default = [row["repo"] for row in (await api_client.get("/api/v1/repos")).json()]
+    assert "acme/widgets" not in default
+    everything = [
+        row["repo"] for row in (await api_client.get("/api/v1/repos", params={"include_inactive": "true"})).json()
+    ]
+    assert "acme/widgets" in everything
+
+
+@pytest.mark.asyncio
+async def test_delete_repo_cascades_config(api_client) -> None:
+    await api_client.put("/api/v1/repos/acme/widgets/qa-config", content=_V2_MIN)
+    assert (await api_client.delete("/api/v1/repos/acme/widgets")).status_code == 204
+    assert (await api_client.get("/api/v1/repos/acme/widgets")).status_code == 404
+    assert (await api_client.get("/api/v1/repos/acme/widgets/qa-config")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_repo_detail_aggregates_env_and_prefs(api_client) -> None:
+    await api_client.post("/api/v1/repos", json={"repo": "acme/widgets"})
+    await api_client.put(
+        "/api/v1/repos/acme/widgets/environment",
+        json={
+            "variables": [
+                {"key": "API_URL", "value": "http://x", "var_type": "config"},
+                {"key": "TOKEN", "value": "s3cret", "var_type": "secret"},
+            ]
+        },
+    )
+    detail = (await api_client.get("/api/v1/repos/acme/widgets")).json()
+    assert detail["env_var_count"] == 2
+    assert detail["env_secret_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_repo_detail_surfaces_the_stored_base_branch(api_client) -> None:
+    """GET /repos/{repo} hands the preferences row through as a raw dict, which
+    is what embry0_mcp's repo_get returns — so base_branch reaches MCP with no
+    MCP-side change. Stored via the API, read back over HTTP."""
+    await api_client.post("/api/v1/repos", json={"repo": "acme/widgets"})
+    put = await api_client.put(
+        "/api/v1/repos/acme/widgets/preferences",
+        json={"base_branch": "release/2026.09"},
+    )
+    assert put.status_code == 200, put.text
+
+    prefs = (await api_client.get("/api/v1/repos/acme/widgets/preferences")).json()
+    assert prefs["base_branch"] == "release/2026.09"
+
+    detail = (await api_client.get("/api/v1/repos/acme/widgets")).json()
+    assert detail["preferences"]["base_branch"] == "release/2026.09"
+
+
+# ---------------------------------------------------------------------------
+# Forge discriminator + nested subgroup paths (#162)
+# ---------------------------------------------------------------------------
+
+_GITLAB_REPO = "acme/products/fbr"  # a real target: three segments
+
+
+@pytest.mark.asyncio
+async def test_defaults_to_github(api_client) -> None:
+    """Every pre-#162 row meant GitHub; the default must preserve that."""
+    r = await api_client.post("/api/v1/repos", json={"repo": "acme/widgets"})
+    assert r.status_code == 201, r.text
+    assert r.json()["forge"] == "github"
+
+
+@pytest.mark.asyncio
+async def test_registers_a_gitlab_subgroup_repo(api_client) -> None:
+    """The old two-segment pattern rejected this outright."""
+    r = await api_client.post("/api/v1/repos", json={"repo": _GITLAB_REPO, "forge": "gitlab", "notes": "firmware"})
+    assert r.status_code == 201, r.text
+    assert r.json() == {**r.json(), "repo": _GITLAB_REPO, "forge": "gitlab"}
+
+
+@pytest.mark.asyncio
+async def test_rejects_an_unknown_forge(api_client) -> None:
+    r = await api_client.post("/api/v1/repos", json={"repo": "acme/widgets", "forge": "bitbucket"})
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_rejects_a_single_segment_repo(api_client) -> None:
+    assert (await api_client.post("/api/v1/repos", json={"repo": "justaname"})).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_detail_and_lifecycle_work_for_a_subgroup_path(api_client) -> None:
+    """Detail / active / delete must all address the full multi-segment path."""
+    await api_client.post("/api/v1/repos", json={"repo": _GITLAB_REPO, "forge": "gitlab"})
+
+    detail = await api_client.get(f"/api/v1/repos/{_GITLAB_REPO}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["repo"] == _GITLAB_REPO
+    assert detail.json()["forge"] == "gitlab"
+
+    deactivated = await api_client.put(f"/api/v1/repos/{_GITLAB_REPO}/active", json={"active": False})
+    assert deactivated.status_code == 200, deactivated.text
+    assert deactivated.json()["active"] is False
+
+    assert (await api_client.delete(f"/api/v1/repos/{_GITLAB_REPO}")).status_code == 204
+    assert (await api_client.get(f"/api/v1/repos/{_GITLAB_REPO}")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_sub_resources_reachable_on_a_subgroup_path(api_client) -> None:
+    """The catch-all must not swallow /qa-config on a three-segment repo."""
+    put = await api_client.put(f"/api/v1/repos/{_GITLAB_REPO}/qa-config", content=_V2_MIN)
+    assert put.status_code in (200, 201), put.text
+
+    got = await api_client.get(f"/api/v1/repos/{_GITLAB_REPO}/qa-config")
+    assert got.status_code == 200, got.text
+    assert "version: 2" in got.text
+
+    detail = await api_client.get(f"/api/v1/repos/{_GITLAB_REPO}")
+    assert detail.json()["has_qa_config"] is True
+
+
+@pytest.mark.asyncio
+async def test_register_without_forge_uses_the_configured_default(api_client) -> None:
+    """The row must record the deployment's DEFAULT_FORGE, not the module
+    constant — the two differ on exactly the tenants that care (Spec 1A §3.8)."""
+    api_client.app.state.config.default_forge = "gitlab"
+    r = await api_client.post("/api/v1/repos", json={"repo": "acme/group/backend"})
+    assert r.status_code == 201, r.text
+    assert r.json()["forge"] == "gitlab"
+
+
+@pytest.mark.asyncio
+async def test_register_without_forge_is_refused_when_the_deployment_has_no_default(api_client) -> None:
+    """A guessed row is worse than no row: it makes forge_for succeed, so
+    ERR_REPO_UNREGISTERED never fires and every sandbox clones github.com."""
+    api_client.app.state.config.default_forge = ""
+    r = await api_client.post("/api/v1/repos", json={"repo": "acme/group/backend"})
+    assert r.status_code == 422, r.text
+    assert "forge is required" in r.text
+    assert (await api_client.get("/api/v1/repos/acme/group/backend")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_explicit_forge_still_registers_without_a_default(api_client) -> None:
+    api_client.app.state.config.default_forge = ""
+    r = await api_client.post(
+        "/api/v1/repos",
+        json={"repo": "acme/group/backend", "forge": "gitlab"},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["forge"] == "gitlab"
+
+
+@pytest.mark.asyncio
+async def test_qa_config_auto_registration_records_the_configured_forge(api_client) -> None:
+    """The repos.forge column DEFAULT is 'github' — a correct backfill for
+    pre-#162 rows, but as a live insert it is the same silent guess §3.8
+    removed from repo_register."""
+    api_client.app.state.config.default_forge = "gitlab"
+    api_client.app.state.qa_configs_repo._default_forge = "gitlab"
+    assert (await api_client.put("/api/v1/repos/acme/group/api/qa-config", content=_V2_MIN)).status_code == 200
+    assert (await api_client.get("/api/v1/repos/acme/group/api")).json()["forge"] == "gitlab"
+
+
+@pytest.mark.asyncio
+async def test_qa_config_refuses_to_auto_register_when_there_is_no_default_forge(api_client) -> None:
+    api_client.app.state.qa_configs_repo._default_forge = ""
+    r = await api_client.put("/api/v1/repos/acme/group/api/qa-config", content=_V2_MIN)
+    assert r.status_code == 422, r.text
+    assert "is not registered" in r.json()["detail"]
+    assert (await api_client.get("/api/v1/repos/acme/group/api")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_qa_config_still_saves_for_an_already_registered_repo_without_a_default(api_client) -> None:
+    api_client.app.state.config.default_forge = ""
+    api_client.app.state.qa_configs_repo._default_forge = ""
+    assert (
+        await api_client.post("/api/v1/repos", json={"repo": "acme/group/api", "forge": "gitlab"})
+    ).status_code == 201
+    assert (await api_client.put("/api/v1/repos/acme/group/api/qa-config", content=_V2_MIN)).status_code == 200
+    assert (await api_client.get("/api/v1/repos/acme/group/api")).json()["forge"] == "gitlab"
+
+
+# --- #522: Docker access is an admin grant per repo -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_new_repo_shows_no_docker_access(api_client) -> None:
+    await api_client.post("/api/v1/repos", json={"repo": "acme/widgets"})
+    rows = (await api_client.get("/api/v1/repos")).json()
+    assert next(r for r in rows if r["repo"] == "acme/widgets")["docker_access"] is False
+    assert (await api_client.get("/api/v1/repos/acme/widgets")).json()["docker_access"] is False
+
+
+@pytest.mark.asyncio
+async def test_put_docker_access_grants_revokes_and_audits(api_client) -> None:
+    await api_client.post("/api/v1/repos", json={"repo": "acme/products/fbr", "forge": "gitlab"})
+    # audit_log is not truncated between tests: read only what this test writes.
+    before = await api_client.app.state.db.fetchval("SELECT COALESCE(MAX(id), 0) FROM audit_log")
+
+    r = await api_client.put("/api/v1/repos/acme/products/fbr/docker-access", json={"enabled": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["docker_access"] is True
+    assert (await api_client.get("/api/v1/repos/acme/products/fbr")).json()["docker_access"] is True
+
+    r = await api_client.put("/api/v1/repos/acme/products/fbr/docker-access", json={"enabled": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["docker_access"] is False
+
+    rows = await api_client.app.state.db.fetch(
+        "SELECT action, details FROM audit_log WHERE id > $1 AND action LIKE 'repo_docker_access_%' ORDER BY id",
+        before,
+    )
+    assert [r["action"] for r in rows] == ["repo_docker_access_granted", "repo_docker_access_revoked"]
+    assert all(r["details"]["repo"] == "acme/products/fbr" for r in rows), rows
+
+
+@pytest.mark.asyncio
+async def test_put_docker_access_on_an_unregistered_repo_is_404(api_client) -> None:
+    r = await api_client.put("/api/v1/repos/acme/ghost/docker-access", json={"enabled": True})
+    assert r.status_code == 404, r.text
+    assert (await api_client.get("/api/v1/repos/acme/ghost")).status_code == 404, "a grant must not register a repo"
+
+
+@pytest.mark.asyncio
+async def test_put_docker_access_rejects_anything_but_the_flag(api_client) -> None:
+    await api_client.post("/api/v1/repos", json={"repo": "acme/widgets"})
+    for body in ({}, {"enabled": True, "repo": "acme/other"}, {"enabled": "yes please"}):
+        r = await api_client.put("/api/v1/repos/acme/widgets/docker-access", json=body)
+        assert r.status_code == 422, (body, r.text)
+    assert (await api_client.get("/api/v1/repos/acme/widgets")).json()["docker_access"] is False
+
+
+def test_docker_access_writes_are_admin_tier() -> None:
+    """The grant hands a repo the daemon that runs the credential proxies: an operator must not set it."""
+    from embry0.api.app import create_app
+    from embry0.api.deps import _admin_dependency
+    from embry0.config import Embry0Config
+    from tests.fixtures.routes import app_routes
+
+    app = create_app(Embry0Config(_env_file=None, auth_dev_mode=True, webhook_dev_mode=True))
+    admin = set()
+    for route in app_routes(app):
+        if not route.path.startswith("/api/v1/repos") or route.dependant is None:
+            continue
+        calls = {d.call for d in route.dependant.dependencies}
+        for method in route.methods or ():
+            if _admin_dependency in calls:
+                admin.add((method, route.path))
+    assert ("PUT", "/api/v1/repos/{full_repo:path}/docker-access") in admin, (
+        f"PUT /repos/{{repo}}/docker-access must carry require_admin; admin routes under /repos: {sorted(admin)}"
+    )

@@ -1,0 +1,9 @@
+node_modules
+dist
+.vite
+*.md
+.eslintrc*
+# Environment and credentials at any depth, not only the context root
+**/.env*
+**/creds.json
+!**/.env.example

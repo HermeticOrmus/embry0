@@ -1,0 +1,98 @@
+"""Merge approvals (#319 phase 2): read the asks, and relay a human's decision.
+
+``POST /merge-approvals/{id}/decide`` is what the chat relay calls (through
+the ``merge_decide`` MCP tool) when someone in the operator's approval chat
+answers "merge it" or "don't". Every check that decides whether a merge may
+happen lives in :class:`embry0.services.merge_approvals.MergeApprovalService`;
+this module only translates.
+
+A ``merge``-scope key — the one the relay holds — may call ``decide`` but no
+other mutation; that restriction is enforced in ``embry0.api.deps``.
+"""
+
+from __future__ import annotations
+
+from typing import Any, cast
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
+
+from embry0.api.deps import request_actor
+from embry0.audit.helpers import emit_audit
+from embry0.services.merge_approvals import DecisionRefused, MergeApprovalService
+
+router = APIRouter()
+
+#: Route template a merge-scope key may POST to (see deps.MERGE_SCOPE_MUTATIONS).
+DECIDE_PATH = "/merge-approvals/{approval_id}/decide"
+
+
+class DecideBody(BaseModel):
+    decision: str = Field(min_length=1, max_length=20, description="'approve' or 'reject'")
+    decided_by: str = Field(min_length=1, max_length=200, description="who answered in the chat")
+    chat_id: str = Field(min_length=1, max_length=300, description="the chat the answer came from")
+
+
+def _service(request: Request) -> MergeApprovalService:
+    # Duck-typed on purpose: an isinstance gate here 503s on any stand-in,
+    # which is how the watcher-stacks route failed its own tests (#391).
+    service = getattr(request.app.state, "merge_approvals", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="merge approvals are not available on this deployment")
+    return cast("MergeApprovalService", service)
+
+
+def _serialize(row: dict[str, Any]) -> dict[str, Any]:
+    return {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in row.items()}
+
+
+@router.get("/merge-approvals")
+async def list_merge_approvals(
+    request: Request,
+    status: str | None = Query(
+        default=None, pattern="^(pending|approved|rejected|merged|failed|stale|closed|expired)$"
+    ),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    service = _service(request)
+    rows = await service.list_recent(status=status, limit=limit)
+    return {"items": [_serialize(r) for r in rows], "mode": service.mode}
+
+
+@router.get("/merge-approvals/{approval_id}")
+async def get_merge_approval(approval_id: str, request: Request) -> dict[str, Any]:
+    row = await _service(request).get(approval_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"no merge approval {approval_id!r}")
+    return _serialize(row)
+
+
+@router.post(DECIDE_PATH)
+async def decide_merge_approval(approval_id: str, body: DecideBody, request: Request) -> dict[str, Any]:
+    service = _service(request)
+    try:
+        result = await service.decide(
+            approval_id, decision=body.decision, decided_by=body.decided_by, chat_id=body.chat_id
+        )
+    except DecisionRefused as refused:
+        raise HTTPException(status_code=refused.status_code, detail=refused.detail) from None
+
+    config = request.app.state.config
+    await emit_audit(
+        getattr(request.app.state, "db", None),
+        "merge.decided",
+        # The caller is the relay (its merge-scope key); the person is decided_by.
+        actor=request_actor(request),
+        details={
+            "approval_id": approval_id,
+            "decision": body.decision,
+            "decided_by": body.decided_by,
+            "outcome": result["outcome"],
+            "status": result["status"],
+            "dry_run": result["dry_run"],
+            "pr_url": result["pr_url"],
+            "head_sha": result["head_sha"],
+        },
+        audit_log_path=getattr(config, "audit_log_path", None),
+    )
+    return result

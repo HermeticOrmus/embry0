@@ -1,0 +1,79 @@
+# Overlay for AGENT_RUNTIME=rootless (#268): sandboxes run on a dedicated
+# rootless Docker daemon on this host instead of the privileged `dind` service.
+# Set up the daemon first (infra/rootless/provision-sandbox-daemon.sh,
+# docs/ops/provisioning.md "A rootless sandbox daemon"), then select this file
+# in infra/.env:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.rootless.yml
+#   SANDBOX_DOCKER_GID=<gid of the sandbox account; the script prints it>
+#
+# What it changes:
+#
+# - The orchestrator reaches the daemon over its unix socket. The directory is
+#   mounted, not the socket file, so a daemon restart does not leave a dead
+#   bind behind; the socket is mode 0660 and the orchestrator joins its group.
+#   Not TCP+TLS: a TCP listener would sit in the daemon's network namespace,
+#   whose bridge gateway every sandbox can address, and the certificates would
+#   be one more secret to rotate.
+# - `dind`, the in-stack `registry`, `registry-auth-init` and
+#   `init-push-images` are switched off (profile `dind-runtime`, never listed).
+#   The sandbox and proxy images are built on the rootless daemon itself
+#   (`DOCKER_HOST=unix:///run/embry0-sandbox/docker.sock docker compose
+#   --profile images build`), so nothing is pushed and nothing is pulled. Only
+#   the daemon's own account can add or replace an image there, which is what
+#   the registry's digest pins (#523) protected against.
+# - The minio-proxy and presign-proxy stay; do not remove them. The rootless
+#   daemon is still a network namespace of its own, apart from the compose
+#   networks, so a sandbox reaches MinIO and the presign endpoint only
+#   through them. The alternatives weaken isolation (docs/ops/provisioning.md
+#   "Why minio-proxy and presign-proxy stay").
+services:
+  orchestrator:
+    # Replaced whole, not merged: the Docker CLI turns TLS on for any
+    # non-empty DOCKER_TLS_VERIFY, so the DinD TLS settings must be absent,
+    # not blank. tests/unit/infra/test_rootless_overlay.py holds the rest of
+    # this map equal to the base file's.
+    environment: !override
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-embry0}:${POSTGRES_PASSWORD:?must be set}@postgres:5432/${POSTGRES_DB:-embry0}"
+      AGENT_RUNTIME: rootless
+      DOCKER_HOST: unix:///run/embry0-sandbox/docker.sock
+      AUDIT_LOG_PATH: /data/audit.jsonl
+      TZ: "${TZ:-America/New_York}"
+      FORWARDED_ALLOW_IPS: "${FORWARDED_ALLOW_IPS:-172.29.0.10,172.29.0.11}"
+      # Images live on the sandbox daemon by local tag: no registry, no pins.
+      # Overrides IMAGE_REGISTRY from the root .env.
+      IMAGE_REGISTRY: ""
+      # #581: arms the off-host backup alert, as in the base file.
+      OFFHOST_BACKUP_S3_PATH: "${OFFHOST_BACKUP_S3_PATH:-}"
+    group_add:
+      - "${SANDBOX_DOCKER_GID:?set SANDBOX_DOCKER_GID in infra/.env to the sandbox account's gid}"
+    volumes: !override
+      - orchestrator-data:/data
+      - ${GITLAB_CA_BUNDLE_HOST:-/dev/null}:/etc/embry0/gitlab-ca.pem:ro
+      - /run/embry0-sandbox:/run/embry0-sandbox:ro
+      # #581: the off-host backup status, as in the base file.
+      - offhost-backup-status:/run/embry0/offhost-backup:ro
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      init-sandbox-networks:
+        condition: service_completed_successfully
+
+  init-sandbox-networks:
+    environment: !override
+      DOCKER_HOST: unix:///run/embry0-sandbox/docker.sock
+    volumes: !override
+      - /run/embry0-sandbox:/run/embry0-sandbox:ro
+      - ./scripts:/scripts:ro
+    depends_on: !reset []
+    network_mode: none
+    networks: !reset []
+
+  dind:
+    profiles: ["dind-runtime"]
+  registry-auth-init:
+    profiles: ["dind-runtime"]
+  registry:
+    profiles: ["dind-runtime"]
+  init-push-images:
+    profiles: ["dind-runtime"]

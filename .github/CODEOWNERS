@@ -1,0 +1,7 @@
+# Code owners are asked to review every pull request that touches their paths.
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Name only accounts with write access to this repository. GitHub skips any
+# other owner, and lists the error on this file's page.
+
+* @sudoTomas

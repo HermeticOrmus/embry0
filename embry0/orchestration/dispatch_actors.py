@@ -1,0 +1,60 @@
+"""Who asked for a job — the fixed service actors for ``jobs.dispatched_by``.
+
+Every path that creates a job records an actor (#281): a person where one is
+known (SSO email, API key name, webhook sender), otherwise one of the names
+below. ``dispatched_by`` was NULL on all 573 jobs before #256/#332, which left
+"who is spending this money" unanswerable.
+
+Service actors carry the reserved ``embry0:`` prefix. ``trackers.models.
+actor_of`` refuses a human actor that starts with it, so a display name cannot
+impersonate one. (``linear-reconciler`` predates the prefix and stays as it is:
+its caps count rows by that exact string, and it is rate-limited, not exempt,
+so impersonating it gains nothing.)
+
+Rate limit
+----------
+``budget_config.rate_limit_per_author_per_hour`` is a per-HUMAN throttle
+(layer 3 of the budget gate). An actor in :data:`RATE_LIMIT_EXEMPT` skips that
+one layer — the daily and monthly spend caps still apply to every job:
+
+* ``embry0:watcher`` — the log watcher dispatches on its own timer (24 ticks a
+  day by default) under its own hard per-job budget (#275/#322). An operator
+  setting the per-author limit to 1 would otherwise refuse every tick, because
+  the count includes the job being checked; and a manual ``watcher_trigger``
+  burst must not starve the scheduled tick.
+* ``embry0:auto-retriage`` — the orchestrator re-running triage with
+  auto-answered questions folded in. It continues a job a person already paid
+  a rate-limit slot for, and is bounded by the triage question-round cap.
+* ``embry0:answer-resume`` — a fresh run started because the last blocking
+  question was answered on a channel that names nobody (Telegram, tracker
+  comment). Same reasoning; answers given through the API carry the person
+  instead.
+
+Anything that acts WITHOUT a person and is not a continuation (the Linear
+reconciler today) is deliberately NOT exempt: the limit is one of its brakes.
+"""
+
+from __future__ import annotations
+
+RESERVED_PREFIX = "embry0:"
+
+WATCHER = f"{RESERVED_PREFIX}watcher"
+AUTO_RETRIAGE = f"{RESERVED_PREFIX}auto-retriage"
+ANSWER_RESUME = f"{RESERVED_PREFIX}answer-resume"
+# A PR-comment follow-up whose comment payload named no author. The author
+# gate upstream makes this near-impossible; the row still gets an actor.
+PR_COMMENT = f"{RESERVED_PREFIX}pr-comment"
+
+RATE_LIMIT_EXEMPT: frozenset[str] = frozenset({WATCHER, AUTO_RETRIAGE, ANSWER_RESUME})
+
+
+def is_rate_limit_exempt(actor: str | None) -> bool:
+    """True when ``actor`` skips the per-author hourly limit (never the
+    spend caps). Exact match on a closed set — a prefix test would exempt any
+    future service actor by accident."""
+    return actor in RATE_LIMIT_EXEMPT
+
+
+def is_reserved(actor: str | None) -> bool:
+    """True when ``actor`` uses the service-actor namespace."""
+    return bool(actor) and str(actor).startswith(RESERVED_PREFIX)

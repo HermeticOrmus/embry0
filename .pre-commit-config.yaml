@@ -1,0 +1,32 @@
+# Hooks that run on the files of each commit: https://pre-commit.com
+#
+#   uv tool install pre-commit && pre-commit install
+#
+# They check only the files a commit touches. To check the whole tree, run
+# `pre-commit run --all-files`.
+#
+# The ruff rev must match the ruff version in uv.lock, so that the hook and
+# `uv run ruff` agree. tests/unit/test_repo_metadata.py checks that.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.10
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-yaml
+        # Deliberately malformed fixtures for the qa.yaml parser's error paths.
+        exclude: ^tests/fixtures/qa-yaml-corpus/invalid/
+      - id: check-toml
+      - id: check-json
+      - id: check-case-conflict
+      - id: check-added-large-files
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: mixed-line-ending

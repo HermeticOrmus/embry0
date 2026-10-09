@@ -1,0 +1,43 @@
+# The dedicated rootless Docker daemon that runs embry0's sandboxes
+# (AGENT_RUNTIME=rootless). A systemd USER unit of the sandbox user,
+# installed by provision-sandbox-daemon.sh; see docs/ops/provisioning.md.
+#
+# It listens on a unix socket only. A TCP listener would sit in the network
+# namespace whose bridge gateway every sandbox can address.
+[Unit]
+Description=embry0 sandbox Docker daemon (rootless)
+Documentation=https://docs.docker.com/go/rootless/
+Requires=dbus.socket
+
+[Service]
+Environment=PATH=/usr/bin:/sbin:/usr/sbin:/bin
+# slirp4netns, pinned rather than auto-detected: a host that later gains
+# pasta must not switch the network path the sandbox rules were proven on.
+Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns
+Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_PORT_DRIVER=builtin
+# No route from a sandbox to the host's 127.0.0.1 (10.0.2.2 under slirp4netns).
+Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK=true
+# The daemon, its bridges and `docker run --network host` must share one
+# network namespace: the sandbox egress and isolation rules are written by a
+# helper container on the host network, and in detached mode that is the
+# real host's namespace, where the account cannot write iptables, not the
+# one the sandbox bridges are in.
+Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=false
+ExecStart=/usr/bin/dockerd-rootless.sh --config-file=%h/.config/docker/daemon.json
+ExecReload=/bin/kill -s HUP $MAINPID
+TimeoutSec=0
+RestartSec=2
+Restart=always
+StartLimitBurst=3
+StartLimitInterval=60s
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+Delegate=yes
+Type=notify
+NotifyAccess=all
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

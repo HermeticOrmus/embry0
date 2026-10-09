@@ -1,0 +1,638 @@
+name: embry0
+
+services:
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      # RAV-1058: no VITE_API_KEY build arg — the dashboard prompts for the key
+      # at runtime (AuthGate) and stores it in the browser, so the secret is
+      # never inlined into the JS bundle.
+    container_name: embry0-frontend
+    mem_limit: 1g
+    ports:
+      - "${PROD_PORT:-8200}:80"
+    # The public dashboard's hostname, e.g. embry0.example.com (no scheme),
+    # from infra/.env. Set, nginx renders a hardened vhost for exactly that
+    # Host: webhook/telegram/internal API paths refused, X-Forwarded-Proto
+    # https, CSP and HSTS. Unset, there is no public vhost and every Host gets
+    # the LAN one. Not env_file: the root .env would hand nginx every secret.
+    environment:
+      DASHBOARD_PUBLIC_HOSTNAME: "${DASHBOARD_PUBLIC_HOSTNAME:-}"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    # RAV-1069: static IP so FORWARDED_ALLOW_IPS can trust nginx SPECIFICALLY
+    # rather than the whole subnet (the dashboard tunnel joins this network
+    # too, and the monitoring stack's blackbox exporter attaches externally —
+    # subnet-wide trust would let any of them spoof client IPs).
+    networks:
+      frontend:
+        ipv4_address: 172.29.0.10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.orchestrator
+    container_name: embry0-orchestrator
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-embry0}:${POSTGRES_PASSWORD:?must be set}@postgres:5432/${POSTGRES_DB:-embry0}"
+      DOCKER_HOST: tcp://dind:2376
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH: /certs/client
+      AUDIT_LOG_PATH: /data/audit.jsonl
+      TZ: "${TZ:-America/New_York}"
+      # RAV-1060: trust X-Forwarded-For only from the frontend (nginx)
+      # network — uvicorn then reports the real client IP, which the per-IP
+      # rate limiter and the secret-reveal audit trail both key on. Without
+      # this every request appeared to come from the nginx container: the
+      # limiter degraded to one global bucket and audit attribution was
+      # useless. Must match the pinned `frontend` network subnet below.
+      # Drift fails safe (falls back to not trusting the header).
+      # RAV-1069: narrowed from the /16 to exactly nginx (.10) + the
+      # dashboard tunnel (.11). Trusting both lets the Cloudflare-edge-
+      # appended visitor IP surface as the client for rate-limit + audit;
+      # everything else on the subnet stays untrusted.
+      FORWARDED_ALLOW_IPS: "${FORWARDED_ALLOW_IPS:-172.29.0.10,172.29.0.11}"
+      # #523: the registry login registry-auth-init generated, and the digests
+      # init-push-images recorded. At startup the orchestrator writes the login
+      # into its docker CLI config and installs the pins, so every embry0 image
+      # runs by digest. Either one missing refuses the start. Set here, not in
+      # .env: each names a path the mounts below provide.
+      REGISTRY_AUTH_DIR: /run/embry0/registry-auth
+      IMAGE_PINS_FILE: /run/embry0/image-pins/pins
+      # #581: set arms embry0_offhost_backup_enabled, the guard of the
+      # off-host staleness alert. The same value the offhost-backup service
+      # copies to; the orchestrator reads only whether it is set.
+      OFFHOST_BACKUP_S3_PATH: "${OFFHOST_BACKUP_S3_PATH:-}"
+    env_file: ../.env
+    expose:
+      - "8000"
+    # Claude OAuth for Agent SDK / sandbox CLI calls comes in via the
+    # CLAUDE_CODE_OAUTH_TOKEN env var (root .env, loaded through env_file).
+    # See .env.example for how to generate it.
+    volumes:
+      - dind-certs-client:/certs/client:ro
+      - orchestrator-data:/data
+      # Spec 1A 3.2: private CA for a self-managed GitLab. GITLAB_CA_BUNDLE_HOST
+      # names a host path; the container always sees it at the fixed path below,
+      # which is what GITLAB_CA_BUNDLE must be set to. The /dev/null default
+      # keeps the mount inert when no private CA is in play. Setting only one of
+      # the two is not symmetric: GITLAB_CA_BUNDLE alone refuses the boot with
+      # "contains no PEM certificate" (it reads this empty /dev/null), while
+      # GITLAB_CA_BUNDLE_HOST alone is a silent no-op — the PEM is mounted and
+      # never read, and every GitLab call fails its handshake later instead.
+      - ${GITLAB_CA_BUNDLE_HOST:-/dev/null}:/etc/embry0/gitlab-ca.pem:ro
+      - registry-auth:/run/embry0/registry-auth:ro
+      - image-pins:/run/embry0/image-pins:ro
+      # #581: what the offhost-backup service last read back from the bucket;
+      # served as embry0_offhost_backup_last_success_timestamp_seconds.
+      - offhost-backup-status:/run/embry0/offhost-backup:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      dind:
+        condition: service_healthy
+      init-sandbox-networks:
+        condition: service_completed_successfully
+      init-push-images:
+        condition: service_completed_successfully
+      # No minio here (#573): the orchestrator prepares the QA bucket in the
+      # background and retries until MinIO answers, so waiting would only
+      # tie the dashboard and webhooks to MinIO starting.
+    deploy:
+      resources:
+        limits:
+          cpus: "${ORCHESTRATOR_CPUS:-4}"
+          memory: "${ORCHESTRATOR_MEMORY:-4G}"
+        reservations:
+          cpus: "1"
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    networks: [frontend, backend]
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16.6-alpine
+    container_name: embry0-postgres
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-embry0}"
+      POSTGRES_USER: "${POSTGRES_USER:-embry0}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?must be set}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-embry0}"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+    networks: [backend]
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    restart: unless-stopped
+
+  postgres-backup:
+    # Pinned by digest (#324). The floating `:16` tag had already moved this
+    # image's pg_dump/psql to 16.10 while the server above stays at 16.6, and
+    # an unattended move could break restores again (the 16.6 psql rejects the
+    # 16.10 dump's `\restrict` header — restores run from THIS container).
+    # The digest is the multi-arch index that was running on 2026-09-20.
+    # Bump it together with the `postgres` image above, never alone:
+    #   docker buildx imagetools inspect prodrigestivill/postgres-backup-local:16
+    # take the index Digest, check `pg_dump --version` in it is >= the server,
+    # re-run docs/ops/postgres-restore-drill.md, and update its version table.
+    image: prodrigestivill/postgres-backup-local:16@sha256:a0103fbce0c48ccc7693ddbb2a2bfa733048db845354f635efef9e4566de185d
+    container_name: embry0-postgres-backup
+    mem_limit: 2g
+    restart: unless-stopped
+    volumes:
+      - backup-data:/backups
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: "${POSTGRES_DB:-embry0}"
+      POSTGRES_USER: "${POSTGRES_USER:-embry0}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?must be set}"
+      SCHEDULE: "@daily"
+      BACKUP_KEEP_DAYS: "7"
+      BACKUP_KEEP_WEEKS: "4"
+      BACKUP_KEEP_MONTHS: "6"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [backend]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # #581: copies the Postgres dumps (backup-data, read-only) and every MinIO
+  # bucket to an operator's S3-compatible bucket, off this host. Opt-in: it
+  # runs only with the offhost-backup profile, and needs OFFHOST_BACKUP_S3_PATH
+  # (it exits 64 without it). Nothing here names a destination; bucket,
+  # endpoint and keys come from infra/.env. It only adds or updates objects
+  # off-host, never deletes them. The script and the restore are in
+  # infra/scripts/offhost-backup.sh and docs/ops/backup-restore.md.
+  #
+  # rclone, pinned by digest (the multi-arch index of 1.75.1). Bump it with
+  #   docker buildx imagetools inspect rclone/rclone:<version>
+  # and re-run the off-host restore drill in docs/ops/postgres-restore-drill.md.
+  offhost-backup:
+    image: rclone/rclone:1.75.1@sha256:45401ad7410db1d67ffdb58e19059ad20b0d8e0285a60e38bbec55cc1019c7a5
+    container_name: embry0-offhost-backup
+    profiles: ["offhost-backup"]
+    mem_limit: 1g
+    restart: unless-stopped
+    entrypoint: ["sh"]
+    command: ["/scripts/offhost-backup.sh"]
+    environment:
+      OFFHOST_BACKUP_S3_PATH: "${OFFHOST_BACKUP_S3_PATH:-}"
+      OFFHOST_BACKUP_INTERVAL_SECONDS: "${OFFHOST_BACKUP_INTERVAL_SECONDS:-3600}"
+      # rclone reads both remotes from these variables; there is no config file.
+      RCLONE_CONFIG: /dev/null
+      RCLONE_S3_NO_CHECK_BUCKET: "true"
+      RCLONE_CONFIG_OFFHOST_TYPE: s3
+      RCLONE_CONFIG_OFFHOST_PROVIDER: "${OFFHOST_BACKUP_S3_PROVIDER:-Other}"
+      RCLONE_CONFIG_OFFHOST_ENDPOINT: "${OFFHOST_BACKUP_S3_ENDPOINT:-}"
+      RCLONE_CONFIG_OFFHOST_REGION: "${OFFHOST_BACKUP_S3_REGION:-}"
+      RCLONE_CONFIG_OFFHOST_ACCESS_KEY_ID: "${OFFHOST_BACKUP_S3_ACCESS_KEY_ID:-}"
+      RCLONE_CONFIG_OFFHOST_SECRET_ACCESS_KEY: "${OFFHOST_BACKUP_S3_SECRET_ACCESS_KEY:-}"
+      RCLONE_CONFIG_EMBRY0MINIO_TYPE: s3
+      RCLONE_CONFIG_EMBRY0MINIO_PROVIDER: Minio
+      RCLONE_CONFIG_EMBRY0MINIO_ENDPOINT: http://minio:9000
+      RCLONE_CONFIG_EMBRY0MINIO_ACCESS_KEY_ID: "${MINIO_ROOT_USER:-}"
+      RCLONE_CONFIG_EMBRY0MINIO_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD:-}"
+    volumes:
+      - backup-data:/backups:ro
+      - offhost-backup-status:/status
+      - ./scripts:/scripts:ro
+    # No depends_on: a MinIO that is down must not hold back the Postgres
+    # copy. Its pass logs "minio: copy FAILED" and the next one retries.
+    networks: [backend]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  minio:
+    # Silo, the community fork of MinIO maintained by Pigsty (pgsty/silo,
+    # AGPL-3.0 like MinIO), pinned by tag and multi-arch index digest (#573).
+    # MinIO Inc. stopped publishing community images and archived the source:
+    # quay.io/minio/minio answers 401 and docker.io/minio/minio "repository
+    # does not exist" for every tag (checked 2026-10-09). Silo keeps MinIO's
+    # on-disk format, MINIO_* variables, S3 API, /data path, root user and
+    # entrypoint (it maps `server` to `silo server`), so the minio-data
+    # volume and this command carry over unchanged; proven on data written by
+    # RELEASE.2025-05-24T17-08-30Z, the MinIO release pinned before. Not the
+    # `-distroless` variant: it has no `curl` for the healthcheck. Bump the
+    # tag and digest together:
+    #   docker buildx imagetools inspect docker.io/pgsty/silo:<RELEASE tag>
+    # take the index Digest, read that release's notes for rollback limits,
+    # and back up minio-data first (docs/ops/backup-restore.md).
+    image: docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
+    container_name: embry0-minio
+    mem_limit: 4g
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:?must be set}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?must be set}"
+    volumes:
+      - minio-data:/data
+    expose:
+      - "9000"   # S3 API
+      - "9001"   # Console UI
+    healthcheck:
+      # The unauthenticated readiness endpoint, no credentials (#605): `mc
+      # alias set` took a root password starting with `-` for a flag and
+      # failed, and put the password on a command line every 30 seconds.
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9000/minio/health/ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    networks: [backend]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  dind:
+    image: docker:27-dind
+    container_name: embry0-dind
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: /certs
+      DOCKER_TLS_SAN: DNS:dind,DNS:localhost,DNS:docker
+    volumes:
+      - dind-certs-ca:/certs/ca
+      - dind-certs-client:/certs/client
+      - dind-storage:/var/lib/docker
+      # Allow DinD to pull from the in-stack `registry` service over plain HTTP.
+      - ./dind-daemon.json:/etc/docker/daemon.json:ro
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "${DIND_CPUS:-4}"
+          memory: "${DIND_MEMORY:-8G}"
+        reservations:
+          cpus: "1"
+          memory: 2G
+    networks: [backend]
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    restart: unless-stopped
+
+  init-sandbox-networks:
+    image: docker:27-cli
+    container_name: embry0-init-sandbox-networks
+    entrypoint: ["sh"]
+    command: ["/scripts/setup-sandbox-networks.sh"]
+    environment:
+      DOCKER_HOST: tcp://dind:2376
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH: /certs/client
+    volumes:
+      - dind-certs-client:/certs/client:ro
+      - ./scripts:/scripts:ro
+    depends_on:
+      dind:
+        condition: service_healthy
+    networks: [backend]
+    restart: "no"
+
+  # #523: generates the registry's login on first start and keeps it after:
+  # `username`, `password` and the bcrypt `htpasswd` the registry reads, in the
+  # registry-auth volume. An httpd image only for its `htpasswd`; no network.
+  # Mounted by this service, registry, init-push-images and orchestrator only.
+  registry-auth-init:
+    image: httpd:2.4-alpine@sha256:3440c39d8d6f54fa9ad2549e5a60c19ddd435faadc29c1ad28aa795f71888889
+    container_name: embry0-registry-auth-init
+    entrypoint: ["sh"]
+    command: ["/scripts/registry-auth-init.sh"]
+    volumes:
+      - registry-auth:/auth
+      - ./scripts:/scripts:ro
+    network_mode: none
+    restart: "no"
+
+  # In-stack container registry. Sandbox + proxy images are pushed here at
+  # bootstrap so DinD (and any future K8s cluster) can pull them by name —
+  # the same flow that production registries use, just on the backend bridge.
+  # Not exposed publicly.
+  #
+  # #523: every client must log in (htpasswd), pulls included. Credentials are
+  # client-side in Docker, so DinD's daemon.json does not change: the
+  # orchestrator's docker CLI sends the login with each pull and push it asks
+  # DinD to make. The login crosses the backend bridge in clear text (the
+  # registry is plain HTTP there), so it stops casual pushes, not a determined
+  # one; what stops a replaced image from running is the digest pinning.
+  registry:
+    image: registry:2
+    container_name: embry0-registry
+    mem_limit: 2g
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: embry0-registry
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+    volumes:
+      - registry-data:/var/lib/registry
+      - registry-auth:/auth:ro
+    depends_on:
+      registry-auth-init:
+        condition: service_completed_successfully
+    # `expose` for backend-network access from DinD/orchestrator.
+    # `ports` (loopback-only) lets the host docker daemon push images via the
+    # init-push-images sidecar, which reaches the registry through the mounted
+    # docker.sock and out of the host's network namespace. Docker treats
+    # 127.0.0.1 as insecure-by-default, so no host daemon.json edit is needed.
+    expose:
+      - "5000"
+    ports:
+      - "127.0.0.1:5001:5000"
+    healthcheck:
+      # 401 is healthy: serving, and refusing anonymous clients. A 200 would
+      # mean auth is off, and nothing downstream may start on an open registry.
+      test: ["CMD-SHELL", "wget -S --spider http://localhost:5000/v2/ 2>&1 | grep -q '401 Unauthorized'"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
+    networks: [backend]
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    restart: unless-stopped
+
+  # Build-only services. Their images aren't run as compose services — they're
+  # pushed to the local `registry` and pulled into DinD on demand. Profiled out
+  # so `docker compose up -d` does not try to start them.
+  sandbox-image-builder:
+    profiles: ["images"]
+    image: embry0-sandbox:latest
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.sandbox
+      # Dockerfile.sandbox is multi-stage; without an explicit target the
+      # final stage (dev-python) would be tagged as the slim sandbox.
+      target: base
+
+  dev-python-image-builder:
+    profiles: ["images"]
+    image: embry0-sandbox-dev-python:latest
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.sandbox
+      target: dev-python
+
+  dev-jvm-python-image-builder:
+    profiles: ["images"]
+    image: embry0-sandbox-dev-jvm-python:latest
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.sandbox
+      target: dev-jvm-python
+
+  qa-image-builder:
+    profiles: ["images"]
+    image: embry0-sandbox-qa:latest
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.sandbox.qa
+
+  proxy-image-builder:
+    profiles: ["images"]
+    image: embry0-proxy:latest
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.proxy
+
+  # Tag the host-built embry0-sandbox + embry0-proxy images and push them to
+  # the in-stack registry. The orchestrator depends on this completing so the
+  # proxy containers it launches in DinD can pull successfully on first ref.
+  init-push-images:
+    image: docker:27-cli
+    container_name: embry0-init-push-images
+    entrypoint: ["sh"]
+    command: ["/scripts/push-images-to-registry.sh"]
+    environment:
+      # Push target — host-loopback exposure of the registry. The mounted
+      # docker.sock means the actual push is performed by the host daemon,
+      # which reaches the registry via the host's loopback interface.
+      REGISTRY: 127.0.0.1:5001
+      # #523: log in with registry-auth-init's credential, and record each
+      # pushed image's digest for the orchestrator to run it by.
+      REGISTRY_AUTH_DIR: /auth
+      PINS_FILE: /pins/pins
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts:/scripts:ro
+      - registry-auth:/auth:ro
+      - image-pins:/pins
+    depends_on:
+      registry:
+        condition: service_healthy
+    restart: "no"
+
+  # Hosted MCP endpoint (streamable HTTP): the embry0 MCP server as a
+  # service, so clients need no local clone — `claude mcp add --transport
+  # http embry0 https://<host>/mcp --header "Authorization: Bearer <key>"`.
+  # Reuses the orchestrator image (same package, console script
+  # embry0-mcp-http). Holds NO credential: each request's own bearer is
+  # forwarded to the orchestrator, which enforces key + scope.
+  mcp:
+    image: embry0-orchestrator
+    container_name: embry0-mcp
+    # The image installs embry0 EDITABLE against /app (#334), so the console
+    # script `embry0-mcp-http` resolves the same code; `python -m` is kept
+    # because it also works on an older rollback image, where the pip layer
+    # held a stub package and only cwd-based imports found the real tree.
+    command: ["python", "-m", "embry0_mcp.http"]
+    mem_limit: 512m
+    restart: unless-stopped
+    environment:
+      EMBRY0_API_URL: http://orchestrator:8000
+      TZ: "${TZ:-America/New_York}"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    expose:
+      - "9200"
+    networks: [backend, frontend]
+    healthcheck:
+      # 401 IS healthy — the endpoint must refuse anonymous requests.
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:9200/mcp | grep -q 401"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # The remote-managed webhooks tunnel. Opt-in (#531): it runs only with the
+  # `webhook-tunnel` profile, e.g. COMPOSE_PROFILES=webhook-tunnel in
+  # infra/.env, so a stack without a tunnel parses and starts with no token.
+  # The token is not `:?`-required: compose checks a required variable even
+  # in a service whose profile is off. With the profile on and the token
+  # empty, cloudflared exits ("requires the ID or name of the tunnel") and
+  # restarts until one is set. An `up` that does not enable the profile
+  # leaves a running tunnel alone, but only an `up` that enables it applies
+  # a change to this service.
+  cloudflared:
+    image: cloudflare/cloudflared:2026.3.0
+    container_name: embry0-cloudflared
+    profiles: ["webhook-tunnel"]
+    mem_limit: 512m
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --metrics 0.0.0.0:2000 run
+    environment:
+      TUNNEL_TOKEN: "${CLOUDFLARED_TUNNEL_TOKEN:-}"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    # frontend: the remote-managed ingress fronts nginx (http://frontend:80),
+    # which serves the dashboard and proxies /api to the orchestrator. backend
+    # is kept for ingress rules that target orchestrator:8000 directly.
+    networks: [backend, frontend]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:2000", "ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # Renders the dashboard tunnel's ingress from DASHBOARD_PUBLIC_HOSTNAME
+  # (infra/.env) into a volume, with the script and hostname rules the
+  # frontend image uses for its public vhost. Fails closed: an unset or
+  # invalid value exits non-zero, writes nothing (and removes any earlier
+  # render), and cloudflared-dashboard, which waits for this, never starts.
+  # The reason is in `docker logs embry0-cloudflared-dashboard-config`.
+  cloudflared-dashboard-config:
+    image: docker:27-cli
+    container_name: embry0-cloudflared-dashboard-config
+    profiles: ["dashboard-tunnel"]
+    entrypoint:
+      - sh
+      - /render/render-dashboard-public.sh
+      - --require
+      - /render/config.yml.template
+      - /rendered/config.yml
+    environment:
+      DASHBOARD_PUBLIC_HOSTNAME: "${DASHBOARD_PUBLIC_HOSTNAME:-}"
+    volumes:
+      - ../frontend/nginx/render-dashboard-public.sh:/render/render-dashboard-public.sh:ro
+      - ./cloudflared-dashboard/config.yml.template:/render/config.yml.template:ro
+      - cloudflared-dashboard-config:/rendered
+    network_mode: none
+    restart: "no"
+
+  # RAV-1069: Pattern-B tunnel fronting the public dashboard at
+  # DASHBOARD_PUBLIC_HOSTNAME -> nginx (frontend:80). Separate from the
+  # remote-managed webhooks tunnel above: this one is version-controlled
+  # (infra/cloudflared-dashboard/config.yml.template, rendered by the service
+  # above, + gitignored creds.json written by provision.sh). Static IP .11 is
+  # trusted in FORWARDED_ALLOW_IPS so the Cloudflare-edge-appended visitor IP
+  # reaches rate-limit + audit.
+  # Not started until provision.sh has run (profile: dashboard-tunnel).
+  cloudflared-dashboard:
+    image: cloudflare/cloudflared:2026.3.0
+    container_name: embry0-cloudflared-dashboard
+    mem_limit: 512m
+    restart: unless-stopped
+    profiles: ["dashboard-tunnel"]
+    user: "${CF_RUN_USER:-65532:65532}"
+    command: tunnel --no-autoupdate --config /etc/cloudflared/rendered/config.yml run ${CF_TUNNEL_ID:-}
+    # cloudflared reads its config once, at start. The label puts the
+    # hostname into this service's config hash, so changing the variable
+    # makes `up -d` recreate the tunnel instead of leaving it on the old rules.
+    labels:
+      embry0.dashboard-public-hostname: "${DASHBOARD_PUBLIC_HOSTNAME:-}"
+    volumes:
+      - cloudflared-dashboard-config:/etc/cloudflared/rendered:ro
+      - ./cloudflared-dashboard/creds.json:/etc/cloudflared/creds.json:ro
+    depends_on:
+      cloudflared-dashboard-config:
+        condition: service_completed_successfully
+      frontend:
+        condition: service_started
+    networks:
+      frontend:
+        ipv4_address: 172.29.0.11
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pgdata:
+  orchestrator-data:
+  dind-certs-ca:
+  dind-certs-client:
+  dind-storage:
+  backup-data:
+  offhost-backup-status:
+  minio-data:
+  registry-data:
+  registry-auth:
+  image-pins:
+  cloudflared-dashboard-config:
+
+networks:
+  frontend:
+    driver: bridge
+    # RAV-1060: pinned so FORWARDED_ALLOW_IPS on the orchestrator stays
+    # correct across network recreations. Only nginx and the orchestrator
+    # live here — trusting this subnet == trusting nginx. If you change it,
+    # change FORWARDED_ALLOW_IPS in the orchestrator environment too.
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+  backend:
+    driver: bridge

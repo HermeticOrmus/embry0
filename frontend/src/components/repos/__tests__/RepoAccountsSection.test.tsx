@@ -1,0 +1,285 @@
+import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useAuthStore } from "@/stores/authStore";
+import { RepoAccountsSection } from "../RepoAccountsSection";
+
+const mockSet = vi.fn();
+let repoCreds: unknown;
+let credentialRows: Array<Record<string, unknown>>;
+
+const forgeRows = () => [
+  {
+    id: "cred-000000000001",
+    label: "alice",
+    provider: "github",
+    status: "ok",
+    masked_preview: "ghp_placeholdersecret",
+  },
+  { id: "cred-000000000002", label: "gl", provider: "gitlab", status: "ok" },
+];
+
+vi.mock("@/hooks/useCredentials", () => ({
+  useRepoCredentials: () => ({ data: repoCreds, isLoading: false, isError: false }),
+  useSetRepoCredentials: () => ({ mutate: mockSet, isPending: false }),
+  useCredentials: () => ({
+    data: credentialRows,
+    isLoading: false,
+  }),
+}));
+
+function renderSection(repo: string, forge: "github" | "gitlab") {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <RepoAccountsSection repo={repo} forge={forge} />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+const asTier = (tier: string) =>
+  useAuthStore.setState({
+    status: "authenticated",
+    authMode: "session",
+    user: { email: "u@example.com", name: "U", tier },
+    ssoEnabled: true,
+    apiKeyLogin: true,
+  });
+
+const llmBinding = {
+  credential_id: "cred-000000000009",
+  role: "llm" as const,
+  pinned: true,
+  priority: 0,
+};
+
+describe("RepoAccountsSection", () => {
+  beforeEach(() => {
+    mockSet.mockReset();
+    repoCreds = undefined;
+    credentialRows = forgeRows();
+    asTier("operator");
+  });
+
+  it("shows the effective account with its trace and source", () => {
+    repoCreds = {
+      repo: "acme/widgets",
+      bindings: [],
+      effective: {
+        forge: {
+          id: "cred-000000000001",
+          label: "alice",
+          provider: "github",
+          source: "registry",
+          trace: ["repo:acme/widgets -> none", "owner:github:acme -> alice"],
+        },
+      },
+    };
+    asTier("operator");
+    renderSection("acme/widgets", "github");
+    // The select lists the same label, so the card is the effective account.
+    const card = screen.getByRole("heading", { name: "Effective forge account" }).parentElement;
+    expect(card).not.toBeNull();
+    expect(within(card as HTMLElement).getByText("alice")).toBeInTheDocument();
+    const source = screen.getByText("registry");
+    expect(source).toBeInTheDocument();
+    expect(source.className).toContain("text-success");
+    const trace = screen.getByTestId("repo-accounts-trace");
+    expect(trace.tagName).toBe("DETAILS");
+    expect(trace).toHaveTextContent("owner:github:acme -> alice");
+    expect(screen.queryByText("ghp_placeholdersecret")).not.toBeInTheDocument();
+  });
+
+  it("shows the missing-credential message", () => {
+    repoCreds = {
+      repo: "acme/widgets",
+      bindings: [],
+      effective: {
+        forge: {
+          error: "no github credential for 'acme/widgets': bind one in the registry or set GITHUB_TOKEN",
+        },
+      },
+    };
+    asTier("operator");
+    renderSection("acme/widgets", "github");
+    expect(screen.getByTestId("repo-accounts-error")).toHaveTextContent(/bind one in the registry/);
+  });
+
+  it("does not crash when the forge credential is missing", () => {
+    repoCreds = { repo: "acme/widgets", bindings: [], effective: {} };
+    asTier("operator");
+    renderSection("acme/widgets", "github");
+    expect(screen.getByLabelText(/bound account/i)).toBeInTheDocument();
+  });
+
+  it("marks an env source as served from the environment", () => {
+    repoCreds = {
+      repo: "acme/widgets",
+      bindings: [],
+      effective: {
+        forge: {
+          id: null,
+          label: "env-token",
+          provider: "github",
+          source: "env",
+          trace: ["env:GITHUB_TOKEN"],
+        },
+      },
+    };
+    asTier("operator");
+    renderSection("acme/widgets", "github");
+    const badge = screen.getByText("env");
+    expect(badge).toHaveAttribute("title", "served from the environment; run import-env");
+    expect(badge.className).toContain("text-warning");
+  });
+
+  it("admin binds a credential of the repo's forge only", async () => {
+    repoCreds = {
+      repo: "acme/widgets",
+      bindings: [llmBinding],
+      effective: { forge: { error: "x" } },
+    };
+    asTier("admin");
+    const user = userEvent.setup();
+    renderSection("acme/widgets", "github");
+    const select = screen.getByLabelText(/bound account/i);
+    // Exact name: /gl/ also matches "global" in the none option.
+    expect(screen.queryByRole("option", { name: "gl" })).toBeNull();
+    expect(within(select).getByRole("option", { name: "(none — use owner/global/env)" })).toBeInTheDocument();
+    await user.selectOptions(select, "cred-000000000001");
+    expect(mockSet).toHaveBeenCalledWith(
+      expect.objectContaining({
+        fullRepo: "acme/widgets",
+        bindings: [
+          llmBinding,
+          { credential_id: "cred-000000000001", role: "forge" },
+        ],
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("clears the forge row and keeps other roles", async () => {
+    repoCreds = {
+      repo: "acme/widgets",
+      bindings: [llmBinding, { credential_id: "cred-000000000001", role: "forge" }],
+      effective: { forge: { error: "x" } },
+    };
+    asTier("admin");
+    const user = userEvent.setup();
+    renderSection("acme/widgets", "github");
+    await user.selectOptions(screen.getByLabelText(/bound account/i), "");
+    expect(mockSet).toHaveBeenCalledWith(
+      expect.objectContaining({
+        fullRepo: "acme/widgets",
+        bindings: [llmBinding],
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("lists gitlab credentials only for a gitlab repo", () => {
+    repoCreds = { repo: "acme/widgets", bindings: [], effective: { forge: { error: "x" } } };
+    asTier("admin");
+    renderSection("acme/widgets", "gitlab");
+    expect(screen.getByRole("option", { name: "gl" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "alice" })).toBeNull();
+  });
+
+  it("operator sees the picker disabled", async () => {
+    repoCreds = { repo: "acme/widgets", bindings: [], effective: { forge: { error: "x" } } };
+    asTier("operator");
+    const user = userEvent.setup();
+    renderSection("acme/widgets", "github");
+    const select = screen.getByLabelText(/bound account/i);
+    expect(select).toBeDisabled();
+    expect(select).toBeInTheDocument();
+    await user.hover(select);
+    expect(screen.getByText("Admin scope required")).toBeInTheDocument();
+  });
+
+  it("filters each LLM picker to that provider", () => {
+    credentialRows = [
+      ...forgeRows(),
+      { id: "cred-00000000000a", label: "claude-default", provider: "anthropic", status: "ok" },
+      { id: "cred-00000000000b", label: "grok-key", provider: "xai", status: "ok" },
+    ];
+    repoCreds = {
+      repo: "acme/widgets",
+      bindings: [],
+      effective: {
+        forge: { error: "x" },
+        llm: {
+          anthropic: {
+            id: "cred-00000000000a",
+            label: "claude-default",
+            provider: "anthropic",
+            source: "registry",
+            trace: ["global -> claude-default"],
+          },
+        },
+      },
+    };
+    asTier("admin");
+    renderSection("acme/widgets", "github");
+    expect(screen.getByRole("heading", { name: "LLM accounts" })).toBeInTheDocument();
+    const anthropic = screen.getByLabelText(/anthropic account/i);
+    expect(within(anthropic).getByRole("option", { name: "claude-default" })).toBeInTheDocument();
+    expect(within(anthropic).queryByRole("option", { name: "grok-key" })).toBeNull();
+    expect(within(anthropic).queryByRole("option", { name: "alice" })).toBeNull();
+    const xai = screen.getByLabelText(/^xai account/i);
+    expect(within(xai).getByRole("option", { name: "grok-key" })).toBeInTheDocument();
+    expect(within(xai).queryByRole("option", { name: "claude-default" })).toBeNull();
+  });
+
+  it("pins the selected LLM account for this repo", async () => {
+    credentialRows = [
+      ...forgeRows(),
+      { id: "cred-00000000000a", label: "claude-default", provider: "anthropic", status: "ok" },
+    ];
+    repoCreds = {
+      repo: "acme/widgets",
+      bindings: [{ credential_id: "cred-000000000001", role: "forge", pinned: false, priority: 0 }],
+      effective: { forge: { error: "x" } },
+    };
+    asTier("admin");
+    const user = userEvent.setup();
+    renderSection("acme/widgets", "github");
+    await user.selectOptions(screen.getByLabelText(/anthropic account/i), "cred-00000000000a");
+    const pin = within(screen.getByTestId("llm-anthropic")).getByRole("checkbox", {
+      name: /never fall back to another account for this repo/i,
+    });
+    await user.click(pin);
+    expect(mockSet).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        fullRepo: "acme/widgets",
+        bindings: expect.arrayContaining([
+          expect.objectContaining({ credential_id: "cred-000000000001", role: "forge" }),
+          expect.objectContaining({
+            credential_id: "cred-00000000000a",
+            role: "llm",
+            pinned: true,
+          }),
+        ]),
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("enables the picker for an API key session", () => {
+    repoCreds = { repo: "acme/widgets", bindings: [], effective: { forge: { error: "x" } } };
+    useAuthStore.setState({
+      status: "authenticated",
+      authMode: "key",
+      user: null,
+      ssoEnabled: false,
+      apiKeyLogin: true,
+    });
+    renderSection("acme/widgets", "github");
+    expect(screen.getByLabelText(/bound account/i)).toBeEnabled();
+  });
+});

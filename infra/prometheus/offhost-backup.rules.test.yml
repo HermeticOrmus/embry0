@@ -1,0 +1,96 @@
+# promtool test rules offhost-backup.rules.test.yml
+# Series carry the labels a real scrape of the orchestrator gives them, one
+# sample a minute: sparser samples go stale between scrapes (5m lookback) and
+# then no `for` is ever satisfied.
+rule_files:
+  - offhost-backup.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Fresh copies: quiet. Time starts at 0, so the copies are stamped near it.
+  - interval: 1m
+    input_series:
+      - series: 'embry0_offhost_backup_enabled{instance="embry0-orchestrator:8000",job="embry0_orchestrator_metrics"}'
+        values: '1x120'
+      - series: 'embry0_offhost_backup_last_success_timestamp_seconds{dataset="postgres",instance="embry0-orchestrator:8000",job="embry0_orchestrator_metrics"}'
+        values: '0x120'
+      - series: 'embry0_offhost_backup_last_success_timestamp_seconds{dataset="minio",instance="embry0-orchestrator:8000",job="embry0_orchestrator_metrics"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: Embry0OffhostBackupStale
+        exp_alerts: []
+
+  # Postgres last copied at t=0 and never again; MinIO keeps up (its timestamp
+  # follows the clock). Quiet at 27 h; at 30 h, past 28 h plus the 15 m `for`,
+  # only postgres fires.
+  - interval: 1m
+    input_series:
+      - series: 'embry0_offhost_backup_enabled{instance="embry0-orchestrator:8000",job="embry0_orchestrator_metrics"}'
+        values: '1x2000'
+      - series: 'embry0_offhost_backup_last_success_timestamp_seconds{dataset="postgres",instance="embry0-orchestrator:8000",job="embry0_orchestrator_metrics"}'
+        values: '0x2000'
+      - series: 'embry0_offhost_backup_last_success_timestamp_seconds{dataset="minio",instance="embry0-orchestrator:8000",job="embry0_orchestrator_metrics"}'
+        values: '0+60x2000'
+    alert_rule_test:
+      - eval_time: 27h
+        alertname: Embry0OffhostBackupStale
+        exp_alerts: []
+      - eval_time: 30h
+        alertname: Embry0OffhostBackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dataset: postgres
+              instance: embry0-orchestrator:8000
+              job: embry0_orchestrator_metrics
+            exp_annotations:
+              summary: "No fresh off-host copy of postgres"
+              description: "The newest postgres copy in the off-host bucket is 1d 6h 0m 0s old (a value of decades means none was ever read back). Check `docker logs embry0-offhost-backup`; docs/ops/backup-restore.md, \"Off-host copy\"."
+
+  # Enabled but never copied: both timestamps read 0. promtool's clock starts
+  # at 0 too, so this is "copied at the epoch", stale once 28 h have passed.
+  # This is the case an absent series would have kept quiet.
+  - interval: 1m
+    input_series:
+      - series: 'embry0_offhost_backup_enabled{instance="embry0-orchestrator:8000",job="embry0_orchestrator_metrics"}'
+        values: '1x2000'
+      - series: 'embry0_offhost_backup_last_success_timestamp_seconds{dataset="postgres",instance="embry0-orchestrator:8000",job="embry0_orchestrator_metrics"}'
+        values: '0x2000'
+      - series: 'embry0_offhost_backup_last_success_timestamp_seconds{dataset="minio",instance="embry0-orchestrator:8000",job="embry0_orchestrator_metrics"}'
+        values: '0x2000'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: Embry0OffhostBackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dataset: postgres
+              instance: embry0-orchestrator:8000
+              job: embry0_orchestrator_metrics
+            exp_annotations:
+              summary: "No fresh off-host copy of postgres"
+              description: "The newest postgres copy in the off-host bucket is 1d 6h 0m 0s old (a value of decades means none was ever read back). Check `docker logs embry0-offhost-backup`; docs/ops/backup-restore.md, \"Off-host copy\"."
+          - exp_labels:
+              severity: warning
+              dataset: minio
+              instance: embry0-orchestrator:8000
+              job: embry0_orchestrator_metrics
+            exp_annotations:
+              summary: "No fresh off-host copy of minio"
+              description: "The newest minio copy in the off-host bucket is 1d 6h 0m 0s old (a value of decades means none was ever read back). Check `docker logs embry0-offhost-backup`; docs/ops/backup-restore.md, \"Off-host copy\"."
+
+  # Disabled: the same zeros, and nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'embry0_offhost_backup_enabled{instance="embry0-orchestrator:8000",job="embry0_orchestrator_metrics"}'
+        values: '0x2000'
+      - series: 'embry0_offhost_backup_last_success_timestamp_seconds{dataset="postgres",instance="embry0-orchestrator:8000",job="embry0_orchestrator_metrics"}'
+        values: '0x2000'
+      - series: 'embry0_offhost_backup_last_success_timestamp_seconds{dataset="minio",instance="embry0-orchestrator:8000",job="embry0_orchestrator_metrics"}'
+        values: '0x2000'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: Embry0OffhostBackupStale
+        exp_alerts: []

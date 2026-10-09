@@ -1,0 +1,120 @@
+"""Integration test: per-sandbox bearer token enrollment lifecycle.
+
+Tests the full enroll → use bearer → unenroll → bearer rejected cycle
+against a real git-proxy container running in Docker (not a mock).
+
+Requires: Docker daemon, embry0-proxy:latest image loadable.
+"""
+
+import asyncio
+import secrets
+import subprocess
+
+import aiohttp
+import pytest
+
+
+@pytest.mark.requires_docker
+class TestProxyEnrollmentE2E:
+    """Validate proxy enrollment lifecycle against a real proxy container."""
+
+    def _start_git_proxy(self, admin_token: str, github_token: str) -> tuple[str, str]:
+        """Start a git-proxy container, return (container_id, proxy_url)."""
+        result = subprocess.run(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                f"test-git-proxy-{secrets.token_hex(4)}",
+                "-e",
+                "PROXY_TYPE=git",
+                "-e",
+                "LISTEN_PORT=9101",
+                "-e",
+                f"PROXY_ADMIN_TOKEN={admin_token}",
+                "-e",
+                f"GITHUB_TOKEN={github_token}",
+                "-p",
+                "0:9101",
+                "embry0-proxy:latest",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"Could not start git-proxy container (is embry0-proxy:latest built?): {result.stderr}")
+        container_id = result.stdout.strip()
+
+        # Get the mapped host port
+        port_result = subprocess.run(
+            ["docker", "port", container_id, "9101"],
+            capture_output=True,
+            text=True,
+        )
+        host_port = port_result.stdout.strip().split(":")[-1]
+        proxy_url = f"http://localhost:{host_port}"
+        return container_id, proxy_url
+
+    def _stop_container(self, container_id: str) -> None:
+        subprocess.run(["docker", "rm", "-f", container_id], capture_output=True)
+
+    @pytest.mark.asyncio
+    async def test_enroll_use_unenroll_cycle(self):
+        """Enrolled bearer is recognised (and given no credential); after unenroll it is rejected with 401."""
+        admin_token = secrets.token_urlsafe(32)
+        fake_github_token = "ghp_fake_token_for_testing_only"
+        sandbox_id = f"test-sandbox-{secrets.token_hex(8)}"
+        sandbox_token = secrets.token_urlsafe(40)
+
+        container_id, proxy_url = self._start_git_proxy(admin_token, fake_github_token)
+        try:
+            # Wait for proxy to be healthy
+            await asyncio.sleep(3)
+
+            async with aiohttp.ClientSession() as session:
+                # 1. Enroll
+                resp = await session.post(
+                    f"{proxy_url}/admin/enroll",
+                    json={"sandbox_id": sandbox_id, "sandbox_token": sandbox_token},
+                    headers={"X-Admin-Token": admin_token},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
+                assert resp.status == 200, f"Enroll failed: {await resp.text()}"
+
+                # 2. Use the bearer — accepted, and no credential handed out (#521):
+                # 410 is the answer to a known bearer, 401 to an unknown one.
+                resp = await session.get(
+                    f"{proxy_url}/git-credentials",
+                    headers={"Authorization": f"Bearer {sandbox_token}"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
+                body = await resp.text()
+                assert resp.status == 410, f"Expected 410 with valid bearer: {resp.status} {body[:200]}"
+                assert fake_github_token not in body and "password=" not in body, body[:200]
+
+                # 3. Wrong bearer → 401
+                resp = await session.get(
+                    f"{proxy_url}/git-credentials",
+                    headers={"Authorization": "Bearer wrong-token-abc"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
+                assert resp.status == 401, f"Expected 401 with wrong bearer: {resp.status}"
+
+                # 4. Unenroll
+                resp = await session.delete(
+                    f"{proxy_url}/admin/enroll/{sandbox_id}",
+                    headers={"X-Admin-Token": admin_token},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
+                assert resp.status == 200, f"Unenroll failed: {await resp.text()}"
+
+                # 5. Previously-valid bearer now returns 401
+                resp = await session.get(
+                    f"{proxy_url}/git-credentials",
+                    headers={"Authorization": f"Bearer {sandbox_token}"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
+                assert resp.status == 401, f"Expected 401 after unenroll but got {resp.status}"
+        finally:
+            self._stop_container(container_id)

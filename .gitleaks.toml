@@ -1,0 +1,61 @@
+# Gitleaks configuration
+# https://github.com/gitleaks/gitleaks
+
+[extend]
+useDefault = true
+
+# Global allowlist: applies to all rules. Listing both `paths` and `regexes`
+# at the same level is OR-combined (any single match suppresses the finding).
+[allowlist]
+description = "embry0 allowlist — placeholder + test fixture exemptions"
+paths = [
+    # Test fixtures that use deliberately fake secrets (placeholder webhook
+    # secrets / wrong-key literals) which trip the generic-api-key rule.
+    '''tests/unit/storage/test_integration_config\.py''',
+    '''tests/unit/api/v2/test_login_route\.py''',
+]
+regexes = [
+    # Placeholder GitHub token pattern in docs / fixtures
+    '''ghp_your-github-personal-access-token''',
+    # sk-ant prefix without a real key shape
+    '''sk-ant-your-api-key-here''',
+    # Synthetic sandbox token (40-char a-z0-9 ramp) used by QA + sandbox unit tests
+    # to satisfy _SANDBOX_TOKEN_RE in embry0/sandbox/github/git_ops.py.
+    '''abcdefghijklmnopqrstuvwxyz0123456789ABCD''',
+    # Synthetic secrets the redaction and scrubbing tests must catch
+    # (tests/unit/safety/test_redaction.py, tests/unit/execution/proxy/
+    # test_log_redaction.py, tests/unit/workflows/verification/test_scrub.py
+    # and test_runner.py, tests/unit/api/v1/test_credentials.py). Each value
+    # is matched whole, so a real secret in the same files is still found.
+    # AKIAIOSFODNN7EXAMPLE is the example key in AWS's own documentation.
+    '''^ghp_abcdefghijklmnopqrstuvwxyz0123456789$''',
+    '''^ghp_0123456789abcdefghijklmnopqrstuvwxyz$''',
+    '''^ghp_echoedsecret1234$''',
+    '''^glpat-abcdefghij0123456789$''',
+    '''^glpat-AAAAAAAAAAAAAAAAAAAA$''',
+    '''^xai-abcdef0123456789abcdef0123456789$''',
+    '''^AKIAIOSFODNN7EXAMPLE$''',
+    '''^eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U$''',
+    '''^-----BEGIN RSA PRIVATE KEY-----\\nMIIEow\\n-----END RSA PRIVATE KEY-----?$''',
+    '''^9f8e7d6c5b4a$''',
+    '''^ak_live_12345$''',
+    '''^abcdef0123456789$''',
+    '''^tok-12345678$''',
+    '''^key-12345678$''',
+    # Identifiers and fixture values that newer gitleaks releases (8.30) read
+    # as generic API keys: a Docker label key (embry0/cache/volume_ownership.py),
+    # the browser storage key for the dashboard's API key (frontend/src/lib/
+    # apiKey.ts and its test), and two fake tokens in
+    # tests/unit/api/v1/test_credentials.py and tests/unit/safety/test_redaction.py.
+    '''^embry0\.scope_key$''',
+    '''^embry0\.api-key$''',
+    '''^ghp_fromenv12345678$''',
+    '''^abcdefgh12345678$''',
+    # xAI's public OAuth client id for the device-code login: an identifier
+    # every client sends, not a credential (embry0/execution/xai_device_login.py).
+    '''^b1a00492-073a-47ea-816f-4c329264a828$''',
+    # The OpenTofu tunnel module's test secret: the bytes 1 to 8 repeated,
+    # base64-encoded (infra/tofu/modules/cloudflare-tunnel/tests/
+    # full.tftest.hcl). A placeholder, never a real tunnel secret.
+    '''^AQIDBAUGBwgBAgMEBQYHCAECAwQFBgcIAQIDBAUGBwg=$''',
+]

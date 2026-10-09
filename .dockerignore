@@ -1,0 +1,48 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.venv
+venv
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Node
+node_modules
+frontend/node_modules
+frontend/dist
+
+# Docker
+.dockerignore
+infra/docker-compose*.yml
+
+# Environment and credentials, at any depth: a bare `.env` matches only at
+# the context root, and this context is the whole repository, so a deploy
+# checkout's infra/.env and tunnel creds.json would otherwise be sent with it.
+**/.env*
+**/creds.json
+!**/.env.example
+
+# IDE
+.vscode
+.idea
+*.swp
+
+# Docs & tests
+docs
+internal
+tests
+*.md
+!requirements*.txt
+
+# Project artifacts
+.claude
+.superpowers

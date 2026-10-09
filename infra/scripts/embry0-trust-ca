@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# embry0-trust-ca — trust a private CA for everything in this sandbox.
+#
+# Reads a PEM on stdin and writes ~/.embry0/ca-bundle.pem = the system trust
+# store PLUS that PEM. SandboxManager points GIT_SSL_CAINFO, SSL_CERT_FILE,
+# REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE and NODE_EXTRA_CA_CERTS at the result
+# (spec 1A section 3.2).
+#
+# The merge is the whole point: GIT_SSL_CAINFO *replaces* git's trust store
+# rather than extending it, and the same sandbox may fetch from public hosts.
+# Installing only the private CA would trade one broken clone for another.
+#
+# Runs as the unprivileged `agent` user — $HOME is writable, so no root is
+# needed. The PEM is public material; it may ride stdin and it is never logged.
+set -euo pipefail
+
+SYSTEM_BUNDLE="${EMBRY0_SYSTEM_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
+TARGET_DIR="${HOME:-/home/agent}/.embry0"
+TARGET="$TARGET_DIR/ca-bundle.pem"
+
+pem="$(cat)"
+
+case "$pem" in
+  *"BEGIN CERTIFICATE"*) ;;
+  *)
+    echo "embry0-trust-ca: stdin carried no PEM certificate" >&2
+    exit 1
+    ;;
+esac
+
+if [ ! -r "$SYSTEM_BUNDLE" ]; then
+  echo "embry0-trust-ca: system CA bundle $SYSTEM_BUNDLE is not readable" >&2
+  exit 1
+fi
+
+mkdir -p "$TARGET_DIR"
+tmp="$(mktemp "$TARGET_DIR/.ca-bundle.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+
+cat "$SYSTEM_BUNDLE" > "$tmp"
+printf '%s\n' "$pem" >> "$tmp"
+chmod 0644 "$tmp"
+
+# Only meaningful in the (unused) root case; as `agent` the file is already
+# agent-owned and chown would fail, so it stays best-effort.
+if [ "$(id -u)" = "0" ]; then
+  chown agent:agent "$tmp" 2>/dev/null || true
+fi
+
+mv "$tmp" "$TARGET"
+trap - EXIT
+echo "$TARGET"

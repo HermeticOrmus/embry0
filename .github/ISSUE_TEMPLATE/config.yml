@@ -1,0 +1,7 @@
+# The issue chooser: the templates in this directory, plus these links.
+# Issues filed through the API are not affected.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/sudoTomas/embry0/security/advisories/new
+    about: Please report security problems privately, never in a public issue. SECURITY.md describes the process.

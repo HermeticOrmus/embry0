@@ -1,0 +1,30 @@
+# Off-host backup staleness (#581). Load this into the Prometheus that scrapes
+# the orchestrator's /metrics (docs/ops/metrics.md, "Where it is exposed").
+#
+# 28 h: the dumps are daily, the copy runs hourly (OFFHOST_BACKUP_INTERVAL_SECONDS
+# default), and a dump takes minutes, so the newest copy is at most about 25 h
+# old when all is well. Raise it if you lengthen the interval.
+#
+# Both series exist from the first scrape, at 0 until a copy is read back, so
+# a deployment whose copy never once succeeded fires too. The guard joins on
+# (instance, job), the labels both series carry from the same scrape; the
+# timestamp's extra `dataset` label is why it cannot be a plain `and`.
+# Tested by offhost-backup.rules.test.yml (promtool test rules).
+groups:
+  - name: embry0-offhost-backup
+    rules:
+      - alert: Embry0OffhostBackupStale
+        expr: |
+          (time() - embry0_offhost_backup_last_success_timestamp_seconds) > 28 * 3600
+          and on (instance, job)
+          embry0_offhost_backup_enabled == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No fresh off-host copy of {{ $labels.dataset }}"
+          description: >-
+            The newest {{ $labels.dataset }} copy in the off-host bucket is
+            {{ $value | humanizeDuration }} old (a value of decades means none
+            was ever read back). Check `docker logs embry0-offhost-backup`;
+            docs/ops/backup-restore.md, "Off-host copy".

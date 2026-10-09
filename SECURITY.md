@@ -1,0 +1,124 @@
+# Security Policy
+
+embry0 runs autonomous coding agents on your infrastructure: it clones a repository into a Docker sandbox, lets an LLM agent write and run code there, and opens a pull request with the result. This document says what embry0 protects, where its trust boundaries are, which of them hold today and why, and which do not. Read [What does not hold](#what-does-not-hold) before you point embry0 at a repository or hand out API keys.
+
+## Reporting a vulnerability
+
+**Please do not open a public issue for security problems.**
+
+- Use [GitHub private vulnerability reporting](../../security/advisories/new): "Report a vulnerability" under the repository's Security tab.
+- If private reporting is unavailable to you, open an issue that asks for a private channel, with no details of the problem. This project publishes no e-mail address.
+
+You will get an acknowledgement, and a fix or mitigation plan will be coordinated with you before any public disclosure.
+
+**In scope:** anything that breaks a guarantee under [What holds](#what-holds). For example: sandbox code reaching the orchestrator, the Docker daemon, the host's network, another sandbox or a forge token; a sandbox profile that weakens Ring 1 or leaves the egress drop; a proxy forwarding outside its enrollment's scope, or serving a request without a valid enrollment; a reserved environment variable reaching a sandbox; an unauthenticated or under-tiered API call outside `AUTH_DEV_MODE`; a sandbox or proxy running an image other than the one embry0 pushed.
+
+**Out of scope:** the exposures listed under [What does not hold](#what-does-not-hold), as described there. That includes an LLM credential read inside a sandbox, a Ring 3 or Ring 2 bypass on its own, and code from a repository granted Docker access controlling the daemon. Also out of scope: deployments with `AUTH_DEV_MODE=true` or `WEBHOOK_DEV_MODE=true`, which are documented and loudly logged development bypasses, and denial of service against your own instance. A way to reach a guarantee **through** one of these, for example reaching the Docker daemon without the grant, is in scope.
+
+## Supported versions
+
+Only the latest release / `main` branch receives security fixes.
+
+## Threat model
+
+### Assets
+
+| Asset | Where it lives |
+|---|---|
+| **Forge tokens** (GitHub and GitLab) | The credential registry, Fernet-encrypted with `ENVIRONMENT_SECRET_KEY` ([credentials.md](docs/credentials.md)), or the orchestrator's environment. At run time, in the forge proxies' memory. |
+| **LLM credentials**: a Claude subscription OAuth token, an Anthropic API key, an xAI API key or xAI subscription token | The credential registry or the orchestrator's environment. At run time, **in each sandbox's environment** (see below). The xAI subscription token is the exception: it stays in `xai-proxy`. |
+| **Operator API keys and sessions**: the master `API_KEY`, database API keys, SSO sessions, plus `PROXY_ADMIN_TOKEN` and the webhook secrets | The orchestrator's environment. Database keys are stored as SHA-256 hashes. |
+| **Environment secrets**: global and per-repo environment variables marked secret | The database, Fernet-encrypted. Injected into sandboxes: global ones into every sandbox, per-repo ones into their repository's. |
+| **The deployment host** | Runs the compose stack. By default that includes a **privileged** Docker-in-Docker (DinD) container that runs every proxy and every sandbox; with `AGENT_RUNTIME=rootless` they run on a dedicated rootless Docker daemon owned by an unprivileged account instead ([provisioning.md §10](docs/ops/provisioning.md#10-a-rootless-sandbox-daemon)). |
+
+Target-repository code is an asset too. It is cloned only inside a sandbox and deleted with it; the orchestrator never checks it out on the host.
+
+### Trust boundaries
+
+| Party | Trusted with | Boundary that applies to it |
+|---|---|---|
+| **Admin tier**: the master `API_KEY`, admin-scope keys, SSO `embry0-admin` | Everything. Credentials, Docker grants, revealing secret values, agent definitions, integrations, users, watcher stacks, minting any key. | API authentication only. |
+| **Operator tier**: operate-scope keys, SSO `embry0-operator` | Running work: jobs and issues, repository registration, env vars, QA configs, sandbox profiles, pipeline templates. **Operator access means the holder can run code in a sandbox** (see below). | Cannot read a secret back through the API, change credentials, grant Docker access, weaken a sandbox's isolation through a profile, or mint a key above its own tier. |
+| **Read and merge keys** | Reading; a merge key may also decide merge approvals, accept watcher findings and answer agent questions. | Every other mutation is refused. |
+| **Issue authors and repository content** | Nothing. Whoever can put the trigger label on an issue starts a job whose task is that issue's text, and the repository's code, tests and dependencies run in the sandbox. | Everything they influence runs inside a sandbox. |
+| **The sandbox**: the agent, and every process it or the repository starts | Nothing. Treated as hostile code. | Ring 1, the proxies' enrollment and scope, the egress drop and sandbox isolation, the reserved environment variables. |
+| **The proxies** (`git-proxy`, `github-proxy`, `gitlab-proxy`, `auth-proxy`, `xai-proxy`, `context-proxy`, `minio-proxy`, `presign-proxy`) | The credentials they inject. | Reached by sandboxes on the `sandbox-restricted` network; every credential proxy authenticates each request by its per-sandbox enrollment. |
+| **DinD** | Every proxy and every sandbox. It runs privileged. | Its daemon is reachable only with its TLS client certificates: the orchestrator's, and those of a sandbox granted Docker access. |
+| **The rootless sandbox daemon** (`AGENT_RUNTIME=rootless`, instead of DinD) | Every proxy and every sandbox. It runs as an unprivileged account, in its own user and network namespaces. | Its unix socket only, mode 0660, mounted into the orchestrator; no sandbox is ever given it. The orchestrator refuses to start unless the daemon reports rootless. |
+| **The in-stack registry** | The proxy and sandbox images DinD runs. | A login, and digest pins ([below](#the-in-stack-image-registry)). |
+| **The public origin**: the dashboard tunnel and the webhook tunnel | Nothing beyond what they authenticate. | SSO on the dashboard; a signature or shared secret on each webhook route. |
+
+### What holds
+
+**Ring 1: container isolation.** Each job runs in its own container on the DinD daemon, as the unprivileged `agent` user, with `--cap-drop=ALL`, `--security-opt=no-new-privileges`, and memory, CPU and PID limits. The container, and the code cloned into it, is destroyed when the job ends. A sandbox profile can set the limits, but not the capability drop or `no-new-privileges`: the API and sandbox creation both refuse a `cap_drop` without `ALL`, any `cap_add`, and any `security_opt` other than `no-new-privileges`.
+
+**Credential proxies with per-sandbox enrollment** ([ADR 0002](docs/adr/0002-credential-proxies-per-sandbox-enrollment.md)). The orchestrator starts the proxies inside DinD with `ProxyManager`:
+
+| Proxy | Holds | Serves a sandbox |
+|---|---|---|
+| `git-proxy` | the forge token | git's smart HTTP for the job's repository |
+| `github-proxy`, `gitlab-proxy` | the forge token | read calls on the job's repository |
+| `xai-proxy` | the xAI subscription token | grok model calls |
+| `context-proxy` | a service-scoped orchestrator API key | log queries, for jobs enrolled for them (opt-in) |
+| `auth-proxy` | an Anthropic API key | nothing: only with `AUTH_PROXY_ENABLED`, and no sandbox uses it |
+| `minio-proxy`, `presign-proxy` | no credential | QA artifact uploads and presigned-URL refreshes |
+
+Each sandbox is enrolled with a bearer of its own, which the proxies keep only as a SHA-256 hash and look up by that hash. Enrollment needs `PROXY_ADMIN_TOKEN`, which the orchestrator refuses to start without outside the dev modes. Repeated wrong admin tokens lock the admin endpoints for a cooldown. Every enrollment has a TTL (`PROXY_ENROLL_TTL_SECONDS`), the registry is capped, and teardown revokes the bearer. Everything a proxy keeps per sandbox (a scope, a quota, an xAI account) ends with the enrollment. A proxy image too old to confirm the scope it was given is unenrolled again, so it serves that sandbox nothing; for `git-proxy` the sandbox is not created at all.
+
+**Forge tokens stay out of the sandbox, and are scoped to the job's repository.**
+
+- `git-proxy` is the sandbox's git remote for the job's repository ([ADR 0007](docs/adr/0007-git-proxy-forwards-smart-http.md)). It streams clone, fetch and push to the forge and adds the token itself, for that repository only. It accepts a push only from a sandbox enrolled to push a branch, which is the issue-to-PR developer's sandbox. It refuses LFS, dumb HTTP, dot segments and percent-encoding, sends the token only to the host it was enrolled for, and does not follow redirects. Its old credential-helper endpoint answers 410.
+- `github-proxy` and `gitlab-proxy` forward only `GET` and `HEAD` on an allowlist of the job's repository's resources, checked segment by segment, and refuse everything else with a 403. No sandbox-side code calls them today; the orchestrator opens pull requests and posts comments with its own client.
+
+So from a sandbox, the operator's forge token can read the job's repository and, in the issue-to-PR sandbox, push to it. It cannot reach any other repository, the forge's write APIs, or the token itself.
+
+**Egress drops and sandbox isolation.** The `sandbox-restricted` network has no NAT, so it leads nowhere outside DinD. On it, a sandbox can open a connection to the proxies and to no other sandbox. One chain in DinD, `EMBRY0-SANDBOX-ISOLATION`, jumped to from `DOCKER-USER` for traffic within that bridge, drops every new connection between two containers on it unless it is addressed to a running proxy. The chain is rewritten from the running proxies at startup, before each sandbox is handed to a job, and when a paused sandbox resumes. The write is refused unless the kernel passes bridged traffic to iptables. If the chain cannot be written and verified, the sandbox is destroyed, or a resume stays paused.
+
+Sandboxes that need the internet (the Claude CLI calls its API from inside the sandbox) are also attached to `sandbox-internet`, and every container on it gets `DOCKER-USER` rules in DinD that drop traffic to `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (RFC 1918), `100.64.0.0/10` (carrier-grade NAT) and `169.254.0.0/16` (link-local). The exceptions are the targets a profile declares (its `extra_hosts` addresses, a private `frontend_url`) and the proxies' own addresses on that network when the sandbox was created (see [What does not hold](#what-does-not-hold)). That keeps a sandbox off the host's LAN, the compose networks (database, orchestrator, registry) and cloud metadata endpoints, and off other sandboxes' `sandbox-internet` addresses. If the rules cannot be installed, the sandbox is destroyed rather than run without them.
+
+**Reserved environment variables.** One check, `env_override_refusal` in `embry0/execution/auth_provider.py`, is applied at the API and again when a sandbox starts, to stored variables and to a profile's `env_defaults`, case-insensitively. It refuses the infrastructure credentials and proxy URLs, and every variable that would redirect a sandbox's traffic or load code into its processes: proxy routing, TLS verification, the dynamic loader, `PATH`, `HOME` and `SHELL`, shell and interpreter startup hooks, and the whole `GIT_`, `CLAUDE_` and `BUN_` namespaces. `NODE_OPTIONS` and the JVM option variables accept memory flags only. A refusal never echoes the submitted value.
+
+**The Docker grant.** A profile's `dind_enabled` only asks for the shared Docker daemon. A sandbox gets the daemon's client certificates only when an admin has also granted its repository Docker access (`PUT /api/v1/repos/{repo}/docker-access`, audited); otherwise the sandbox is refused before it is created. With `AGENT_RUNTIME=rootless` no grant opens the daemon: every `dind_enabled` profile and QA `mode: dind` is refused before anything is created.
+
+**Profile isolation fields.** Sandbox profiles are operator tier, and a profile cannot weaken Ring 1 or leave the egress drop. One check, `profile_isolation_problems` in `embry0/execution/profile_isolation.py`, is applied at the API and again when a sandbox is created: `cap_drop` must include `ALL`, `cap_add` must be empty, `security_opt` holds only `no-new-privileges`, `base_image` names an image in embry0's own registry without a registry host, and `extra_networks` holds only `sandbox-internet`. A sandbox on a stored profile that holds anything else is refused before it is created.
+
+**API authentication.** Every API route needs an API key or an SSO session of a sufficient tier; the event streams also take a short-lived token, scoped to one job or run, that such a caller mints. The hosted MCP endpoint passes the caller's key through. The exceptions are health, the SSO login flow, the webhook and Telegram routes (each checks its sender's signature or shared secret), and the internal QA route (per-sandbox bearer). `AUTH_DEV_MODE` is the only switch that turns API authentication off. The orchestrator refuses to start with an empty `API_KEY` without it, and refuses either dev mode while SSO or a tunnel token is configured, because either means a public origin.
+
+**The public origin.** The dashboard tunnel fronts the dashboard behind SSO through a dedicated nginx vhost, rendered from `DASHBOARD_PUBLIC_HOSTNAME`. That vhost returns 404 for the webhook, Telegram and internal paths, and sends a Content-Security-Policy and HSTS. The tunnel refuses to start without a valid hostname rather than open a catch-all ingress ([sso.md](docs/sso.md#ingress)).
+
+**Secrets at rest and in output.** Credentials and secret env vars are Fernet-encrypted in the database. Credentials are write-only: no endpoint returns one. A secret env value can be revealed only by the admin tier, and each reveal is audited. `embry0 config`, the settings object and the startup logs mask every secret setting, and the password in any URL.
+
+#### The in-stack image registry
+
+The compose stack's `registry` holds the proxy and sandbox images that the Docker-in-Docker daemon runs. Two guards keep a replaced image from running:
+
+- **The registry refuses anonymous clients.** `registry-auth-init` generates a random login on first start, in a volume that only the registry, `init-push-images` and the orchestrator mount. This stops a casual push from another service on the backend network or a process on the host. It is not a strong boundary alone: the registry speaks plain HTTP on the backend network, so the login crosses it in clear text.
+- **embry0 images run by digest.** `init-push-images` records the digest each push reported, and the orchestrator launches the proxy and every builtin sandbox image as `…:<tag>@<digest>`; a pre-built QA image is recorded with the digest of its own push. Docker resolves such a reference by the digest alone and checks the content against it, so pushing a different image under the same tag, with or without the login, changes nothing that runs. The orchestrator refuses to start without these pins.
+
+Not covered: an image a custom sandbox profile names comes from embry0's own registry (#553) but runs by tag unless it is one of the pinned images or names its own digest; a pre-built QA image baked before digests were recorded runs by tag until it is rebuilt; and whoever can write the `image-pins` volume, or reach a Docker daemon directly, is past both guards.
+
+### What does not hold
+
+These are known and accepted, or not yet closed. They are stated plainly so you can decide what to run, and with which credentials.
+
+**The LLM credential is in the sandbox environment.** `SandboxManager` puts the agent's credential into the container's environment: `CLAUDE_CODE_OAUTH_TOKEN` for a Claude subscription, or `ANTHROPIC_API_KEY`, and `XAI_API_KEY` for an xAI API key. This is deliberate. Subscription OAuth stays supported, and the Claude CLI reads its credential from its environment, so it is not proxied ([ADR 0008](docs/adr/0008-llm-credential-in-sandbox-env.md)). Public egress is open, so **any code a job runs can read the credential and send it anywhere**: the agent, a test, a dependency's install script, or a command an issue talked the agent into. Treat the credential as exposed to every repository and every issue author whose work you run. Use a dedicated account with a spending limit, and rotate it if you suspect misuse. Only the xAI subscription token stays behind `xai-proxy`; the sandbox gets a per-sandbox bearer for it. Turning `auth-proxy` on does not take a key out of the environment.
+
+**Environment variables, secrets included, are in the sandbox environment too.** Global variables are injected into every sandbox and a repository's own into its sandboxes, so the same code can read them. Encryption at rest and the admin-only reveal protect them from the API, not from a sandbox.
+
+**Ring 3 is a regex denylist: defence in depth, not a boundary.** The `PreToolUse` hook refuses Bash commands that match one of 41 published regular expressions (`embry0/safety/patterns.py`), after NFKC normalization. It catches accidents and naive attempts, such as `printenv`, `cat /proc/...` or `echo $..._TOKEN`. It matches command text, so a program the agent writes and then runs is not checked at all.
+
+**Ring 2 is the Claude CLI's permission rules.** The rules in the sandbox's `.claude/settings.json` deny the CLI's file tools access to `/etc`, `/proc`, `/root` and the home directory's credential folders, and deny writing `.claude/settings*.json`. The direct xAI executor applies the same rules itself. They bind the agent's tool calls, and Bash commands that name a denied path. They do not bind the processes the agent starts: a script can read `/proc/self/environ`. embry0's own copy of the check, for the direct xAI executor, normalizes paths lexically and does not resolve symlinks.
+
+**Repositories granted Docker access are trusted code.** A granted repository's code holds the DinD client certificates, so it controls the daemon that runs every credential proxy (and their tokens) and every other sandbox. The daemon runs privileged, so that is root on the host. Ring 1, the egress drop and sandbox isolation do not bind it. Grant Docker access only to a repository whose code you would run as root on the host.
+
+**The operator tier can run code in a sandbox.** A QA config's `boot_command` runs as a shell command in the sandbox, outside Ring 2 and Ring 3. Package-registry settings such as `npm_config_registry` and `PIP_INDEX_URL` stay settable, so installs can come from a registry the operator chooses. And a job's issue text steers the agent. So an operator-tier key or session can read the LLM credential and the repository's secret env values, although the reveal endpoint is admin-only. Give operator access only to people you would trust with those.
+
+**A sandbox that outlives a restart keeps its old egress exceptions.** The private-range drop on `sandbox-internet` is written once per sandbox, with the proxies' addresses at that moment as exceptions. A paused sandbox kept across an orchestrator restart keeps them, and if an old proxy address is given to a new sandbox, the paused one can connect to it on `sandbox-internet` (#568).
+
+**Push is scoped to the repository, not the branch.** The issue-to-PR sandbox can push any ref of the job's repository that the forge token can, including the default branch, and can force-push (#559). Use branch protection on the forge, and a token limited to the repositories embry0 works on.
+
+**Isolation is a container on a shared kernel.** A kernel or container-runtime escape from a sandbox lands in the DinD container, which is privileged, and so on the host. With `AGENT_RUNTIME=rootless` it lands in the rootless daemon's account instead: not root on the host, but the owner of every sandbox and proxy, and so of the credentials the proxies hold. A kernel escape is a host compromise either way.
+
+**No gVisor under the rootless runtime.** Isolation under `AGENT_RUNTIME=rootless` is the rootless daemon, the capability drop and `no-new-privileges`, the egress drop and sandbox isolation chains, and per-sandbox limits; every sandbox runs under runc on the host kernel. gVisor (`runsc`) is refused: under rootless Docker it would run only with `--ignore-cgroups`, dropping every per-sandbox limit. A profile naming another runtime is refused at creation, and the orchestrator refuses a daemon that registers runsc or defaults to anything but runc. gVisor is revisited for the SaaS runtime (#587). `minio-proxy` and `presign-proxy` stay under both runtimes: a sandbox has no other route to MinIO or the presign endpoint, and every alternative would widen its egress.
+
+**Only the dashboard hostname gets the hardened vhost.** On the frontend, any hostname other than `DASHBOARD_PUBLIC_HOSTNAME` gets the LAN vhost: API authentication applies, but the CSP, HSTS and path blocking of the public vhost do not. The webhook tunnel points at that frontend, and its restriction to the webhook paths lives in the tunnel's own configuration on the Cloudflare side, not in embry0 ([webhooks.md](docs/webhooks.md)). Restrict it to the webhook paths, and do not expose port 8200 directly to the internet.

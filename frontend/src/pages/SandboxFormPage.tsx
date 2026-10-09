@@ -1,0 +1,562 @@
+import { useState, useEffect } from "react";
+import { useParams, useNavigate, Link } from "react-router";
+import { ArrowLeft, Info } from "lucide-react";
+import { OperationGlyph } from "@/components/divine/OperationGlyph";
+import { OPERATION_NUMERAL, OPERATION_ELEMENT } from "@/components/divine/operations";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
+import { Button } from "@/components/ui/Button";
+import { Input } from "@/components/ui/Input";
+import { Label } from "@/components/ui/Label";
+import { TagInput } from "@/components/ui/TagInput";
+import {
+  useSandboxProfile,
+  useCreateSandboxProfile,
+  useUpdateSandboxProfile,
+  useResetSandboxProfile,
+} from "@/hooks/useSandboxProfiles";
+import type { SandboxProfile } from "@/api/sandbox-profiles";
+import { toast } from "sonner";
+
+type ProfileForm = Omit<SandboxProfile, "created_at" | "updated_at" | "is_builtin">;
+
+// Fixed for every profile: the API refuses any other value, because each one
+// would weaken the sandbox's isolation (#553).
+const FIXED_ISOLATION = {
+  cap_drop: ["ALL"],
+  cap_add: [] as string[],
+  security_opt: ["no-new-privileges"],
+};
+const INTERNET_NETWORK = "sandbox-internet";
+
+const DEFAULT_PROFILE: ProfileForm = {
+  name: "",
+  base_image: "embry0-sandbox:latest",
+  additional_packages: [],
+  setup_commands: [],
+  memory: "8g",
+  cpus: "4",
+  pids_limit: 256,
+  cap_drop: ["ALL"],
+  cap_add: [],
+  security_opt: ["no-new-privileges"],
+  agent_timeout_seconds: 300,
+  container_timeout_seconds: 3600,
+  description: "",
+  dind_enabled: false,
+  idle_timeout_seconds: 600,
+  extra_networks: [],
+  env_defaults: {},
+  extra_hosts: {},
+};
+
+export function SandboxFormPage() {
+  const { name } = useParams<{ name: string }>();
+  const navigate = useNavigate();
+  const isEditMode = !!name && name !== "new";
+
+  const { data: existing, isLoading } = useSandboxProfile(isEditMode ? name : null);
+  const createMutation = useCreateSandboxProfile();
+  const updateMutation = useUpdateSandboxProfile();
+  const resetMutation = useResetSandboxProfile();
+
+  const [form, setForm] = useState<ProfileForm>(DEFAULT_PROFILE);
+  // Local raw text for env_defaults JSON so the user can type freely (incl.
+  // intermediate invalid JSON) without losing characters. We only push to
+  // form.env_defaults when the text parses to a valid plain object.
+  const [envDefaultsText, setEnvDefaultsText] = useState<string>(
+    JSON.stringify(DEFAULT_PROFILE.env_defaults, null, 2)
+  );
+  const [envDefaultsValid, setEnvDefaultsValid] = useState<boolean>(true);
+  // Same raw-text pattern for extra_hosts (hostname -> IP map).
+  const [extraHostsText, setExtraHostsText] = useState<string>(
+    JSON.stringify(DEFAULT_PROFILE.extra_hosts, null, 2)
+  );
+  const [extraHostsValid, setExtraHostsValid] = useState<boolean>(true);
+
+  const isBuiltin = isEditMode && !!existing?.is_builtin;
+
+  // Populate form when editing
+  useEffect(() => {
+    if (isEditMode && existing) {
+      const { created_at: _ca, updated_at: _ua, is_builtin: _ib, ...rest } = existing;
+      setForm(rest);
+      setEnvDefaultsText(JSON.stringify(rest.env_defaults ?? {}, null, 2));
+      setEnvDefaultsValid(true);
+      setExtraHostsText(JSON.stringify(rest.extra_hosts ?? {}, null, 2));
+      setExtraHostsValid(true);
+    }
+  }, [isEditMode, existing]);
+
+  const setField = <K extends keyof ProfileForm>(
+    field: K,
+    value: ProfileForm[K]
+  ) => {
+    setForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const handleEnvDefaultsChange = (text: string) => {
+    setEnvDefaultsText(text);
+    const trimmed = text.trim();
+    if (trimmed === "") {
+      setField("env_defaults", {});
+      setEnvDefaultsValid(true);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        !Array.isArray(parsed) &&
+        Object.values(parsed).every((v) => typeof v === "string")
+      ) {
+        setField("env_defaults", parsed as Record<string, string>);
+        setEnvDefaultsValid(true);
+      } else {
+        setEnvDefaultsValid(false);
+      }
+    } catch {
+      setEnvDefaultsValid(false);
+    }
+  };
+
+  const handleExtraHostsChange = (text: string) => {
+    setExtraHostsText(text);
+    const trimmed = text.trim();
+    if (trimmed === "") {
+      setField("extra_hosts", {});
+      setExtraHostsValid(true);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        !Array.isArray(parsed) &&
+        Object.values(parsed).every((v) => typeof v === "string")
+      ) {
+        setField("extra_hosts", parsed as Record<string, string>);
+        setExtraHostsValid(true);
+      } else {
+        setExtraHostsValid(false);
+      }
+    } catch {
+      setExtraHostsValid(false);
+    }
+  };
+
+  const handleSave = () => {
+    if (!form.name.trim()) {
+      toast.error("Profile name is required");
+      return;
+    }
+    if (!envDefaultsValid) {
+      toast.error("Env Defaults must be a valid JSON object of string values");
+      return;
+    }
+    if (!extraHostsValid) {
+      toast.error("Extra Hosts must be a valid JSON object of hostname → IP strings");
+      return;
+    }
+
+    // The mutations expect a SandboxProfile shape; include is_builtin=false on
+    // create. On update the server ignores the field but it satisfies the type.
+    const payload: SandboxProfile = {
+      ...form,
+      ...FIXED_ISOLATION,
+      extra_networks: form.extra_networks.includes(INTERNET_NETWORK) ? [INTERNET_NETWORK] : [],
+      is_builtin: existing?.is_builtin ?? false,
+    };
+
+    if (isEditMode) {
+      updateMutation.mutate(payload, {
+        onSuccess: () => {
+          toast.success(`Updated "${form.name}"`);
+          navigate("/sandboxes");
+        },
+        onError: (err) => toast.error(`Failed to update: ${err.message}`),
+      });
+    } else {
+      createMutation.mutate(payload, {
+        onSuccess: () => {
+          toast.success(`Created "${form.name}"`);
+          navigate("/sandboxes");
+        },
+        onError: (err) => toast.error(`Failed to create: ${err.message}`),
+      });
+    }
+  };
+
+  const handleReset = () => {
+    if (!name) return;
+    if (!confirm(`Reset "${name}" to its built-in defaults?`)) return;
+    resetMutation.mutate(name, {
+      onSuccess: () => {
+        toast.success(`Reset "${name}"`);
+        navigate("/sandboxes");
+      },
+      onError: (err) => toast.error(`Failed to reset: ${(err as Error).message}`),
+    });
+  };
+
+  const isPending = createMutation.isPending || updateMutation.isPending;
+
+  if (isEditMode && isLoading) {
+    return <div className="text-muted-foreground">Loading...</div>;
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <Link to="/sandboxes">
+            <Button variant="ghost" size="icon">
+              <ArrowLeft className="h-4 w-4" />
+            </Button>
+          </Link>
+          <span className="flex items-center justify-center w-9 h-9 shrink-0">
+            <OperationGlyph operation="ferment" size={36} titled />
+          </span>
+          <div className="flex flex-col">
+            <h1 className="text-2xl font-bold leading-tight">
+              {isEditMode ? `Edit "${name}"` : "New Sandbox Profile"}
+            </h1>
+            <span className="text-[10px] uppercase tracking-[0.18em] text-primary/65 font-mono mt-0.5">
+              Op {OPERATION_NUMERAL.ferment} · ferment · {OPERATION_ELEMENT.ferment}
+            </span>
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <Link to="/sandboxes">
+            <Button variant="outline" disabled={isPending || resetMutation.isPending}>
+              Cancel
+            </Button>
+          </Link>
+          {isBuiltin ? (
+            <Button
+              variant="destructive"
+              onClick={handleReset}
+              disabled={isPending || resetMutation.isPending}
+            >
+              {resetMutation.isPending ? "Resetting..." : "Reset to Default"}
+            </Button>
+          ) : (
+            <Button onClick={handleSave} disabled={isPending || !envDefaultsValid}>
+              {isPending ? "Saving..." : "Save Profile"}
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {/* Builtin notice */}
+      {isBuiltin && (
+        <div className="flex items-start gap-2.5 px-4 py-3 rounded-md bg-cyan-500/[0.06] border border-cyan-500/20 text-sm text-cyan-100/80">
+          <Info className="w-4 h-4 mt-0.5 shrink-0 text-cyan-300" />
+          <div>
+            This is a builtin profile. Its fields are read-only here. To revert
+            any local changes that drift from the built-in defaults, use{" "}
+            <span className="font-semibold">Reset to Default</span>.
+          </div>
+        </div>
+      )}
+
+      {/* Section 1: Image & Packages */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-lg">Image &amp; Packages</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <Label htmlFor="name">Profile Name</Label>
+              <Input
+                id="name"
+                value={form.name}
+                onChange={(e) => setField("name", e.target.value)}
+                disabled={isEditMode || isBuiltin}
+                placeholder="e.g. python-dev"
+                className="mt-1"
+              />
+              {isEditMode && (
+                <p className="text-xs text-white/30 mt-1">Name cannot be changed after creation.</p>
+              )}
+            </div>
+            <div>
+              <Label htmlFor="base_image">Base Image</Label>
+              <Input
+                id="base_image"
+                value={form.base_image}
+                onChange={(e) => setField("base_image", e.target.value)}
+                disabled={isBuiltin}
+                placeholder="embry0-sandbox:latest"
+                className="mt-1"
+              />
+              <p className="text-xs text-white/30 mt-1">
+                An image from embry0's own registry, named without a registry host.
+              </p>
+            </div>
+          </div>
+          <div>
+            <Label>Additional Packages</Label>
+            <div className="mt-1">
+              <TagInput
+                value={form.additional_packages}
+                onChange={(tags) => setField("additional_packages", tags)}
+                placeholder="Add package..."
+                disabled={isBuiltin}
+              />
+            </div>
+            <p className="text-xs text-white/30 mt-1">Press Enter to add. These are installed at container startup.</p>
+          </div>
+          <div>
+            <Label>Setup Commands</Label>
+            <div className="mt-1">
+              <TagInput
+                value={form.setup_commands}
+                onChange={(tags) => setField("setup_commands", tags)}
+                placeholder="Add command..."
+                disabled={isBuiltin}
+              />
+            </div>
+            <p className="text-xs text-white/30 mt-1">Shell commands run after package installation.</p>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Section 2: Resources */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-lg">Resources</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <Label htmlFor="memory">Memory</Label>
+              <Input
+                id="memory"
+                value={form.memory}
+                onChange={(e) => setField("memory", e.target.value)}
+                disabled={isBuiltin}
+                placeholder="8g"
+                className="mt-1"
+              />
+              <p className="text-xs text-white/30 mt-1">e.g. 512m, 4g, 8g</p>
+            </div>
+            <div>
+              <Label htmlFor="cpus">CPUs</Label>
+              <Input
+                id="cpus"
+                value={form.cpus}
+                onChange={(e) => setField("cpus", e.target.value)}
+                disabled={isBuiltin}
+                placeholder="4"
+                className="mt-1"
+              />
+              <p className="text-xs text-white/30 mt-1">CPU limit (e.g. 0.5, 2, 4)</p>
+            </div>
+            <div>
+              <Label htmlFor="pids_limit">PIDs Limit</Label>
+              <Input
+                id="pids_limit"
+                type="number"
+                min={1}
+                max={65535}
+                value={form.pids_limit}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  if (!isNaN(n)) setField("pids_limit", Math.min(65535, Math.max(1, n)));
+                }}
+                disabled={isBuiltin}
+                className="mt-1"
+              />
+              <p className="text-xs text-white/30 mt-1">1–65535</p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Section 3: Security */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-lg">Security</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          <ul className="font-mono text-xs text-white/70 space-y-1">
+            <li>--cap-drop=ALL</li>
+            <li>--security-opt=no-new-privileges</li>
+          </ul>
+          <p className="text-xs text-white/30">
+            Fixed for every profile: all Linux capabilities dropped and none added back, no-new-privileges,
+            and Docker's default seccomp and AppArmor settings kept. A profile cannot weaken sandbox isolation.
+          </p>
+        </CardContent>
+      </Card>
+
+      {/* Section 4: QA & Networking */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-lg">QA &amp; Networking</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div>
+            <Label htmlFor="description">Description</Label>
+            <Input
+              id="description"
+              value={form.description}
+              onChange={(e) => setField("description", e.target.value)}
+              disabled={isBuiltin}
+              placeholder="Short summary shown on the sandboxes list"
+              className="mt-1"
+            />
+          </div>
+
+          <div className="flex items-start gap-3">
+            <input
+              id="dind_enabled"
+              type="checkbox"
+              checked={form.dind_enabled}
+              onChange={(e) => setField("dind_enabled", e.target.checked)}
+              disabled={isBuiltin}
+              className="mt-1 h-4 w-4 rounded border-white/20 bg-white/5 text-cyan-500 focus:ring-cyan-500/50 disabled:opacity-50"
+            />
+            <div>
+              <Label htmlFor="dind_enabled" className="cursor-pointer">DinD enabled</Label>
+              <p className="text-xs text-white/30 mt-0.5">
+                Asks for the shared Docker daemon so QA jobs can build and run containers. A sandbox gets it only
+                for repos an admin has granted Docker access (on the repo page): code from such a repo can control
+                the shared Docker daemon, including the proxies holding your tokens. Without the grant, a sandbox
+                on this profile is refused.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-start gap-3">
+            <input
+              id="internet_egress"
+              type="checkbox"
+              checked={form.extra_networks.includes(INTERNET_NETWORK)}
+              onChange={(e) => setField("extra_networks", e.target.checked ? [INTERNET_NETWORK] : [])}
+              disabled={isBuiltin}
+              className="mt-1 h-4 w-4 rounded border-white/20 bg-white/5 text-cyan-500 focus:ring-cyan-500/50 disabled:opacity-50"
+            />
+            <div>
+              <Label htmlFor="internet_egress" className="cursor-pointer">Internet egress (sandbox-internet)</Label>
+              <p className="text-xs text-white/30 mt-0.5">
+                Joins the sandbox-internet network: the public internet through NAT, with private address ranges
+                blocked except a QA run's declared targets. The only network a profile can add to the default
+                sandbox-restricted one.
+              </p>
+            </div>
+          </div>
+
+          <div>
+            <Label htmlFor="idle_timeout_seconds">Idle Timeout (seconds)</Label>
+            <Input
+              id="idle_timeout_seconds"
+              type="number"
+              min={1}
+              value={form.idle_timeout_seconds}
+              onChange={(e) => {
+                const n = parseInt(e.target.value, 10);
+                if (!isNaN(n) && n > 0) setField("idle_timeout_seconds", n);
+              }}
+              disabled={isBuiltin}
+              className="mt-1"
+            />
+            <p className="text-xs text-white/30 mt-1">
+              Reap the sandbox after this many seconds with no agent activity.
+            </p>
+          </div>
+
+          <div>
+            <Label htmlFor="env_defaults_json">Env Defaults (JSON)</Label>
+            <textarea
+              id="env_defaults_json"
+              value={envDefaultsText}
+              onChange={(e) => handleEnvDefaultsChange(e.target.value)}
+              disabled={isBuiltin}
+              rows={5}
+              className="mt-1 w-full font-mono text-xs bg-white/5 border border-white/10 rounded px-2 py-1.5 disabled:opacity-50"
+              placeholder='{"LANG": "C.UTF-8"}'
+            />
+            <p className="text-xs text-white/30 mt-1">
+              Non-secret env vars set by the profile. Stored as a JSON object of string values.
+            </p>
+            {!envDefaultsValid && (
+              <p className="text-xs text-red-400 mt-1">
+                Invalid JSON — must be a flat object of string values, e.g. {`{"KEY": "value"}`}.
+              </p>
+            )}
+          </div>
+
+          <div>
+            <Label htmlFor="extra_hosts_json">Extra Hosts (JSON)</Label>
+            <textarea
+              id="extra_hosts_json"
+              value={extraHostsText}
+              onChange={(e) => handleExtraHostsChange(e.target.value)}
+              disabled={isBuiltin}
+              rows={4}
+              className="mt-1 w-full font-mono text-xs bg-white/5 border border-white/10 rounded px-2 py-1.5 disabled:opacity-50"
+              placeholder='{"app.example.com": "192.168.1.10"}'
+            />
+            <p className="text-xs text-white/30 mt-1">
+              Hostname → IP aliases emitted as --add-host at sandbox create, for reaching an
+              externally deployed app by its vhost name. The "dind" alias is reserved.
+            </p>
+            {!extraHostsValid && (
+              <p className="text-xs text-red-400 mt-1">
+                Invalid JSON — must be a flat object mapping hostnames to IP strings.
+              </p>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Section 5: Timeouts */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-lg">Timeouts</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <Label htmlFor="agent_timeout_seconds">Agent Timeout (seconds)</Label>
+              <Input
+                id="agent_timeout_seconds"
+                type="number"
+                min={1}
+                value={form.agent_timeout_seconds}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  if (!isNaN(n) && n > 0) setField("agent_timeout_seconds", n);
+                }}
+                disabled={isBuiltin}
+                className="mt-1"
+              />
+              <p className="text-xs text-white/30 mt-1">Max time for the agent to complete its task</p>
+            </div>
+            <div>
+              <Label htmlFor="container_timeout_seconds">Container Timeout (seconds)</Label>
+              <Input
+                id="container_timeout_seconds"
+                type="number"
+                min={1}
+                value={form.container_timeout_seconds}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  if (!isNaN(n) && n > 0) setField("container_timeout_seconds", n);
+                }}
+                disabled={isBuiltin}
+                className="mt-1"
+              />
+              <p className="text-xs text-white/30 mt-1">Max lifetime of the container</p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

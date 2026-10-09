@@ -1,0 +1,12 @@
+{
+    "ahead_by": 1,
+    "base_commit": {
+        "sha": "378a576c9cf89ebf00292e7b7d6040aabb2928d8"
+    },
+    "behind_by": 8,
+    "merge_base_commit": {
+        "sha": "c2d1c0f41b7ab3130b642b1ed419d3be93b24bcc"
+    },
+    "status": "diverged",
+    "total_commits": 1
+}

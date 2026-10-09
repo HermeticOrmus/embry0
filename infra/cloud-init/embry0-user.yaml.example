@@ -1,0 +1,30 @@
+#cloud-config
+# Example cloud-init for an embry0 host.
+#
+# Copy this file onto the hypervisor snippets directory and point the VM's
+# cicustom user-data at that copy. Set hostname to this machine's name.
+hostname: embry0
+fqdn: embry0.example.com
+preserve_hostname: false
+users:
+  - name: embry0
+    shell: /bin/bash
+    groups: [sudo]
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    lock_passwd: true
+    # The operator fills this list.
+    ssh_authorized_keys: []
+package_update: true
+packages:
+  - qemu-guest-agent
+  - prometheus-node-exporter
+  - docker.io
+  - docker-compose-v2
+  - git
+  - curl
+  - ca-certificates
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  - systemctl enable --now docker
+  - systemctl enable --now prometheus-node-exporter
+  - usermod -aG docker embry0

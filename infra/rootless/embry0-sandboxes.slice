@@ -1,0 +1,14 @@
+# Every container of the rootless sandbox daemon runs in this slice of the
+# sandbox account's user manager (daemon.json "cgroup-parent"), so the
+# collective ceiling bounds the sandboxes and proxies together while the
+# daemon itself stays outside it: an out-of-memory kill at the ceiling picks a
+# sandbox process, never dockerd. provision-sandbox-daemon.sh fills in the
+# limits from SANDBOX_MEMORY_MAX, SANDBOX_CPU_QUOTA and SANDBOX_TASKS_MAX.
+[Unit]
+Description=embry0 sandboxes (collective ceiling)
+
+[Slice]
+MemoryMax=@MEMORY_MAX@
+MemorySwapMax=0
+CPUQuota=@CPU_QUOTA@
+TasksMax=@TASKS_MAX@

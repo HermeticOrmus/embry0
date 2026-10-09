@@ -1,0 +1,337 @@
+"""Tests for the sticky embry0/qa PR comment renderer."""
+
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+
+from embry0.execution.github_client import GitHubClient
+from embry0.notifications.qa_comment import (
+    COMMENT_MARKER,
+    render_qa_comment,
+    upsert_sticky_comment,
+)
+from embry0.workflows.qa.subtask_result_schema import (
+    CacheHits,
+    SubTaskResult,
+    SubTaskStatus,
+)
+
+
+def _client(handler) -> GitHubClient:
+    """Real GitHubClient over a MockTransport — exercises headers and paging."""
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return GitHubClient(default_token="tok", http_client=http)
+
+
+def _r(app: str, status: SubTaskStatus, **kw) -> SubTaskResult:
+    return SubTaskResult(
+        app_name=app,
+        status=status,
+        duration_ms=kw.get("duration_ms", 1000),
+        cache_hits=CacheHits(),
+        trace_url=kw.get("trace_url"),
+        failure_summary=kw.get("failure_summary"),
+    )
+
+
+def test_comment_includes_marker_for_sticky_lookup():
+    out = render_qa_comment(
+        run_number=1,
+        overall_status="passed",
+        apps_to_qa=["hub"],
+        results=[_r("hub", SubTaskStatus.PASSED)],
+    )
+    assert COMMENT_MARKER in out
+
+
+def test_comment_passed_run_collapses_passing_apps():
+    out = render_qa_comment(
+        run_number=42,
+        overall_status="passed",
+        apps_to_qa=["hub", "companion"],
+        results=[
+            _r("hub", SubTaskStatus.PASSED),
+            _r("companion", SubTaskStatus.PASSED),
+        ],
+    )
+    assert "Status: Passed" in out
+    assert "run #42" in out
+    assert "<details>" in out  # collapsed section
+
+
+def test_comment_failed_run_expands_failing_apps():
+    out = render_qa_comment(
+        run_number=43,
+        overall_status="failed",
+        apps_to_qa=["hub", "companion"],
+        results=[
+            _r("hub", SubTaskStatus.PASSED),
+            _r("companion", SubTaskStatus.QA_FAILURE, failure_summary="customer list did not render"),
+        ],
+    )
+    assert "Status: Failed" in out
+    assert "companion" in out
+    assert "customer list did not render" in out
+
+
+def test_comment_skipped_run():
+    out = render_qa_comment(
+        run_number=44,
+        overall_status="passed",
+        apps_to_qa=[],
+        results=[],
+    )
+    assert "QA skipped" in out
+    assert "no affected apps" in out
+
+
+def test_comment_includes_trace_links_when_available():
+    out = render_qa_comment(
+        run_number=45,
+        overall_status="failed",
+        apps_to_qa=["hub"],
+        results=[
+            _r(
+                "hub",
+                SubTaskStatus.QA_FAILURE,
+                trace_url="https://embry0.example/traces/run-45/hub.zip",
+                failure_summary="loads page did not render",
+            ),
+        ],
+    )
+    assert "https://embry0.example/traces/run-45/hub.zip" in out
+
+
+def test_comment_summary_table_orders_apps_alphabetically():
+    out = render_qa_comment(
+        run_number=46,
+        overall_status="passed",
+        apps_to_qa=["companion", "hub", "lane"],
+        results=[
+            _r("companion", SubTaskStatus.PASSED),
+            _r("hub", SubTaskStatus.PASSED),
+            _r("lane", SubTaskStatus.PASSED),
+        ],
+    )
+    hub_idx = out.find("apps/hub")
+    lane_idx = out.find("apps/lane")
+    companion_idx = out.find("apps/companion")
+    assert companion_idx < hub_idx < lane_idx
+
+
+def test_comment_infra_error_distinguishable():
+    out = render_qa_comment(
+        run_number=47,
+        overall_status="infra_error",
+        apps_to_qa=["hub"],
+        results=[],
+        failure_summary="qa.yaml not found",
+    )
+    assert "infra error" in out.lower()
+    assert "qa.yaml not found" in out
+
+
+def test_human_duration_clamps_negative():
+    from embry0.notifications.qa_comment import _human_duration
+
+    assert _human_duration(-100) == "0.0s"
+    assert _human_duration(0) == "0.0s"
+    assert _human_duration(500) == "0.5s"
+    assert _human_duration(60_000) == "1m  0s"
+    assert _human_duration(125_000) == "2m  5s"
+
+
+def test_comment_workspace_warnings_section_when_present():
+    out = render_qa_comment(
+        run_number=48,
+        overall_status="passed",
+        apps_to_qa=["hub"],
+        results=[_r("hub", SubTaskStatus.PASSED)],
+        validation_warnings=[
+            "warning: app 'lane' present in workspace but missing from qa.yaml apps:",
+        ],
+    )
+    assert "workspace warnings" in out
+    assert "lane" in out
+
+
+def test_comment_shows_cache_hit_indicators_per_app():
+    """A SubTaskResult with all 3 cache layers hit should show 🔥 glyphs."""
+    result = SubTaskResult(
+        app_name="hub",
+        status=SubTaskStatus.PASSED,
+        duration_ms=1500,
+        cache_hits=CacheHits(
+            prebaked_image=True,
+            shared_volume=True,
+            turbo_remote_hits=["apps/hub#build", "apps/hub#lint"],
+            turbo_remote_misses=[],
+        ),
+        trace_url=None,
+        failure_summary=None,
+    )
+    out = render_qa_comment(
+        run_number=50,
+        overall_status="passed",
+        apps_to_qa=["hub"],
+        results=[result],
+    )
+    # All three layers hit → three fire glyphs
+    assert "\U0001f525\U0001f525\U0001f525" in out
+
+
+def test_comment_summary_table_includes_cache_column():
+    """The summary table header must contain a Cache column."""
+    out = render_qa_comment(
+        run_number=51,
+        overall_status="passed",
+        apps_to_qa=["hub"],
+        results=[_r("hub", SubTaskStatus.PASSED)],
+    )
+    assert "| Cache |" in out
+
+
+from unittest.mock import MagicMock  # noqa: E402
+
+
+def _stub_resp(status_code: int, payload=None, text: str = ""):
+    class _R:
+        def __init__(self):
+            self.status_code = status_code
+            self._payload = payload if payload is not None else []
+            self.text = text
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            if not (200 <= self.status_code < 300):
+                raise httpx.HTTPStatusError(
+                    "fail",
+                    request=MagicMock(),
+                    response=MagicMock(status_code=self.status_code),
+                )
+
+    return _R()
+
+
+@pytest.mark.asyncio
+async def test_upsert_creates_when_no_existing_comment_with_marker():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[{"id": 1, "body": "some other comment"}])
+        if request.method == "POST":
+            seen["url"] = str(request.url)
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(201, json={"id": 99})
+        raise AssertionError("should not patch when no existing comment")
+
+    new_id = await upsert_sticky_comment(
+        github_token="tok",
+        repo="org/repo",
+        issue_number=42,
+        body="rendered content",
+        client=_client(handler),
+    )
+    assert new_id == 99
+    assert "issues/42/comments" in seen["url"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_updates_when_existing_comment_has_marker():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[{"id": 7, "body": f"before {COMMENT_MARKER} after"}])
+        if request.method == "PATCH":
+            seen["url"] = str(request.url)
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": 7})
+        raise AssertionError("should not post when a marker comment exists")
+
+    got = await upsert_sticky_comment(
+        github_token="tok",
+        repo="org/repo",
+        issue_number=42,
+        body="updated content",
+        client=_client(handler),
+    )
+    assert got == 7
+    assert seen["url"].endswith("/repos/org/repo/issues/comments/7")
+    assert seen["body"]["body"] == "updated content"
+
+
+@pytest.mark.asyncio
+async def test_upsert_handles_multiple_marker_matches_by_picking_first():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": 3, "body": f"first {COMMENT_MARKER}"},
+                    {"id": 8, "body": f"second {COMMENT_MARKER}"},
+                ],
+            )
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"id": 3})
+
+    got = await upsert_sticky_comment(
+        github_token="tok",
+        repo="org/repo",
+        issue_number=42,
+        body="x",
+        client=_client(handler),
+    )
+    assert got == 3
+    assert seen["url"].endswith("/issues/comments/3")
+
+
+@pytest.mark.asyncio
+async def test_upsert_follows_pagination_to_find_the_marker():
+    """The marker may be on a later page; this module used to hand-roll that."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method != "GET":
+            return httpx.Response(200, json={"id": 55})
+        if request.url.params.get("page") is None:
+            return httpx.Response(
+                200,
+                json=[{"id": 1, "body": "chatter"}],
+                headers={"Link": '<https://api.github.com/repos/org/repo/issues/42/comments?page=2>; rel="next"'},
+            )
+        return httpx.Response(200, json=[{"id": 55, "body": f"late {COMMENT_MARKER}"}])
+
+    got = await upsert_sticky_comment(
+        github_token="tok", repo="org/repo", issue_number=42, body="x", client=_client(handler)
+    )
+    assert got == 55
+
+
+@pytest.mark.asyncio
+async def test_upsert_uses_the_per_owner_token(monkeypatch):
+    """The bug #158 fixes: this path ignored GITHUB_TOKEN__<OWNER> entirely."""
+    monkeypatch.setenv("GITHUB_TOKEN__ORG", "tok-org")
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers.get("Authorization")
+        if request.method == "GET":
+            return httpx.Response(200, json=[])
+        return httpx.Response(201, json={"id": 1})
+
+    await upsert_sticky_comment(
+        github_token="tok-default",
+        repo="org/repo",
+        issue_number=42,
+        body="x",
+        client=_client(handler),
+    )
+    assert seen["auth"] == "Bearer tok-org"

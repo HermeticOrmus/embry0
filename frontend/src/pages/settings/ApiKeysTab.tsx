@@ -1,0 +1,280 @@
+import { useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { Copy, KeyRound, Trash2 } from "lucide-react";
+import { toast } from "sonner";
+import { useApiKeys } from "@/hooks/useApiKeys";
+import { createApiKey, revokeApiKey, type ApiKey, type CreatedApiKey } from "@/api/apiKeys";
+import { useAuthStore } from "@/stores/authStore";
+import { Badge, type BadgeTone } from "@/components/ui/Badge";
+import { Button } from "@/components/ui/Button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
+import { Input } from "@/components/ui/Input";
+import { Label } from "@/components/ui/Label";
+import { Select } from "@/components/ui/Select";
+import { EmptyState } from "@/components/ui/EmptyState";
+import { PageError } from "@/components/PageError";
+import { TableSkeleton } from "@/components/TableSkeleton";
+import { formatDate } from "@/lib/utils";
+
+const SCOPE_TONES: Record<ApiKey["scope"], BadgeTone> = {
+  admin: "gold",
+  operate: "info",
+  merge: "warning",
+  read: "neutral",
+};
+
+/**
+ * Self-service API keys (RAV-1056 Phase B). Session users mint keys scoped
+ * at or below their own tier; admins additionally see everyone's keys and
+ * can mint unowned service keys. The plaintext token is shown exactly once
+ * after creation — copy it or lose it.
+ */
+
+/** The `claude mcp add` command for this deployment, with the fresh key inline.
+ * Points at the hosted MCP endpoint (/mcp) — nothing to clone or install.
+ * Origin comes from the browser so the snippet is correct on any deployment —
+ * no environment-specific strings live in the repo. */
+function mcpAddCommand(key: string): string {
+  return [
+    "claude mcp add --transport http embry0 \\",
+    `  ${window.location.origin}/mcp \\`,
+    `  --header "Authorization: Bearer ${key}"`,
+  ].join("\n");
+}
+
+export default function ApiKeysTab() {
+  const keys = useApiKeys();
+  const queryClient = useQueryClient();
+  const authMode = useAuthStore((s) => s.authMode);
+  const userTier = useAuthStore((s) => s.user?.tier);
+  const isAdmin = authMode === "key" || userTier === "admin";
+
+  const [name, setName] = useState("");
+  const [scope, setScope] = useState("read");
+  const [expiresDays, setExpiresDays] = useState("");
+  const [service, setService] = useState(false);
+  const [minted, setMinted] = useState<CreatedApiKey | null>(null);
+
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: ["api-keys"] });
+
+  const createMut = useMutation({
+    mutationFn: (body: Parameters<typeof createApiKey>[0]) => createApiKey(body),
+    onSuccess: (row) => {
+      setMinted(row);
+      setName("");
+      setExpiresDays("");
+      setService(false);
+      invalidate();
+    },
+    onError: () => toast.error("Key creation failed"),
+  });
+
+  const revokeMut = useMutation({
+    mutationFn: (id: string) => revokeApiKey(id),
+    onSuccess: (row) => {
+      toast.success(`Key "${row.name}" revoked`);
+      invalidate();
+    },
+    onError: () => toast.error("Revoke failed"),
+  });
+
+  // "merge" is the chat relay's narrow scope (read + merge decisions + agent
+  // answers); only an admin may mint one.
+  const scopeOptions = isAdmin ? ["read", "operate", "admin", "merge"] : ["read", "operate"];
+
+  return (
+    <div className="space-y-6">
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <KeyRound size={16} /> Create key
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <p className="text-sm text-muted-foreground">
+            Keys authenticate MCP/CLI clients with the <code>Authorization: Bearer</code> header on
+            any origin. Scope is capped at your tier; <code>read</code> keys can only perform
+            read-only requests.
+          </p>
+          <div className="grid gap-3 sm:grid-cols-4">
+            <div className="sm:col-span-2">
+              <Label htmlFor="key-name">Name</Label>
+              <Input
+                id="key-name"
+                placeholder="e.g. laptop-cli"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+              />
+            </div>
+            <div>
+              <Label htmlFor="key-scope">Scope</Label>
+              <Select id="key-scope" value={scope} onChange={(e) => setScope(e.target.value)}>
+                {scopeOptions.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </Select>
+            </div>
+            <div>
+              <Label htmlFor="key-expiry">Expires (days)</Label>
+              <Input
+                id="key-expiry"
+                placeholder="never"
+                inputMode="numeric"
+                value={expiresDays}
+                onChange={(e) => setExpiresDays(e.target.value.replace(/[^0-9]/g, ""))}
+              />
+            </div>
+          </div>
+          {isAdmin && (
+            <label className="flex items-center gap-2 text-sm text-muted-foreground">
+              <input type="checkbox" checked={service} onChange={(e) => setService(e.target.checked)} />
+              Service key (unowned — for agents/infra such as a chat relay)
+            </label>
+          )}
+          <Button
+            disabled={!name.trim() || createMut.isPending}
+            onClick={() =>
+              createMut.mutate({
+                name: name.trim(),
+                scope,
+                expires_days: expiresDays ? Number(expiresDays) : undefined,
+                service: service || undefined,
+              })
+            }
+          >
+            {createMut.isPending ? "Creating…" : "Create key"}
+          </Button>
+        </CardContent>
+      </Card>
+
+      {minted && (
+        <Card className="border-amber-500/40">
+          <CardContent className="space-y-2 pt-4">
+            <p className="text-sm font-medium text-foreground">
+              Copy this key now — it will not be shown again.
+            </p>
+            <div className="flex items-center gap-2">
+              <code
+                data-testid="minted-key"
+                className="flex-1 overflow-x-auto rounded bg-black/40 px-3 py-2 font-mono text-xs"
+              >
+                {minted.key}
+              </code>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  void navigator.clipboard.writeText(minted.key);
+                  toast.success("Copied");
+                }}
+              >
+                <Copy size={14} />
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setMinted(null)}>
+                Done
+              </Button>
+            </div>
+            <div className="space-y-2 border-t border-border pt-3">
+              <p className="text-sm font-medium text-foreground">Connect Claude Code</p>
+              <p className="text-xs text-muted-foreground">
+                Registers this deployment&apos;s hosted MCP server — nothing to install:
+              </p>
+              <div className="flex items-start gap-2">
+                <pre
+                  data-testid="mcp-command"
+                  className="flex-1 overflow-x-auto whitespace-pre rounded bg-black/40 px-3 py-2 font-mono text-xs"
+                >
+                  {mcpAddCommand(minted.key)}
+                </pre>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    void navigator.clipboard.writeText(mcpAddCommand(minted.key));
+                    toast.success("Copied");
+                  }}
+                >
+                  <Copy size={14} />
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Then ask Claude Code to list embry0 jobs to verify the connection.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {keys.isLoading && <TableSkeleton rows={3} />}
+      {keys.isError && <PageError message="Could not load keys" onRetry={() => keys.refetch()} />}
+      {keys.data && keys.data.length === 0 && (
+        <EmptyState title="No API keys" description="Create one above to authenticate MCP/CLI clients." />
+      )}
+
+      {keys.data && keys.data.length > 0 && (
+        <div className="embry0-card overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-white/[0.06] text-left text-xs uppercase text-muted-foreground">
+                <th className="px-4 py-2.5">Name</th>
+                <th className="px-4 py-2.5">Key</th>
+                <th className="px-4 py-2.5">Scope</th>
+                {isAdmin && <th className="px-4 py-2.5">Owner</th>}
+                <th className="px-4 py-2.5">Last used</th>
+                <th className="px-4 py-2.5">Expires</th>
+                <th className="px-4 py-2.5">Status</th>
+                <th className="px-4 py-2.5 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {keys.data.map((k) => (
+                <tr key={k.id} className="border-b border-white/[0.04]">
+                  <td className="px-4 py-2.5">{k.name}</td>
+                  <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">{k.prefix}…</td>
+                  <td className="px-4 py-2.5">
+                    <Badge tone={SCOPE_TONES[k.scope]}>{k.scope}</Badge>
+                  </td>
+                  {isAdmin && (
+                    <td className="px-4 py-2.5 text-xs text-muted-foreground">
+                      {k.service ? <Badge tone="neutral">service</Badge> : (k.user_id ?? "—")}
+                    </td>
+                  )}
+                  <td className="px-4 py-2.5 text-xs text-muted-foreground">
+                    {k.last_used_at ? formatDate(k.last_used_at) : "never"}
+                  </td>
+                  <td className="px-4 py-2.5 text-xs text-muted-foreground">
+                    {k.expires_at ? formatDate(k.expires_at) : "—"}
+                  </td>
+                  <td className="px-4 py-2.5">
+                    {k.revoked_at ? <Badge tone="error">revoked</Badge> : <Badge tone="success">active</Badge>}
+                  </td>
+                  <td className="px-4 py-2.5">
+                    <div className="flex justify-end">
+                      {!k.revoked_at && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          title="Revoke this key"
+                          disabled={revokeMut.isPending}
+                          onClick={() => {
+                            if (window.confirm(`Revoke key "${k.name}"? Clients using it will get 401s.`)) {
+                              revokeMut.mutate(k.id);
+                            }
+                          }}
+                        >
+                          <Trash2 size={14} className="text-destructive" />
+                        </Button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}

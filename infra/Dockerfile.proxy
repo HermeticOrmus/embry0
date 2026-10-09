@@ -1,0 +1,56 @@
+# Stateless proxies — same image is used for two distinct deployment shapes:
+#   1. Credential-injection proxies (git, github, auth) — run inside DinD on
+#      sandbox-restricted, holding orchestrator credentials.
+#   2. Network-plumbing proxies (minio, presign) — run on the HOST docker daemon
+#      on the backend network, giving DinD-spawned sandboxes a stable hostname
+#      to reach minio:9000 and orchestrator:8000 (which are NOT visible inside
+#      DinD's network namespace).
+# Each container instance picks a proxy type at startup via PROXY_TYPE env var.
+
+FROM python:3.12.7-slim-bookworm
+
+# Upgrade OS packages first — the pinned base tag ships a CRITICAL OpenSSL
+# (CVE-2026-31789) whose fix is already in the Debian repos.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Only need aiohttp + httpx + structlog. Pinned to match the orchestrator's runtime.
+RUN pip install --no-cache-dir \
+    "aiohttp>=3.14.4,<4" \
+    "httpx>=0.27,<1" \
+    "structlog>=26.1,<27"
+
+# Make the embry0 namespace importable.
+RUN mkdir -p /app/embry0/execution/proxy
+COPY embry0/__init__.py                           /app/embry0/__init__.py
+COPY embry0/execution/__init__.py                 /app/embry0/execution/__init__.py
+# gitlab_proxy imports embry0.execution.tls for the private-CA context (spec 1A 3.2).
+COPY embry0/execution/tls.py                      /app/embry0/execution/tls.py
+# xai_proxy reads 403 bodies with embry0/safety/xai_denials.py; the package __init__ imports patterns.py.
+COPY embry0/safety/__init__.py                    /app/embry0/safety/__init__.py
+COPY embry0/safety/patterns.py                    /app/embry0/safety/patterns.py
+COPY embry0/safety/xai_denials.py                 /app/embry0/safety/xai_denials.py
+COPY embry0/execution/proxy/__init__.py           /app/embry0/execution/proxy/__init__.py
+COPY embry0/execution/proxy/auth_proxy.py         /app/embry0/execution/proxy/auth_proxy.py
+COPY embry0/execution/proxy/context_proxy.py      /app/embry0/execution/proxy/context_proxy.py
+COPY embry0/execution/proxy/enrollment.py         /app/embry0/execution/proxy/enrollment.py
+COPY embry0/execution/proxy/forge_scope.py        /app/embry0/execution/proxy/forge_scope.py
+COPY embry0/execution/proxy/git_proxy.py          /app/embry0/execution/proxy/git_proxy.py
+COPY embry0/execution/proxy/git_scope.py          /app/embry0/execution/proxy/git_scope.py
+COPY embry0/execution/proxy/github_proxy.py       /app/embry0/execution/proxy/github_proxy.py
+COPY embry0/execution/proxy/gitlab_proxy.py       /app/embry0/execution/proxy/gitlab_proxy.py
+COPY embry0/execution/proxy/log_redaction.py      /app/embry0/execution/proxy/log_redaction.py
+COPY embry0/execution/proxy/minio_proxy.py        /app/embry0/execution/proxy/minio_proxy.py
+COPY embry0/execution/proxy/presign_proxy.py      /app/embry0/execution/proxy/presign_proxy.py
+COPY embry0/execution/proxy/xai_proxy.py          /app/embry0/execution/proxy/xai_proxy.py
+COPY embry0/execution/proxy/server.py             /app/embry0/execution/proxy/server.py
+
+# Health check via the proxy's own /health endpoint. Use Python's urllib since
+# wget/curl are not present in python:3.12-slim. PORT defaults to 9100 in
+# absence of PROXY_TYPE; the docker-compose / ProxyManager always sets it.
+HEALTHCHECK --interval=5s --timeout=3s --start-period=2s --retries=3 \
+    CMD python -c "import urllib.request, os; urllib.request.urlopen('http://localhost:' + os.environ.get('LISTEN_PORT','9100') + '/health')" || exit 1
+
+# Default command runs whichever proxy was selected via env at container start.
+CMD ["python", "-m", "embry0.execution.proxy.server"]

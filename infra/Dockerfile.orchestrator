@@ -1,0 +1,105 @@
+FROM python:3.12.7-slim-bookworm
+
+# Upgrade OS packages first — the pinned base tag ships a CRITICAL OpenSSL
+# (CVE-2026-31789) whose fix is already in the Debian repos.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates gnupg libpq-dev openssh-client \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+       https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install -y --no-install-recommends docker-ce-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python dependencies. Only pyproject + a stub package are copied here so this
+# layer caches across source changes; the full source lands further down.
+#
+# EDITABLE install (#334): `pip install .` at this point copied the STUB into
+# site-packages (embry0/__init__.py and nothing else). Console scripts put
+# their own directory on sys.path, not the cwd, so `embry0 …` imported that
+# stub and died with "No module named 'embry0.cli'", while uvicorn (which adds
+# the cwd) ran the real tree from /app — two copies of one package, picked by
+# import order. `-e` writes a .pth that points at /app instead: site-packages
+# holds metadata only (console scripts + the embry0.workspace_* entry points),
+# and /app is the ONE copy every entry path imports, data files included.
+#
+# README.md is a stub too: hatchling reads pyproject's `readme` to build the
+# metadata and fails if the file is missing. The real one is not in the build
+# context (.dockerignore drops *.md), and copying it would re-run this layer
+# on every docs edit. The image never shows the long description.
+COPY pyproject.toml /app/
+COPY embry0/__init__.py /app/embry0/__init__.py
+COPY embry0_mcp/__init__.py /app/embry0_mcp/__init__.py
+WORKDIR /app
+RUN touch README.md && pip install --no-cache-dir -e . psycopg[binary]
+
+# Install Node.js. No Claude CLI here (#497): the orchestrator never runs an
+# agent — every query() runs in a sandbox image, on the CLI bundled in that
+# image's claude-agent-sdk — so an npm @anthropic-ai/claude-code here was a
+# second, unused CLI version.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    # npm self-upgrade — nodesource bundles an npm whose vendored tar carries
+    # CRITICAL CVE-2026-59873 (fixed in tar >= 7.5.19).
+    && npm install -g npm@latest
+
+# Application code (overwrite with full source)
+COPY embry0/ /app/embry0/
+# The hosted MCP endpoint (embry0-mcp-http, compose service `mcp`) runs from
+# this image too — the entry point comes from pyproject at the pip layer, but
+# the module itself rides the /app source copy like embry0/ does.
+COPY embry0_mcp/ /app/embry0_mcp/
+
+# Non-root user
+RUN useradd --create-home orchestrator \
+    && mkdir -p /data \
+    && chown orchestrator:orchestrator /data
+
+USER orchestrator
+
+# Inside this image the API is on :8000 (the :8200 the CLI defaults to is the
+# host-side nginx port). Compose `environment:` still overrides these — the
+# `mcp` service points EMBRY0_API_URL at http://orchestrator:8000.
+#
+# PROD_PORT, not EMBRY0_URL: `embry0 health` derives its URL from PROD_PORT,
+# while EMBRY0_URL is also the base for the console/board deep links that
+# services/linear_dispatch.py prints, and those are nginx routes that :8000
+# does not serve — setting it would hand operators 404 links.
+ENV EMBRY0_API_URL=http://localhost:8000 \
+    PROD_PORT=8000
+
+# Build-time smoke (#334): fail the build, not the operator. Runs from / as the
+# runtime user so nothing is found via the cwd — every import must resolve
+# through the install, and must resolve to /app (a second copy in
+# site-packages is the bug this guards against).
+WORKDIR /
+RUN embry0 --help > /dev/null \
+    && embry0 build-qa-image --help > /dev/null \
+    && python -c "import embry0, embry0_mcp.http, embry0.api.app, pathlib, sysconfig; \
+assert embry0.__file__ == '/app/embry0/__init__.py', embry0.__file__; \
+assert embry0_mcp.__file__ == '/app/embry0_mcp/__init__.py', embry0_mcp.__file__; \
+sp = pathlib.Path(sysconfig.get_paths()['purelib']); \
+assert not (sp / 'embry0').exists() and not (sp / 'embry0_mcp').exists(), 'package copy in site-packages'"
+WORKDIR /app
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl --fail http://localhost:8000/health || exit 1
+
+# --proxy-headers is uvicorn's default but stated explicitly: which peers'
+# X-Forwarded-For is trusted comes from FORWARDED_ALLOW_IPS in the compose
+# environment (RAV-1060 — pinned to the nginx/frontend network subnet).
+# Without a trusted source uvicorn reports the nginx container IP as the
+# client for every request, gutting per-IP rate limiting + audit actors.
+CMD ["uvicorn", "embry0.api.app:create_app", "--factory", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--proxy-headers", \
+     "--log-level", "info", \
+     "--timeout-graceful-shutdown", "30", \
+     "--timeout-keep-alive", "65"]
