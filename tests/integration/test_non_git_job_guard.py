@@ -112,7 +112,9 @@ async def test_none_context_proceeds_past_init(issue_executor, jobs_repo):
     docker = MagicMock()
     docker.build_exec_cmd = MagicMock(side_effect=lambda cid, cmd, **kw: ["docker", "exec", cid, *cmd])
     docker.run_cmd = AsyncMock(return_value="")
-    sandbox_mgr._docker = docker
+    # The executor hands the graph the runtime's client (#602), not the
+    # manager's private _docker, so that is where the mock goes.
+    sandbox_mgr.runtime.client = docker
 
     job_id = await jobs_repo.create(task="Research the widget market", context={"type": "none"})
     synthetic_issue = {"repo": None, "title": "Research", "body": "", "tracker": None, "tracker_key": None}
