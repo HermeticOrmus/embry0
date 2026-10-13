@@ -42,8 +42,11 @@ export function columnForStatus(status: JobStatus): BoardColumnId {
       return "queued";
     case "running":
       return "running";
+    // skipped (#474): ended without work because an open PR already covers
+    // the ticket — nothing failed and nothing is waiting on the operator.
     case "completed":
     case "pr_merged":
+    case "skipped":
       return "done";
     case "failed":
     case "partial":

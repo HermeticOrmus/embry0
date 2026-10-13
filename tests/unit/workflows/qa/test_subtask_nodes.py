@@ -166,7 +166,6 @@ async def test_emit_result_node_passed():
         "failure_summary": None,
         "started_at": now - 5.0,
         "completed_at": now,
-        "trace_url": None,
         "raw_result": {"overall": "passed"},
     }
     out = await emit_result_node(state, {})
@@ -188,7 +187,6 @@ async def test_emit_result_node_no_status_defaults_to_infra_failure():
         "failure_summary": None,
         "started_at": time.monotonic() - 1.0,
         "completed_at": None,
-        "trace_url": None,
         "raw_result": {},
     }
     out = await emit_result_node(state, {})
@@ -606,7 +604,6 @@ async def test_emit_result_node_passes_boot_phase_to_subtask_result():
         "failure_summary": "boot_command did not become ready within 600s",
         "started_at": now - 600.0,
         "completed_at": now,
-        "trace_url": None,
         "raw_result": {},
         "boot_phase": boot_phase,
     }
@@ -629,7 +626,6 @@ async def test_emit_result_node_boot_phase_defaults_to_none():
         "failure_summary": None,
         "started_at": time.monotonic() - 1.0,
         "completed_at": time.monotonic(),
-        "trace_url": None,
         "raw_result": {"overall": "passed"},
     }
     out = await emit_result_node(state, {})
@@ -661,7 +657,6 @@ async def test_emit_result_node_publishes_subtask_status_to_event_bus():
         "failure_summary": "boot timeout",
         "started_at": now - 3.0,
         "completed_at": now,
-        "trace_url": None,
         "raw_result": {},
         "boot_phase": boot_phase,
     }
@@ -694,7 +689,6 @@ async def test_emit_result_node_skips_publish_when_no_event_bus():
         "failure_summary": None,
         "started_at": time.monotonic() - 1.0,
         "completed_at": time.monotonic(),
-        "trace_url": None,
         "raw_result": {"overall": "passed"},
     }
     # Test passes if no exception is raised when config has no qa_event_bus.
@@ -719,7 +713,6 @@ async def test_emit_result_node_swallows_publish_errors():
         "failure_summary": None,
         "started_at": time.monotonic() - 1.0,
         "completed_at": time.monotonic(),
-        "trace_url": None,
         "raw_result": {"overall": "passed"},
     }
     config = {"configurable": {"qa_event_bus": bus}}
@@ -1321,6 +1314,35 @@ async def test_exploratory_qa_node_forwards_agent_models_override():
     assert captured["agent_models_override"] == {"qa": "grok-4.5"}
 
 
+@pytest.mark.asyncio
+async def test_exploratory_qa_node_holds_the_qa_agent_to_the_jobs_cap():
+    """#264: the QA turn's cap check reads the parent's cap and mode off the
+    state it is handed — without them it falls back to the default cap."""
+    from embry0.orchestration.budget import resolve_job_cap
+    from embry0.workflows.qa.subtask_nodes import exploratory_qa_node
+
+    captured: dict = {}
+
+    async def fake_qa_node(state, config):
+        captured.update(state)
+        return {"agent_outputs": []}
+
+    state = {
+        "status": None,
+        "resolved": _resolved_app("hub"),
+        "parent_run_id": "job-77",
+        "repo": "o/r",
+        "branch_name": "main",
+        "sandbox_id": "cid-x",
+    }
+    budget = {"max_budget_usd": 2.5, "budget_overrun_mode_override": "hard"}
+    with patch("embry0.workflows.qa.nodes.qa_node", fake_qa_node):
+        await exploratory_qa_node(state, {"configurable": {"qa_job_budget": budget}})
+
+    assert resolve_job_cap(captured) == 2.5, f"the QA agent ran under cap {resolve_job_cap(captured)}, not the job's"
+    assert captured["budget_overrun_mode_override"] == "hard"
+
+
 # ---------------------------------------------------------------------------
 # #238: sub-task boot-failure diagnostic screenshot
 # ---------------------------------------------------------------------------
@@ -1513,3 +1535,112 @@ async def test_acquire_sandbox_reports_an_unregistered_repo_as_infra_failure():
     out = await acquire_sandbox_node(_make_acquire_state(), config)
     assert out["status"] == SubTaskStatus.INFRA_FAILURE
     assert out["failure_summary"].startswith(ErrorCode.REPO_UNREGISTERED)
+
+
+# ---------------------------------------------------------------------------
+# #643: one bounded retry of the QA agent on an environmental failure
+# ---------------------------------------------------------------------------
+
+
+def _fake_qa_runs(*runs: dict):
+    """A stand-in for qa_node that plays ``runs`` in order, honouring its
+    contract: stamp exit_reason on the attempt, extend agent_outputs, return
+    the state. A run may instead carry ``raise`` to raise an exception."""
+    calls: list[dict] = []
+
+    async def fake(state, config):
+        run = runs[len(calls)]
+        calls.append(state)
+        if "raise" in run:
+            raise run["raise"]
+        state["qa"]["attempts"][-1]["exit_reason"] = run.get("exit_reason")
+        state.setdefault("agent_outputs", []).append(run["output"])
+        if "budget_overrun_usd" in run:
+            state["budget_overrun_usd"] = run["budget_overrun_usd"]
+        return state
+
+    return fake, calls
+
+
+def _explore_state() -> dict:
+    return {
+        "status": None,
+        "resolved": _resolved_app("hub"),
+        "parent_run_id": "job-643",
+        "repo": "o/r",
+        "branch_name": "main",
+        "sandbox_id": "cid-x",
+    }
+
+
+_TRANSIENT = {
+    "exit_reason": "agent_transient: connection reset by peer",
+    "output": {"agent_type": "qa", "is_error": True, "error_message": "connection reset by peer"},
+}
+_CLEAN = {"exit_reason": None, "output": {"agent_type": "qa", "is_error": False}}
+
+
+@pytest.mark.asyncio
+async def test_exploratory_qa_retries_a_transient_agent_failure_once():
+    from embry0.workflows.qa.subtask_nodes import exploratory_qa_node
+
+    fake, calls = _fake_qa_runs(_TRANSIENT, _CLEAN)
+    with patch("embry0.workflows.qa.nodes.qa_node", fake):
+        out = await exploratory_qa_node(_explore_state(), {})
+
+    assert len(calls) == 2, f"a transient agent failure must be retried once, ran {len(calls)} time(s)"
+    assert out.get("status") is None, out
+    assert out["agent_transient_retries"] == 1, "the retry must be recorded on the sub-task state"
+    assert [o["is_error"] for o in out["agent_outputs"]] == [True, False], out["agent_outputs"]
+    assert calls[1]["qa"]["attempts"][-1].get("exit_reason") is None, "the retry must start from a fresh attempt"
+
+
+@pytest.mark.asyncio
+async def test_exploratory_qa_a_second_transient_failure_falls_through():
+    from embry0.workflows.qa.subtask_nodes import exploratory_qa_node
+
+    fake, calls = _fake_qa_runs(_TRANSIENT, _TRANSIENT)
+    with patch("embry0.workflows.qa.nodes.qa_node", fake):
+        out = await exploratory_qa_node(_explore_state(), {})
+
+    assert len(calls) == 2, f"exactly one retry, ran {len(calls)} time(s)"
+    # As before the retry existed: no status here, collect_artifacts decides.
+    assert out.get("status") is None, out
+    assert len(out["agent_outputs"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_exploratory_qa_does_not_retry_a_behavioural_agent_error():
+    from embry0.workflows.qa.subtask_nodes import exploratory_qa_node
+
+    run = {"exit_reason": "agent_error: tool misuse", "output": {"agent_type": "qa", "is_error": True}}
+    fake, calls = _fake_qa_runs(run)
+    with patch("embry0.workflows.qa.nodes.qa_node", fake):
+        out = await exploratory_qa_node(_explore_state(), {})
+
+    assert len(calls) == 1, "only an environmental failure is retried"
+    assert out.get("agent_transient_retries", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_exploratory_qa_does_not_retry_once_the_job_is_over_its_cap():
+    from embry0.workflows.qa.subtask_nodes import exploratory_qa_node
+
+    fake, calls = _fake_qa_runs({**_TRANSIENT, "budget_overrun_usd": 0.5})
+    with patch("embry0.workflows.qa.nodes.qa_node", fake):
+        await exploratory_qa_node(_explore_state(), {})
+
+    assert len(calls) == 1, "a run that crossed the job's budget cap must not be retried"
+
+
+@pytest.mark.asyncio
+async def test_exploratory_qa_does_not_retry_a_hard_budget_stop():
+    from embry0.orchestration.budget import BudgetOverrunError
+    from embry0.workflows.qa.subtask_nodes import exploratory_qa_node
+
+    fake, calls = _fake_qa_runs({"raise": BudgetOverrunError(5.0, 4.0)})
+    with patch("embry0.workflows.qa.nodes.qa_node", fake):
+        out = await exploratory_qa_node(_explore_state(), {})
+
+    assert len(calls) == 1, "a hard budget stop must end the sub-task, not retry it"
+    assert out["status"] == SubTaskStatus.INFRA_FAILURE

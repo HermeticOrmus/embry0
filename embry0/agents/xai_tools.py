@@ -8,6 +8,10 @@ Gating is the executor's job: it calls ``embry0.safety.policy.gate_tool_call`` B
 ``execute_tool`` for every call, so these implementations assume the path/command has
 already cleared Ring-2/Ring-3. They still fail gracefully (returning an is_error result
 the model can react to) rather than raising.
+
+A cleared Glob or Grep root can still contain a denied directory, which a verdict on
+the root cannot see. Given the policy, Glob and Grep drop every hit a ``Read`` deny
+rule covers, as the Claude CLI does for a search over a parent directory (#542).
 """
 
 from __future__ import annotations
@@ -17,6 +21,8 @@ import os
 import re
 import subprocess
 from typing import Any
+
+from embry0.safety.policy import SafetyPolicy, evaluate_ring2_paths
 
 # Tool names this module implements — the executor intersects these with the
 # agent's allowlist so an agent only sees the tools it is permitted.
@@ -120,17 +126,24 @@ def _resolve(path: str, cwd: str) -> str:
     return path if os.path.isabs(path) else os.path.join(cwd, path)
 
 
+def _readable(policy: SafetyPolicy | None, path: str, cwd: str) -> bool:
+    """Whether a Read of *path* clears the policy's deny rules (always, without a policy)."""
+    return policy is None or evaluate_ring2_paths(policy, "Read", {"file_path": path}, cwd=cwd).allowed
+
+
 def execute_tool(
     tool_name: str,
     tool_input: dict[str, Any],
     *,
     cwd: str = "/workspace",
     bash_timeout: int = _DEFAULT_BASH_TIMEOUT,
+    policy: SafetyPolicy | None = None,
 ) -> tuple[str, bool]:
     """Execute a builtin tool. Returns (result_text, is_error).
 
     Never raises for expected failures (missing file, bad edit, non-zero exit) —
-    those come back as is_error results the model can recover from.
+    those come back as is_error results the model can recover from. With
+    *policy*, Glob and Grep leave out the files its Read deny rules cover.
     """
     try:
         if tool_name == "Read":
@@ -142,9 +155,9 @@ def execute_tool(
         if tool_name == "Bash":
             return _bash(tool_input, cwd, bash_timeout)
         if tool_name == "Glob":
-            return _glob_tool(tool_input, cwd)
+            return _glob_tool(tool_input, cwd, policy)
         if tool_name == "Grep":
-            return _grep(tool_input, cwd)
+            return _grep(tool_input, cwd, policy)
         return (f"unknown tool: {tool_name!r}", True)
     except Exception as exc:  # defensive — a tool bug must not kill the loop
         return (f"{tool_name} failed: {exc!r}", True)
@@ -213,17 +226,17 @@ def _bash(ti: dict[str, Any], cwd: str, default_timeout: int) -> tuple[str, bool
     return (_truncate(f"[exit {proc.returncode}]\n{out}"), False)
 
 
-def _glob_tool(ti: dict[str, Any], cwd: str) -> tuple[str, bool]:
+def _glob_tool(ti: dict[str, Any], cwd: str, policy: SafetyPolicy | None) -> tuple[str, bool]:
     pattern = str(ti["pattern"])
     root = _resolve(str(ti.get("path") or cwd), cwd)
     full = pattern if os.path.isabs(pattern) else os.path.join(root, pattern)
-    matches = sorted(_glob.glob(full, recursive=True))
+    matches = sorted(m for m in _glob.glob(full, recursive=True) if _readable(policy, m, cwd))
     if not matches:
         return (f"Glob: no matches for {pattern!r} under {root}", False)
     return (_truncate("\n".join(matches)), False)
 
 
-def _grep(ti: dict[str, Any], cwd: str) -> tuple[str, bool]:
+def _grep(ti: dict[str, Any], cwd: str, policy: SafetyPolicy | None) -> tuple[str, bool]:
     pattern = str(ti["pattern"])
     root = _resolve(str(ti.get("path") or cwd), cwd)
     flags = re.IGNORECASE if ti.get("ignore_case") else 0
@@ -238,6 +251,8 @@ def _grep(ti: dict[str, Any], cwd: str) -> tuple[str, bool]:
             dirnames.remove(".git")
         for fn in filenames:
             fp = os.path.join(dirpath, fn)
+            if not _readable(policy, fp, cwd):
+                continue
             try:
                 with open(fp, encoding="utf-8", errors="ignore") as f:
                     for lineno, line in enumerate(f, 1):

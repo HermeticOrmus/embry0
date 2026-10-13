@@ -33,6 +33,7 @@ from embry0.metrics import NULL_METRICS, LoopMetrics
 
 if TYPE_CHECKING:
     from embry0.execution.runtime import AgentRuntime
+    from embry0.storage.repositories.qa_volume_state import QAVolumeStateRepository
 
 logger = structlog.get_logger(__name__)
 
@@ -69,6 +70,7 @@ class VolumeReaper:
         runtime: AgentRuntime,
         jobs_repo: Any,
         *,
+        state_repo: QAVolumeStateRepository | None,
         instance_id: str | None,
         interval_seconds: int = 3600,
         dry_run: bool = False,
@@ -79,6 +81,9 @@ class VolumeReaper:
         self._metrics = metrics or NULL_METRICS
         self._runtime = runtime
         self._jobs_repo = jobs_repo
+        # Rows in qa_volume_state describe a volume; a removed volume's row
+        # goes with it (#328). Required, so production cannot forget it.
+        self._state_repo = state_repo
         # Identity of the database jobs_repo reads (storage.instance_id). None
         # — it could not be resolved — leaves every labelled volume alone.
         self._instance_id = instance_id
@@ -194,6 +199,11 @@ class VolumeReaper:
             result.removed.append(vol.name)
             self._metrics.volume_reaper_volume("removed", str(decision.reason))
             logger.info("volume_reaper_removed", **fields)
+            if self._state_repo is not None:
+                try:
+                    await self._state_repo.delete_by_volume_name(vol.name)
+                except Exception as exc:
+                    logger.warning("volume_reaper_state_delete_failed", error=str(exc), **fields)
 
         self._metrics.volume_reaper_sweep("ok")
         logger.info(

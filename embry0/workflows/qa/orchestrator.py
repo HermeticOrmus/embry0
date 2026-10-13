@@ -24,6 +24,8 @@ import structlog
 from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 
+from embry0.orchestration.budget import BudgetOverrunError, resolve_job_cap
+from embry0.orchestration.nodes.agent import evaluate_job_cap
 from embry0.workflows.qa._orchestrator_workspace import (
     compute_changed_files_via_diff,
     resolve_base_branch,
@@ -809,6 +811,16 @@ async def _qa_orchestrator_node_impl(
                 job_id=state.get("job_id"),
                 browser_backend=override_backend,
             )
+        # #537: the per-job sandbox profile (QAJobOverrides.sandbox_profile)
+        # outranks every qa.yaml layer, the same way the browser backend does.
+        override_profile = qa_state.get("sandbox_profile")
+        if override_profile:
+            resolved_configs = [replace(rc, sandbox_profile=override_profile) for rc in resolved_configs]
+            logger.info(
+                "qa_sandbox_profile_overridden",
+                job_id=state.get("job_id"),
+                sandbox_profile=override_profile,
+            )
     except ValueError as exc:
         outcome = OrchestratorOutcome(
             overall_status="infra_error",
@@ -862,6 +874,12 @@ async def _qa_orchestrator_node_impl(
             qa_state["error_message"] = outcome.failure_summary
             qa_state["final_status"] = "failed"
             return {"qa": qa_state}
+
+    # #537: the profile the sub-task sandboxes run on, for the jobs row. One
+    # value when every app shares it; None when they differ — a single
+    # column cannot say which app ran where.
+    used_profiles = {rc.sandbox_profile for rc in resolved_configs}
+    qa_state["sandbox_profile_used"] = used_profiles.pop() if len(used_profiles) == 1 else None
 
     # 4b. Job-level acceptance-criteria override (QAJobOverrides). A caller
     # that supplies a non-empty list on POST /jobs replaces every app's
@@ -921,7 +939,22 @@ async def _qa_orchestrator_node_impl(
     # Thread the live stream writer into the sub-task config — sub-graphs
     # run under ainvoke() where get_stream_writer() is dead (see above).
     child_config: dict[str, Any] = dict(config or {})
-    child_config["configurable"] = {**early_configurable, "qa_parent_writer": writer}
+    child_config["configurable"] = {
+        **early_configurable,
+        "qa_parent_writer": writer,
+        # #264: the job's per-job cap and overrun mode, for the QA agent turns.
+        # Sub-task states are built fresh, so the parent's cap rides here.
+        "qa_job_budget": {
+            "max_budget_usd": resolve_job_cap(state),
+            "budget_overrun_mode_override": state.get("budget_overrun_mode_override"),
+        },
+    }
+
+    async def _job_budget_spent() -> bool:
+        """True once a hard cap is crossed: start no more sub-tasks (#264)."""
+        check = await evaluate_job_cap(state, config, float(state.get("total_cost_usd") or 0.0))
+        return not check.decision.allowed
+
     per_app_results = await fan_out_subtasks(
         resolved_configs,
         parent_run_id=state["job_id"],
@@ -934,6 +967,7 @@ async def _qa_orchestrator_node_impl(
         turbo_remote_enabled=cfg.cache.turbo_remote.enabled,
         max_concurrent=cfg.parallelism.max_concurrent_apps,
         config=child_config,
+        budget_spent=_job_budget_spent,
     )
 
     # 6. Persist (idempotent upsert).  Phase 5A: route through
@@ -947,7 +981,6 @@ async def _qa_orchestrator_node_impl(
                     status=str(r.status),
                     duration_ms=int(r.duration_ms),
                     cache_hits=r.cache_hits,
-                    trace_url=r.trace_url,
                     failure_summary=r.failure_summary,
                     raw_result=r.raw_result,
                     boot_phase=r.boot_phase,
@@ -1001,4 +1034,23 @@ async def _qa_orchestrator_node_impl(
         apps=apps,
     )
 
-    return {"qa": qa_state}
+    # #264: layer 1 over the whole fan-out. The QA agents' cost never reaches
+    # this state, but their traces do: a soft crossing is recorded for the
+    # job's routing, a hard one fails the job like any agent turn would.
+    # Results are persisted above first, so the per-app verdicts survive.
+    update: dict[str, Any] = {"qa": qa_state}
+    cap_check = await evaluate_job_cap(state, config, float(state.get("total_cost_usd") or 0.0))
+    if cap_check.decision.overrun > 0:
+        update["budget_overrun_usd"] = cap_check.decision.overrun
+        logger.warning(
+            "job_budget_exceeded",
+            agent_type="qa",
+            total_cost_usd=cap_check.total,
+            max_budget_usd=cap_check.cap,
+            overrun_usd=cap_check.decision.overrun,
+            overrun_mode=cap_check.mode,
+            job_id=state.get("job_id"),
+        )
+    if not cap_check.decision.allowed:
+        raise BudgetOverrunError(cap_check.total, cap_check.cap)
+    return update

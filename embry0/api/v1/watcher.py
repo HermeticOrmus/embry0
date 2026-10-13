@@ -4,6 +4,8 @@ from typing import Any, cast
 
 from fastapi import APIRouter, HTTPException, Request
 
+from embry0.api.repo_allowlist import enforce_repo_allowlist
+
 router = APIRouter()
 
 
@@ -30,13 +32,18 @@ async def trigger_watcher_run(request: Request, stack: str | None = None) -> dic
         single = getattr(request.app.state, "watcher_service", None)
         if single is None:
             raise HTTPException(status_code=503, detail="watcher not initialized")
+        # A single unnamed watcher has no stack to check a restricted key against.
+        await enforce_repo_allowlist(request, stack, action="run the watcher")
         return cast("dict[str, Any]", await single.run_once())
     if stack:
         if stack not in services:
             raise HTTPException(status_code=404, detail=f"{stack} is not a watched stack")
+        await enforce_repo_allowlist(request, stack, action="run the watcher")
         return cast("dict[str, Any]", await services[stack].run_once())
     if len(services) > 1:
         # Ticking "the" watcher is ambiguous once there are several, and the
         # wrong one costs an analysis job.
         raise HTTPException(status_code=400, detail=f"name the stack to tick: {', '.join(sorted(services))}")
-    return cast("dict[str, Any]", await next(iter(services.values())).run_once())
+    only_stack, service = next(iter(services.items()))
+    await enforce_repo_allowlist(request, only_stack, action="run the watcher")
+    return cast("dict[str, Any]", await service.run_once())

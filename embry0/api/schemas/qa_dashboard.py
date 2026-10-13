@@ -92,7 +92,6 @@ class AppResult(BaseModel):
     status: _STATUS
     duration_ms: int
     cache_hits: CacheHitsModel = Field(default_factory=CacheHitsModel)
-    trace_url: str | None = None
     failure_summary: str | None = None
     boot_phase: BootPhaseDetail | None = None
 

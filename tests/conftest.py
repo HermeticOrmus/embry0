@@ -10,6 +10,7 @@ import structlog
 
 from embry0.storage.database import DatabasePool, _jsonb_decoder, _jsonb_encoder
 from embry0.storage.migrations.runner import run_migrations
+from tests.fixtures.postgres import postgres_unavailable
 
 
 def pytest_collection_modifyitems(config, items):
@@ -67,7 +68,7 @@ async def db_with_migrations() -> AsyncIterator[DatabasePool]:
     try:
         await db.connect()
     except Exception as exc:
-        pytest.skip(f"PostgreSQL unavailable: {exc}")
+        postgres_unavailable(exc)
         return
     await db.execute("DROP SCHEMA public CASCADE")
     await db.execute("CREATE SCHEMA public")
@@ -82,7 +83,7 @@ async def pg_pool() -> AsyncIterator[asyncpg.Pool]:
 
     Requires a running PostgreSQL instance at localhost:5432.
     Uses DATABASE_URL env var or defaults to test database.
-    Falls back to skipping if PostgreSQL is unavailable.
+    Skips if PostgreSQL is unavailable, or fails when TEST_DATABASE_URL is set (#509).
     """
     import os
 
@@ -127,7 +128,7 @@ async def pg_pool() -> AsyncIterator[asyncpg.Pool]:
             await conn.execute("CREATE SCHEMA public")
         await pool.close()
     except (OSError, asyncpg.PostgresError) as exc:
-        pytest.skip(f"PostgreSQL unavailable: {exc}")
+        postgres_unavailable(exc)
 
 
 @pytest.fixture(autouse=True)

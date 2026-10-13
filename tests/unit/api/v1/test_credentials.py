@@ -66,10 +66,14 @@ class MemRepo:
             for r in self.rows.values()
         ]
 
-    async def update_meta(self, cid, **kw):
+    async def update_meta(self, cid, *, label=None, **author):
+        # Mirrors the repository: label None keeps; an author kwarg passed is
+        # written, None included (clears); one not passed is kept (#440).
         if cid not in self.rows:
             return None
-        self.rows[cid].update({k: v for k, v in kw.items() if v is not None})
+        if label is not None:
+            self.rows[cid]["label"] = label
+        self.rows[cid].update(author)
         return await self.get(cid)
 
     async def rotate(self, cid, *, secret_ciphertext, masked_preview):
@@ -910,3 +914,22 @@ async def test_xai_device_login_refuses_a_foreign_token_endpoint(client, app):
     assert "evil.example" not in r.text and _REFRESH not in r.text
     assert app.state.credentials_repo.rows == {}, "a foreign token endpoint must not be stored"
     await _close_device_http(app)
+
+
+# ---- #440: clearing a credential's git author ----
+
+
+async def test_put_null_clears_git_author_and_omission_keeps_it(client, app):
+    cid = (await _create(client)).json()["id"]
+
+    r = await client.put(f"/api/v1/credentials/{cid}", json={"label": "alice-2"})
+    assert r.status_code == 200, r.text
+    assert (r.json()["git_author_name"], r.json()["git_author_email"]) == ("Alice", "alice@example.com"), (
+        f"a PUT that omits the author fields changed them: {r.json()}"
+    )
+
+    r = await client.put(f"/api/v1/credentials/{cid}", json={"git_author_name": None, "git_author_email": "  "})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert (body["git_author_name"], body["git_author_email"]) == (None, None), f"author not cleared: {body}"
+    assert body["label"] == "alice-2"

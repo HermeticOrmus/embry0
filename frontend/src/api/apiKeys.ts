@@ -12,6 +12,8 @@ export interface ApiKey {
   expires_at: string | null;
   last_used_at: string | null;
   revoked_at: string | null;
+  /** Repositories the key may start work on; null = unrestricted. */
+  allowed_repos: string[] | null;
 }
 
 export interface CreatedApiKey extends ApiKey {
@@ -29,8 +31,20 @@ export async function createApiKey(body: {
   scope: string;
   expires_days?: number;
   service?: boolean;
+  allowed_repos?: string[];
 }): Promise<CreatedApiKey> {
   const { data } = await api.post<CreatedApiKey>("/apikeys", body);
+  return data;
+}
+
+/** Replace a key's repository allowlist; an empty list lifts it. */
+export async function setApiKeyAllowedRepos(
+  id: string,
+  allowedRepos: string[],
+): Promise<ApiKey> {
+  const { data } = await api.put<ApiKey>(`/apikeys/${id}/allowed-repos`, {
+    allowed_repos: allowedRepos,
+  });
   return data;
 }
 

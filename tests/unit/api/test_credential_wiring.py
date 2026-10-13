@@ -100,7 +100,9 @@ def test_lifespan_passes_resolver_to_every_forge_consumer():
         ),
         r"GitHubCommentChannel\(": ("token_resolver=",),
         r"GitHubSyncService\(": (resolver,),
-        r"CommentDispatchService\(": (resolver,),
+        # #344: without the recorder a PR-comment follow-up is never linked
+        # to its healing case, and nothing says so.
+        r"CommentDispatchService\(": (resolver, "case_recorder=app.state.case_recorder"),
         r"WatcherService\(": (resolver,),
         r"build_filer\(": (resolver,),
     }
@@ -141,11 +143,25 @@ def test_startup_registers_registry_secrets_with_the_scrubber():
     assert src.index(call) > src.index("await _init_app_state("), "scrub set registered before _init_app_state"
 
 
+def test_startup_registers_the_log_redaction_fields():
+    """#294: the operator's PII field names reach the redactor before any job runs,
+    and reach the context proxy, which redacts in a process of its own."""
+    src = _src()
+    call = "register_redacted_fields(config.log_redaction_fields)"
+    assert call in src, "the orchestrator never registers LOG_REDACTION_FIELDS"
+    assert src.index(call) > src.index("await _init_app_state("), "fields registered before _init_app_state"
+    windows = [w for _, w in _call_windows(src, r"proxy_mgr\.start\(") if "enable_context_proxy" in w]
+    assert windows, "no proxy_mgr.start(...) call launches the context proxy"
+    for window in windows:
+        assert "log_redaction_fields=config.log_redaction_fields" in _top_level(window), window
+
+
 def test_orphan_sweep_stamps_credential_uses():
     """Jobs failed by the boot sweep never reach the executor's ledger stamp; the sweep must close them."""
     lines = _src().splitlines()
     idx = next(i for i, line in enumerate(lines) if "fail_orphaned(" in line)
-    following = "\n".join(lines[idx + 1 : idx + 16])
+    # 24: the call carries the recovery arguments since #307.
+    following = "\n".join(lines[idx + 1 : idx + 24])
     assert "finish_uses" in following, "fail_orphaned is not followed by a credential_uses finish_uses stamp"
 
 

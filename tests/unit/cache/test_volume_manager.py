@@ -202,3 +202,46 @@ async def test_destroy_for_job_label_lookup_is_scoped_to_this_instance():
         "docker volume ls --quiet --filter label=embry0.job_id=job-1 --filter label=embry0.instance=a1b2c3d4e5f60718"
         in _cmds(docker)
     )
+
+
+@pytest.mark.asyncio
+async def test_destroy_for_job_forgets_the_state_rows_of_removed_volumes_only():
+    """A qa_volume_state row must not outlive its volume (#328)."""
+    docker = _stub_docker()
+
+    async def run_cmd(cmd, timeout=None):
+        if cmd[1:3] == ["volume", "ls"]:
+            return "embry0-qa-vol-job-1\nheld-vol\n"
+        if cmd[1:3] == ["volume", "rm"] and cmd[3] == "held-vol":
+            raise RuntimeError("volume is in use")
+        return ""
+
+    docker.run_cmd = AsyncMock(side_effect=run_cmd)
+    state_repo = AsyncMock()
+    mgr = SharedVolumeManager(runtime=DockerRuntime(docker), state_repo=state_repo)
+    await mgr.destroy_for_job("job-1")
+    forgotten = [c.args[0] for c in state_repo.delete_by_volume_name.await_args_list]
+    assert forgotten == ["embry0-qa-vol-job-1"], (
+        f"destroy_for_job must delete the row of each volume it removed, and only those; deleted {forgotten}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_destroy_forgets_the_state_row():
+    docker = _stub_docker()
+    state_repo = AsyncMock()
+    mgr = SharedVolumeManager(runtime=DockerRuntime(docker), state_repo=state_repo)
+    await mgr.destroy("embry0-qa-vol-job-1")
+    state_repo.delete_by_volume_name.assert_awaited_once_with("embry0-qa-vol-job-1")
+
+
+@pytest.mark.asyncio
+async def test_a_state_delete_failure_does_not_fail_the_cleanup():
+    docker = _stub_docker()
+    docker.run_cmd = AsyncMock(
+        side_effect=lambda cmd, timeout=None: "embry0-qa-vol-job-1\n" if cmd[1:3] == ["volume", "ls"] else ""
+    )
+    state_repo = AsyncMock()
+    state_repo.delete_by_volume_name = AsyncMock(side_effect=RuntimeError("db down"))
+    mgr = SharedVolumeManager(runtime=DockerRuntime(docker), state_repo=state_repo)
+    assert await mgr.destroy_for_job("job-1") == ["embry0-qa-vol-job-1"]

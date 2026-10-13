@@ -21,7 +21,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from embry0_mcp.client import Embry0APIError, Embry0Client
+from embry0.mcp_server.client import Embry0APIError, Embry0Client
 
 mcp = MCPServer(
     "embry0",
@@ -253,7 +253,7 @@ async def job_list(
     offset: int = 0,
 ) -> dict[str, Any]:
     """List jobs (paginated envelope: jobs, total, offset, limit). Filter by status
-    (pending|running|awaiting_input|paused|completed|failed|cancelled|partial|expired|pr_merged|pr_closed)
+    (pending|running|awaiting_input|paused|completed|failed|cancelled|partial|expired|skipped|pr_merged|pr_closed)
     and/or repo ("group/name", or a GitLab subgroup path like "group/subgroup/project")."""
     return _compact_jobs(await _get_client().job_list(status=status, repo=repo, limit=limit, offset=offset))
 
@@ -313,7 +313,7 @@ async def job_create(
 @_tool
 async def job_wait(job_id: str, timeout: float = 600.0, poll_interval: float = 5.0) -> dict[str, Any]:
     """Wait server-side until a job reaches a terminal status (completed|failed|cancelled|
-    partial|expired) or timeout (seconds) elapses. On timeout the current job state is
+    partial|expired|skipped) or timeout (seconds) elapses. On timeout the current job state is
     returned with wait_timed_out=true. Use this instead of polling job_get in a loop."""
     return await _get_client().job_wait(job_id, timeout=timeout, poll_interval=poll_interval)
 
@@ -438,7 +438,7 @@ async def template_list() -> list[dict[str, Any]]:
 
 @_tool
 async def template_get(template_id: str) -> dict[str, Any]:
-    """Get one pipeline template, including its graph definition and agent model map."""
+    """Get one pipeline template, including its graph definition (each step names its model in config.model)."""
     return await _get_client().template_get(template_id)
 
 

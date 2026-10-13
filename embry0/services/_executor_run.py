@@ -15,8 +15,11 @@ if TYPE_CHECKING:
     from embry0.services.issue_executor import IssueExecutor
 
 from embry0.orchestration.checkpoint import checkpointer_context
+from embry0.orchestration.restart import NOT_RESUMABLE_PIPELINES, ShutdownInterrupt
 from embry0.safety.error_codes import ErrorCode, classify_failure, classify_qa_outcome
 from embry0.services._cost import resolve_job_total_cost
+from embry0.services.healing.lifecycle import Origin
+from embry0.services.healing.recorder import record_case_event
 from embry0.storage.repositories.jobs import StatusTransitionConflict
 from embry0.trackers import github_number_of, linear_identifier_of
 
@@ -31,6 +34,8 @@ async def _process_stream(
     issue_id: str | None,
     job_id: str,
     state_sink: dict[str, Any] | None = None,
+    *,
+    stop_on_drain: bool = False,
 ) -> tuple[dict[str, Any] | None, bool, Any]:
     """Stream graph execution events, detect interrupts.
 
@@ -40,46 +45,68 @@ async def _process_stream(
     return value is lost when the graph raises mid-run — which is exactly
     what ``overrun_mode=hard`` does — and the caller still needs the last
     known state to destroy the sandbox and record the cost (#246).
+
+    With ``stop_on_drain``, a drain (#307) stops the run at a node boundary:
+    once a node's update has streamed, LangGraph has its writes, so the
+    stream is closed there (cancelling whatever node started next) and
+    ``ShutdownInterrupt`` raised. The next process resumes from that point.
     """
     final_state: dict[str, Any] | None = None
     last_persisted_stage: str | None = None
 
-    async for event in graph.astream(
+    def _draining() -> bool:
+        return stop_on_drain and bool(getattr(self, "draining", False))
+
+    if _draining():
+        raise ShutdownInterrupt(job_id)
+    stream = graph.astream(
         input_value,
         config=graph_config,
         stream_mode=["updates", "custom"],
-    ):
-        mode = event[0] if isinstance(event, tuple) else "updates"
-        data = event[1] if isinstance(event, tuple) else event
+    )
+    try:
+        async for event in stream:
+            mode = event[0] if isinstance(event, tuple) else "updates"
+            data = event[1] if isinstance(event, tuple) else event
 
-        if mode == "custom":
-            await self._broadcast_event(job_id, data)
-        elif mode == "updates":
-            if isinstance(data, dict):
-                for _node_name, node_output in data.items():
-                    if isinstance(node_output, dict):
-                        final_state = {**(final_state or {}), **node_output}
-                        if state_sink is not None:
-                            state_sink.update(node_output)
-                        # Persist the workflow stage on the jobs row at each
-                        # node transition so pollers (the Console board)
-                        # see it without a WS or log fetch. This is the
-                        # single write point: every workflow — issue-to-pr
-                        # and QA, fresh run and resume — streams through
-                        # here. Best-effort: a stage write must never fail
-                        # the workflow (same stance as checkpoint purge).
-                        stage = node_output.get("current_stage")
-                        if stage and stage != last_persisted_stage:
-                            last_persisted_stage = stage
-                            try:
-                                await self._jobs.update(job_id, current_stage=stage)
-                            except Exception:
-                                logger.warning(
-                                    "current_stage_persist_failed",
-                                    job_id=job_id,
-                                    stage=stage,
-                                    exc_info=True,
-                                )
+            if mode == "custom":
+                await self._broadcast_event(job_id, data)
+            elif mode == "updates":
+                if isinstance(data, dict):
+                    for _node_name, node_output in data.items():
+                        if isinstance(node_output, dict):
+                            final_state = {**(final_state or {}), **node_output}
+                            if state_sink is not None:
+                                state_sink.update(node_output)
+                            # Persist the workflow stage on the jobs row at each
+                            # node transition so pollers (the Console board)
+                            # see it without a WS or log fetch. This is the
+                            # single write point: every workflow — issue-to-pr
+                            # and QA, fresh run and resume — streams through
+                            # here. Best-effort: a stage write must never fail
+                            # the workflow (same stance as checkpoint purge).
+                            stage = node_output.get("current_stage")
+                            if stage and stage != last_persisted_stage:
+                                last_persisted_stage = stage
+                                try:
+                                    await self._jobs.update(job_id, current_stage=stage)
+                                except Exception:
+                                    logger.warning(
+                                        "current_stage_persist_failed",
+                                        job_id=job_id,
+                                        stage=stage,
+                                        exc_info=True,
+                                    )
+                # A node finished (custom events stream from inside one).
+                if _draining():
+                    raise ShutdownInterrupt(job_id)
+    finally:
+        # An async generator left mid-iteration is only closed when it is
+        # garbage-collected; close it now so the graph's running nodes stop
+        # and its pending checkpoint writes are flushed before we go on.
+        aclose = getattr(stream, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
     # Check if graph was interrupted
     state_snapshot = await graph.aget_state(graph_config)
@@ -121,7 +148,10 @@ async def _refuse_if_over_budget(
 
     Every background runner starts here, so the daily/monthly caps and the
     per-author rate limit are enforced once per dispatched job regardless of
-    which entry point created it. A refusal is a terminal failure rather than
+    which entry point created it. It runs while the job is still ``pending``
+    (#348), so a refusal goes straight to ``failed`` — the one
+    pending -> failed transition the jobs repository allows — and the row
+    never gets a ``started_at``. A refusal is a terminal failure rather than
     a silently-dropped job: the row carries ``ERR_BUDGET_REFUSED`` (its own
     code since #331 — the job never ran, unlike an in-run ``ERR_BUDGET_OVERRUN``
     hard stop, and only a refusal is exempt from rate-limit counts), an audit
@@ -160,7 +190,9 @@ async def _refuse_if_over_budget(
             finished_at=datetime.now(UTC),
         )
         await self._finish_credential_uses(job_id, error_code=ErrorCode.BUDGET_REFUSED.value)
-    except StatusTransitionConflict:
+    except (StatusTransitionConflict, ValueError):
+        # ValueError: the job left `pending` meanwhile (cancelled) — the
+        # repository refuses the transition; the job is not ours to fail.
         logger.warning("budget_refusal_status_conflict", job_id=job_id, exc_info=True)
     await self._emit_audit(
         self._db,
@@ -209,10 +241,12 @@ async def _run_onboard_workflow(
 
     final_state: dict[str, Any] | None = None
     try:
-        await self._jobs.update(job_id, status="running", started_at=datetime.now(UTC))
-
+        # #348: ask the gate before the job is marked running — a refused
+        # job never ran and must not carry a started_at.
         if await self._refuse_if_over_budget(job_id):
             return
+
+        await self._jobs.update(job_id, status="running", started_at=datetime.now(UTC))
 
         initial_state: dict[str, Any] = {
             "job_id": job_id,
@@ -496,9 +530,10 @@ async def _execute_workflow_stream(
     ``pipeline`` selects which workflow to compile via ``_select_workflow``
     (defaults to ``issue-to-pr`` for the legacy issue path). Shared body of
     ``_run_workflow`` (fresh initial state) and ``resume``
-    (Command(resume=...)). Returns the tuple from ``_process_stream``; a
-    resume's state also gets back the facts in ``_RESUME_CARRIED_KEYS``
-    wherever this run left them empty.
+    (Command(resume=...), or None to go on from the last checkpoint after a
+    restart, #307). Returns the tuple from ``_process_stream``; a resume's
+    state also gets back the facts in ``_RESUME_CARRIED_KEYS`` wherever this
+    run left them empty.
     """
     from langgraph.types import Command
 
@@ -513,7 +548,7 @@ async def _execute_workflow_stream(
     carried: dict[str, Any] = {}
     async with checkpointer_context(self._database_url) as saver:
         graph = workflow.compile(config={"checkpointer": saver})
-        if isinstance(input_value, Command):
+        if input_value is None or isinstance(input_value, Command):
             snapshot = await graph.aget_state(graph_config)
             paused = getattr(snapshot, "values", None) or {}
             carried = {key: paused[key] for key in _RESUME_CARRIED_KEYS if paused.get(key)}
@@ -521,7 +556,16 @@ async def _execute_workflow_stream(
             # the sink, and it needs the sandbox id as much as a finished one.
             if state_sink is not None:
                 state_sink.update(carried)
-            if _resume_runs_agents(input_value):
+            if input_value is None:
+                await _reclaim_sandbox_after_restart(
+                    self,
+                    paused,
+                    job_id,
+                    llm_ids=llm_ids,
+                    llm_kinds=llm_kinds,
+                    git_push=pipeline not in _READ_ONLY_PIPELINES,
+                )
+            elif _resume_runs_agents(input_value):
                 await _reenroll_paused_sandbox(
                     self,
                     paused,
@@ -537,6 +581,7 @@ async def _execute_workflow_stream(
             issue_id,
             job_id,
             state_sink,
+            stop_on_drain=pipeline not in NOT_RESUMABLE_PIPELINES,
         )
     # A run that produced no update still returns None: nothing is invented.
     if final_state is not None:
@@ -594,7 +639,8 @@ async def _reenroll_paused_sandbox(
     after 24 h and on every orchestrator start. The xAI account is the one the
     precheck just resolved for this resume; the proxy injects an account's
     token only for an oauth account, as at create. ``git_push`` restores the
-    push right the sandbox was created with (#521). Raises what
+    push right the sandbox was created with (#521), for the one branch the
+    checkpoint names (#559). Raises what
     ``SandboxManager.reenroll`` raises: ``SANDBOX_GONE`` fails the resume,
     ``SandboxReenrollError`` leaves the job paused (``IssueExecutor.resume``).
     """
@@ -612,6 +658,21 @@ async def _reenroll_paused_sandbox(
         context_scope = True
     elif values.get("case_log_containers"):
         context_scope = list(values["case_log_containers"])
+    git_push_branches: list[str] = []
+    if git_push:
+        # #559: the branch the paused job may push, from its checkpoint: the
+        # developer's chosen branch once it has one (init_node's rule).
+        from embry0.orchestration.branch_names import job_push_branch
+
+        git_push_branches = [
+            job_push_branch(
+                issue_id=values.get("issue_id"),
+                task=values.get("task"),
+                job_id=values.get("job_id") or job_id,
+                context=values.get("context"),
+                chosen=values.get("branch_name"),
+            )
+        ]
     await sandbox.reenroll(
         container,
         job_id=job_id,
@@ -620,7 +681,41 @@ async def _reenroll_paused_sandbox(
         xai_credential_id=xai_credential_id,
         context_scope=context_scope,
         git_push=git_push,
+        git_push_branches=git_push_branches,
     )
+
+
+async def _reclaim_sandbox_after_restart(
+    self: IssueExecutor,
+    values: dict[str, Any],
+    job_id: str,
+    *,
+    llm_ids: dict[str, str],
+    llm_kinds: dict[str, str],
+    git_push: bool,
+) -> None:
+    """Make a job's sandbox usable again before its graph goes on after a restart (#307).
+
+    ``values`` is the checkpoint's state. With a sandbox recorded there, the
+    agent the previous process left running inside is killed (it would
+    otherwise share the workspace with the re-run node), then the sandbox is
+    re-enrolled with the proxies as a paused resume does; a sandbox that is
+    gone fails the job (``SANDBOX_GONE``). With none recorded, the job stopped
+    inside its first node, which may have created the container already, so
+    any ``sandbox-<job_id>`` is removed and the node creates it afresh.
+    """
+    sandbox = getattr(self, "_sandbox", None)
+    if sandbox is None:
+        return
+    container = values.get("sandbox_container_id")
+    if not container:
+        await sandbox.destroy(f"sandbox-{job_id}")
+        return
+    try:
+        await sandbox.stop_agent(container)
+    except Exception:  # noqa: BLE001 — reenroll below says whether the sandbox is usable
+        logger.warning("sandbox_agent_stop_failed", job_id=job_id, exc_info=True)
+    await _reenroll_paused_sandbox(self, values, job_id, llm_ids=llm_ids, llm_kinds=llm_kinds, git_push=git_push)
 
 
 async def _handle_interrupt(
@@ -683,13 +778,15 @@ async def _run_workflow(
     # instead of destroying nothing and recording $0.00 (#246).
     streamed_state: dict[str, Any] = {}
     try:
-        await self._jobs.update(job_id, status="running", started_at=datetime.now(UTC))
-
         # The actor is the job row's dispatcher, NOT issues.created_by: that
         # column holds a provenance constant ("webhook-label", "triage"), so
         # bucketing on it made the hourly limit one fleet-wide throttle (#246).
+        # #348: asked before the job is marked running — a refused job never
+        # ran and must not carry a started_at.
         if await self._refuse_if_over_budget(job_id, issue_id=issue_id, actor=(job_row or {}).get("dispatched_by")):
             return
+
+        await self._jobs.update(job_id, status="running", started_at=datetime.now(UTC))
 
         initial_state = {
             "job_id": job_id,
@@ -773,6 +870,10 @@ async def _run_workflow(
             initial_state["dev_checks"] = pref["dev_checks"]
         if (job_row or {}).get("pipeline_template"):
             initial_state["pipeline_template_request"] = job_row["pipeline_template"]  # type: ignore[index]
+        # #306: a watcher-found fix runs unattended, so it always gets review
+        # and verification — plan_route refuses triage's lighter pick for it.
+        if issue_id and await _works_watcher_case(self, issue_id):
+            initial_state["pin_full_pipeline"] = True
 
         # Fold auto-answer Q&A block into the triage prompt when retriage is
         # triggered after all questions were auto-answerable (B3 fix).
@@ -793,8 +894,10 @@ async def _run_workflow(
         # deliberately. The developer/reviewer see a job's known PR via
         # state["pr_url"]; fresh jobs get the open-PR list on state for
         # prompt injection, and an exact ticket match ends the job here
-        # linking the existing PR (skip+link policy). Fetch is fail-open:
-        # any GitHub failure yields [] and the pipeline runs as before.
+        # linking the existing PR (skip+link policy). The listing fails
+        # CLOSED (#305): OpenPRListError propagates to the failure path below
+        # (ERR_PR_LISTING_FAILED) — "could not list" is not "none open", and
+        # running on would risk a second PR for the same ticket.
         job_pr_url = (job_row or {}).get("pr_url")
         job_ref = ((job_row or {}).get("context") or {}).get("ref")
         if job_pr_url:
@@ -954,6 +1057,24 @@ async def _run_workflow(
                 logger.warning("trace_id_unbind_failed", job_id=job_id, exc_info=True)
 
 
+async def _works_watcher_case(self: IssueExecutor, issue_id: str) -> bool:
+    """True when the issue belongs to a healing case the watcher opened.
+
+    Fail-open to False like every ledger read in the job lifecycle: without
+    a recorder (tests, a deployment without the ledger) or on a ledger error
+    the job runs as triage routes it.
+    """
+    recorder = getattr(self, "_case_recorder", None)
+    if recorder is None:
+        return False
+    try:
+        origin = await recorder.case_origin(issue_id)
+    except Exception:
+        logger.warning("case_origin_lookup_failed", issue_id=issue_id, exc_info=True)
+        return False
+    return bool(origin == Origin.WATCHER)
+
+
 async def _failed_job_owning(self: IssueExecutor, pr: dict[str, Any], issue_id: str | None) -> dict[str, Any] | None:
     """The failed job of this issue whose open PR ``pr`` is, or None (#349).
 
@@ -1005,38 +1126,68 @@ async def _skip_as_duplicate(
     repo: str,
     duplicate: dict[str, Any],
     task: str | None = None,
+    *,
+    summary: str | None = None,
+    total_cost_usd: float = 0.0,
+    kind: str | None = None,
 ) -> None:
-    """End a job as completed-with-link because an open PR already covers
-    its ticket (RAV-1079 skip+link policy). Called pre-graph — no sandbox
-    exists yet and no agent has run. The caller's ``finally`` block posts
-    the tracker outcome comment (terminal status → post_outcome)."""
+    """End a job as ``skipped`` because an open PR already covers its ticket.
+
+    Two callers: the executor's pre-graph ticket match (RAV-1079 — no
+    sandbox, no agent has run) and triage's semantic ``duplicate_of_pr``
+    flag (``current_stage == "skipped_duplicate"``, after triage ran and
+    spent money — ``summary`` and ``total_cost_usd`` come from that run).
+
+    #474: the job opened nothing, so it ends ``skipped``, never ``completed``,
+    and the other PR is NOT written to its ``pr_url``: that column is how
+    merge sync and the case ledger tell which job owns a PR, and a person's
+    PR recorded there was credited to embry0 when it merged. The PR is
+    linked to the issue's healing case with no owning job instead, so its
+    merge resolves the case ``out_of_band``. The issue goes back to ``open``:
+    nothing is merged yet, and redispatch refuses a ticket whose latest job
+    was skipped, so the open issue does not dispatch a second job. The
+    caller's ``finally`` posts the tracker outcome comment, which carries
+    ``result_summary`` because ``pr_url`` is empty.
+    """
     from datetime import UTC, datetime
 
     from embry0.workflows.issue_to_pr.plan_route import job_title_from_task
 
-    summary = (
-        f"Skipped: open PR #{duplicate['number']} already addresses this issue "
-        f"({duplicate['url']}, matched by {duplicate['matched_by']}). "
-        "No new PR was opened — review/merge the existing PR instead."
-    )
+    matched_by = duplicate.get("matched_by")
+    if summary is None:
+        summary = (
+            f"Skipped: a pull request for this issue already exists: #{duplicate['number']} "
+            f"({duplicate['url']}"
+            + (f", matched by {matched_by}" if matched_by else "")
+            + "). No new pull request was opened; review or merge the existing one instead."
+        )
     logger.info(
         "job_skipped_duplicate_pr",
         job_id=job_id,
         issue_id=issue_id,
         repo=repo,
         pr_number=duplicate["number"],
-        matched_by=duplicate["matched_by"],
+        matched_by=matched_by,
     )
     await self._jobs.update(
         job_id,
-        status="completed",
-        pr_url=duplicate["url"],
+        status="skipped",
         result_summary=summary,
+        total_cost_usd=total_cost_usd,
+        current_stage="skipped_duplicate",
         finished_at=datetime.now(UTC),
     )
     await self._finish_credential_uses(job_id, error_code=None)
+    await record_case_event(
+        self,
+        "existing_pr_found",
+        log_ids={"job_id": job_id, "issue_id": issue_id},
+        issue_id=issue_id,
+        job_id=job_id,
+        pr_url=str(duplicate["url"]),
+    )
     if issue_id:
-        await self._issues.update(issue_id, status="closed")
+        await self._issues.update(issue_id, status="open")
         await self._issues.update_parent_status(issue_id)
     await self._emit_audit(
         self._db,
@@ -1047,7 +1198,7 @@ async def _skip_as_duplicate(
             "repo": repo,
             "pr_number": duplicate["number"],
             "pr_url": duplicate["url"],
-            "matched_by": duplicate["matched_by"],
+            "matched_by": matched_by,
         },
         audit_log_path=self._audit_log_path,
         issue_id=issue_id,
@@ -1056,18 +1207,21 @@ async def _skip_as_duplicate(
     notifier = getattr(self, "_webhook_notifier", None)
     if notifier is not None:
         notifier.emit_soon(
-            "job.completed",
+            "job.skipped",
             {
                 "job_id": job_id,
                 "issue_id": issue_id,
                 "title": job_title_from_task(task),
-                "kind": None,
+                "kind": kind,
                 "repo": repo,
-                "pr_url": duplicate["url"],
+                # The job's own PR — none. The existing one is in the summary
+                # and under existing_pr_url, never posing as this job's.
+                "pr_url": None,
+                "existing_pr_url": duplicate["url"],
                 "summary": summary,
                 "result_summary": summary,
                 "deliverable_count": 0,
-                "total_cost_usd": 0.0,
+                "total_cost_usd": total_cost_usd,
                 "error_code": None,
                 "error_message": None,
             },
@@ -1106,15 +1260,16 @@ async def _run_qa_workflow(
 
     final_state: dict[str, Any] | None = None
     try:
-        await self._jobs.update(job_id, status="running", started_at=datetime.now(UTC))
-
+        # #348: ask the gate before the job is marked running — a refused
+        # job never ran and must not carry a started_at.
         if await self._refuse_if_over_budget(job_id):
             return
+
+        await self._jobs.update(job_id, status="running", started_at=datetime.now(UTC))
 
         qa_block: dict[str, Any] = {
             "needs_qa": True,
             "acceptance_criteria": list(qa_overrides.get("acceptance_criteria") or []),
-            "sandbox_profile_name": qa_overrides.get("sandbox_profile") or "qa-jvm",
             "attempts": [],
             "failure_rounds": 0,
             "final_status": "pending",
@@ -1135,6 +1290,10 @@ async def _run_qa_workflow(
         # layer; qa_orchestrator_node applies it after app-config resolution.
         if qa_overrides.get("browser_backend"):
             qa_block["browser_backend"] = qa_overrides["browser_backend"]
+        # #537: per-job sandbox profile — outranks every qa.yaml layer, applied
+        # by qa_orchestrator_node like the browser backend.
+        if qa_overrides.get("sandbox_profile"):
+            qa_block["sandbox_profile"] = qa_overrides["sandbox_profile"]
 
         initial_state: dict[str, Any] = {
             "job_id": job_id,
@@ -1178,8 +1337,8 @@ async def _run_qa_workflow(
             pipeline="qa",
         )
 
-        # QA workflow does not interrupt today (retry_node returns
-        # Command(goto=END|init_qa) — never an Interrupt). If a future
+        # The QA workflow does not interrupt today (no node in
+        # embry0/workflows/qa/graph.py raises an Interrupt). If a future
         # version adds one, surface it as a failed job rather than silently
         # leaving the row in 'running'.
         if interrupted:
@@ -1258,6 +1417,12 @@ async def _run_qa_workflow(
             float((final_state or {}).get("total_cost_usd", 0.0) or 0.0),
         )
 
+        # #537: the profile the run actually used, not a placeholder. Absent
+        # (config never resolved, or apps on different profiles) leaves the
+        # row as start_job wrote it: the caller's override, or nothing.
+        profile_used = {}
+        if qa_state.get("sandbox_profile_used"):
+            profile_used["sandbox_profile"] = qa_state["sandbox_profile_used"]
         await self._jobs.update(
             job_id,
             status=job_status,
@@ -1266,6 +1431,7 @@ async def _run_qa_workflow(
             total_cost_usd=total_cost_usd,
             budget_overrun_usd=float((final_state or {}).get("budget_overrun_usd") or 0.0),
             finished_at=datetime.now(UTC),
+            **profile_used,
         )
         await self._finish_credential_uses(job_id, error_code=error_code)
 
@@ -1289,12 +1455,20 @@ async def _run_qa_workflow(
             error=str(exc),
         )
         crash_code = classify_failure(exc=exc, stage="qa").value
+        # #264: a hard budget stop lands here; the row still says what was
+        # spent and by how much the cap was crossed.
+        spent: dict[str, float] = {"budget_overrun_usd": _overrun_of(exc, final_state)}
+        try:
+            spent["total_cost_usd"] = await resolve_job_total_cost(getattr(self, "_traces", None), job_id, 0.0)
+        except Exception:
+            logger.warning("qa_crash_cost_resolve_failed", job_id=job_id, exc_info=True)
         await self._jobs.update(
             job_id,
             status="failed",
             error_message=str(exc),
             error_code=crash_code,
             finished_at=datetime.now(UTC),
+            **spent,
         )
         await self._finish_credential_uses(job_id, error_code=crash_code)
         await self._cleanup_sandbox(final_state, job_id)

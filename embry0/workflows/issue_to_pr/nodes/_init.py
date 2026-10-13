@@ -116,6 +116,19 @@ async def _job_case_evidence(
     return evidence.as_state() if evidence is not None else None
 
 
+def _job_push_branch(state: dict[str, Any]) -> str:
+    """The branch this job's sandbox is enrolled to push (#559); see ``job_push_branch``."""
+    from embry0.orchestration.branch_names import job_push_branch
+
+    return job_push_branch(
+        issue_id=state.get("issue_id"),
+        task=state.get("task"),
+        job_id=state.get("job_id"),
+        context=state.get("context"),
+        chosen=state.get("branch_name"),
+    )
+
+
 async def init_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     """Create the sandbox container and populate /workspace for the job context.
 
@@ -267,6 +280,9 @@ async def init_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, 
             # The developer pushes its branch from this sandbox (#521). Every
             # other sandbox (QA, onboarding, warmers, image builds) only reads.
             git_push=True,
+            # #559: and only that branch. Until the developer chooses, the
+            # job's own name; developer_node swaps in the chosen one.
+            git_push_branches=[_job_push_branch(state)],
         )
         logger.info("sandbox_created", job_id=job_id, container_id=container_id)
         writer({"type": "progress", "message": "Sandbox container created"})

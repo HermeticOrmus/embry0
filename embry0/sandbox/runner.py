@@ -126,6 +126,9 @@ async def run_agent(
         "cost_usd": result.cost_usd,
         "duration_ms": result.duration_ms,
         "tools_called": result.tools_called,
+        # #470: the orchestrator's AgentRunner reads this back; without it
+        # every run's denials stopped at the sandbox boundary.
+        "policy_denials": getattr(result, "policy_denials", None) or {},
         "input_tokens": getattr(result, "input_tokens", 0),
         "output_tokens": getattr(result, "output_tokens", 0),
         "cache_read_tokens": getattr(result, "cache_read_tokens", 0),

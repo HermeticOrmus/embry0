@@ -275,7 +275,7 @@ async def update_provider(
         # must stay mutually consistent — a disabled model in a tier slot
         # would make the tier fallback itself broken. #465: the same goes for
         # the default model, which every agent of every job resolves to.
-        from embry0.agents.providers import known_models
+        from embry0.agents.providers import known_models, unpriced_models, unpriced_models_message
 
         current = await repo.get()
         new_default = updates.get("default_model")
@@ -284,6 +284,13 @@ async def update_provider(
                 status_code=422,
                 detail=f"default_model is not a known model id: {new_default!r}",
             )
+        # #219: the default and the tier models are what agents run on; one
+        # that routes to a provider by prefix but has no price would run unmetered.
+        unpriced = unpriced_models(
+            str(updates.get(key) or "") for key in ("default_model", "model_heavy", "model_medium", "model_light")
+        )
+        if unpriced:
+            raise HTTPException(status_code=422, detail=unpriced_models_message(unpriced))
         disabled = set(
             updates["disabled_models"] if "disabled_models" in updates else current.get("disabled_models") or []
         )

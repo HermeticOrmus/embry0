@@ -93,6 +93,17 @@ async def test_relabel_after_failure_redispatches_and_a_live_job_dedupes(db_with
     await jobs.update(first["job_id"], status="failed")
     await issues.update(first["issue_id"], status="open")
 
+    # #462: a relabel is a retry only if Linear's history dates it after the
+    # failed job ended — the redelivery of the original add is not one.
+    failed = await jobs.get(first["job_id"])
+    assert failed is not None and failed["finished_at"] is not None, "a failed job row carries no finished_at"
+    svc.trigger_label_added_since = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    redelivered = await svc.handle_webhook_event(_RELABEL, ctx)
+    assert redelivered.get("dedupe") == "label_not_reapplied", redelivered
+    since = svc.trigger_label_added_since.await_args.args[2]
+    assert since == failed["finished_at"], (since, failed["finished_at"])
+
+    svc.trigger_label_added_since = AsyncMock(return_value=True)  # type: ignore[method-assign]
     retry = await svc.handle_webhook_event(_RELABEL, ctx)
 
     assert retry["action"] == "dispatched" and retry["issue_id"] == first["issue_id"]

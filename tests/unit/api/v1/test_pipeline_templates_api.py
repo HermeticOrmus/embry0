@@ -22,7 +22,6 @@ SAMPLE_TEMPLATE = {
     "id": "tmpl-1",
     "name": "My Template",
     "graph_definition": SAMPLE_GRAPH,
-    "agent_models": {},
     "sandbox_profile": None,
 }
 
@@ -123,3 +122,15 @@ async def test_duplicate_template(app):
     assert resp.status_code == 201
     assert resp.json()["id"] == "tmpl-2"
     assert resp.json()["name"] == "Copy of My Template"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["post", "put"])
+async def test_a_template_agent_models_map_is_refused(app, method):
+    """#468: the map was stored and never read; the API now says so instead."""
+    body = {"name": "t", "graph_definition": SAMPLE_GRAPH, "agent_models": {"developer": "m"}}
+    url = "/api/v1/pipelines/templates" + ("/tmpl-1" if method == "put" else "")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await getattr(client, method)(url, json=body, headers={"X-Requested-With": "XMLHttpRequest"})
+    assert r.status_code == 422, f"a template agent_models map must be refused, got {r.status_code}"
+    assert "config.model" in r.text

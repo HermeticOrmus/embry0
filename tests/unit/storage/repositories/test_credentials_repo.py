@@ -283,6 +283,23 @@ async def test_rotate_and_update_meta(db_with_migrations: DatabasePool) -> None:
     assert await repo.find_by_label("github", "alice-2") is not None
 
 
+async def test_update_meta_none_clears_git_author_and_omission_keeps_it(db_with_migrations: DatabasePool) -> None:
+    """#440: COALESCE made a stored author impossible to clear."""
+    repo = CredentialsRepository(db_with_migrations)
+    a = await _gh(repo, "alice")
+    await repo.update_meta(a["id"], git_author_name="Alice", git_author_email="a@example.com")
+
+    kept = await repo.update_meta(a["id"], label="alice-2")
+    assert (kept["git_author_name"], kept["git_author_email"]) == ("Alice", "a@example.com")
+
+    cleared = await repo.update_meta(a["id"], git_author_name=None)
+    assert cleared["git_author_name"] is None, f"explicit None did not clear the author name: {cleared}"
+    assert cleared["git_author_email"] == "a@example.com" and cleared["label"] == "alice-2"
+
+    cleared = await repo.update_meta(a["id"], git_author_email=None)
+    assert cleared["git_author_email"] is None
+
+
 async def test_scope_values_normalize_like_the_resolver_lookup(db_with_migrations: DatabasePool) -> None:
     """A mixed-case write is stored in the form CredentialResolver looks up."""
     repo = CredentialsRepository(db_with_migrations)

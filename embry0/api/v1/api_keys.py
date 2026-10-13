@@ -9,6 +9,11 @@ ownership and scope caps:
   unowned SERVICE keys and see/revoke every key;
 - operators see and revoke only their own keys.
 
+A key may be limited to a repository allowlist (``allowed_repos``), set at
+mint or later by the key's owner or an admin; ``embry0.api.repo_allowlist``
+enforces it. A key carrying an allowlist may not mint or change keys: an
+unrestricted key it minted would undo its own restriction.
+
 The plaintext token appears exactly once, in the mint response.
 """
 
@@ -19,9 +24,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from embry0.api.deps import bust_api_key_cache, request_actor, unidentified_caller_tier
+from embry0.api.repo_allowlist import restricted_key_name
+from embry0.api.schemas.repo_path import validate_repo_path
 from embry0.api.session import TIER_ADMIN
 from embry0.audit.helpers import emit_audit
 
@@ -29,6 +36,22 @@ router = APIRouter()
 
 _SCOPE_RANK = {"read": 0, "operate": 1, "merge": 1, "admin": 2}
 _TIER_MAX_SCOPE = {"operator": "operate", "admin": "admin"}
+MAX_ALLOWED_REPOS = 100
+
+
+def _clean_allowed_repos(value: list[str] | None) -> list[str] | None:
+    """Validated, de-duplicated (case-insensitively, first spelling kept);
+    empty or None means unrestricted and is returned as None."""
+    if not value:
+        return None
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for entry in value:
+        slug = validate_repo_path(entry.strip())
+        if slug.lower() not in seen:
+            seen.add(slug.lower())
+            cleaned.append(slug)
+    return cleaned
 
 
 class CreateKeyBody(BaseModel):
@@ -36,6 +59,23 @@ class CreateKeyBody(BaseModel):
     scope: str = Field(pattern="^(read|operate|admin|merge)$")
     expires_days: int | None = Field(default=None, gt=0, le=730)
     service: bool = False
+    # Repositories the key may start work on; omitted or empty: unrestricted.
+    allowed_repos: list[str] | None = Field(default=None, max_length=MAX_ALLOWED_REPOS)
+
+    @field_validator("allowed_repos")
+    @classmethod
+    def _allowed_repos(cls, v: list[str] | None) -> list[str] | None:
+        return _clean_allowed_repos(v)
+
+
+class AllowedReposBody(BaseModel):
+    # Empty or null lifts the restriction.
+    allowed_repos: list[str] | None = Field(max_length=MAX_ALLOWED_REPOS)
+
+    @field_validator("allowed_repos")
+    @classmethod
+    def _allowed_repos(cls, v: list[str] | None) -> list[str] | None:
+        return _clean_allowed_repos(v)
 
 
 def _serialize(row: Any) -> dict[str, Any]:
@@ -44,7 +84,18 @@ def _serialize(row: Any) -> dict[str, Any]:
         if d.get(k) is not None:
             d[k] = d[k].isoformat()
     d["service"] = d["user_id"] is None
+    if d.get("allowed_repos") is not None:
+        d["allowed_repos"] = list(d["allowed_repos"])
     return d
+
+
+def _refuse_restricted_caller(request: Request) -> None:
+    name = restricted_key_name(request)
+    if name is not None:
+        raise HTTPException(
+            status_code=403,
+            detail=f"API key {name!r} is limited to a repository allowlist and may not mint or change keys",
+        )
 
 
 async def _caller(request: Request) -> tuple[str, Any | None]:
@@ -81,6 +132,7 @@ async def list_keys(request: Request) -> dict[str, Any]:
 @router.post("/apikeys", status_code=201)
 async def create_key(body: CreateKeyBody, request: Request) -> dict[str, Any]:
     repo = request.app.state.api_keys_repo
+    _refuse_restricted_caller(request)
     tier, user = await _caller(request)
 
     if body.service:
@@ -116,6 +168,7 @@ async def create_key(body: CreateKeyBody, request: Request) -> dict[str, Any]:
         user_id=owner_id,
         created_by=actor,
         expires_at=expires_at,
+        allowed_repos=body.allowed_repos,
     )
     bust_api_key_cache()
     config = request.app.state.config
@@ -123,10 +176,52 @@ async def create_key(body: CreateKeyBody, request: Request) -> dict[str, Any]:
         getattr(request.app.state, "db", None),
         "apikey.created",
         actor=actor,
-        details={"key_id": row.id, "name": row.name, "scope": row.scope, "service": owner_id is None},
+        details={
+            "key_id": row.id,
+            "name": row.name,
+            "scope": row.scope,
+            "service": owner_id is None,
+            "allowed_repos": body.allowed_repos,
+        },
         audit_log_path=config.audit_log_path,
     )
     return {**_serialize(row), "key": plaintext}
+
+
+@router.put("/apikeys/{key_id}/allowed-repos")
+async def set_allowed_repos(key_id: str, body: AllowedReposBody, request: Request) -> dict[str, Any]:
+    """Replace a key's repository allowlist; an empty list lifts it.
+
+    Same authority as revoking: the key's owner or an admin. Takes effect
+    at once — the key cache is busted, not left to expire.
+    """
+    repo = request.app.state.api_keys_repo
+    _refuse_restricted_caller(request)
+    tier, user = await _caller(request)
+    existing = await repo.get(key_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"key {key_id!r} not found")
+    is_owner = user is not None and existing.user_id == user.id
+    if tier != TIER_ADMIN and not is_owner:
+        raise HTTPException(status_code=403, detail="only the key owner or an admin can change its repositories")
+    row = await repo.set_allowed_repos(key_id, body.allowed_repos)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"key {key_id!r} not found")
+    bust_api_key_cache()
+    config = request.app.state.config
+    await emit_audit(
+        getattr(request.app.state, "db", None),
+        "apikey.allowed_repos_changed",
+        actor=request_actor(request),
+        details={
+            "key_id": key_id,
+            "name": existing.name,
+            "before": list(existing.allowed_repos) if existing.allowed_repos is not None else None,
+            "after": body.allowed_repos,
+        },
+        audit_log_path=config.audit_log_path,
+    )
+    return _serialize(row)
 
 
 @router.delete("/apikeys/{key_id}")

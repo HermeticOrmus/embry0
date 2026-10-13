@@ -68,3 +68,17 @@ async def test_start_job_without_agent_models_omits_override(monkeypatch):
 
     create_kwargs = ex._jobs.create.call_args.kwargs
     assert "agent_models_override" not in create_kwargs["pipeline_config"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("overrides", "expected"), [({}, None), ({"sandbox_profile": "qa-custom"}, "qa-custom")])
+async def test_start_job_records_no_placeholder_profile(monkeypatch, overrides, expected):
+    """#537: a QA job row used to say qa-jvm whatever the run used."""
+    ex = _executor()
+    monkeypatch.setattr(ex, "_track_task", lambda coro, **kw: coro.close())
+    monkeypatch.setattr(ex, "_run_qa_workflow", AsyncMock())
+
+    await ex.start_job(repo="o/r", branch="main", pipeline="qa", qa_overrides=overrides)
+
+    got = ex._jobs.create.call_args.kwargs["sandbox_profile"]
+    assert got == expected, f"jobs.sandbox_profile at creation must be the caller's override or nothing, got {got!r}"

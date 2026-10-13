@@ -167,9 +167,35 @@ async def test_list_open_prs_extracts_refs():
 
 
 @pytest.mark.asyncio
-async def test_list_open_prs_api_failure_is_fail_open():
+async def test_list_open_prs_api_failure_raises_instead_of_reading_as_none_open():
+    """#305: an empty list would say "no open PRs" and let a job open a
+    duplicate. A failed listing raises; the caller fails closed."""
+    from embry0.services.github_prs import OpenPRListError
+
     def handler(request):
         return httpx.Response(403, json={"message": "rate limited"})
+
+    with pytest.raises(OpenPRListError, match=r"o/r \(HTTP 403\)") as caught:
+        await OpenPRService(github_token="tok", http_client=_client(handler)).list_open_prs("o/r")
+    assert "tok" not in str(caught.value)
+    assert "api.github.com" not in str(caught.value), "the request URL must not reach the job row"
+
+
+@pytest.mark.asyncio
+async def test_list_open_prs_non_list_payload_raises():
+    from embry0.services.github_prs import OpenPRListError
+
+    def handler(request):
+        return httpx.Response(200, json={"message": "not a list"})
+
+    with pytest.raises(OpenPRListError, match="not a list"):
+        await OpenPRService(github_token="tok", http_client=_client(handler)).list_open_prs("o/r")
+
+
+@pytest.mark.asyncio
+async def test_list_open_prs_empty_listing_is_a_plain_empty_list():
+    def handler(request):
+        return httpx.Response(200, json=[])
 
     assert await OpenPRService(github_token="tok", http_client=_client(handler)).list_open_prs("o/r") == []
 

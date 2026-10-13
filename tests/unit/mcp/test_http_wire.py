@@ -23,9 +23,9 @@ from typing import Any
 import httpx
 import pytest
 
-from embry0_mcp import server
-from embry0_mcp.client import Embry0Client
-from embry0_mcp.http import build_app
+from embry0.mcp_server import server
+from embry0.mcp_server.client import Embry0Client
+from embry0.mcp_server.http import build_app
 
 GOOD_KEY = "emb_good-key"
 ALLOWED = "mcp.example.test, other.example.test:*"

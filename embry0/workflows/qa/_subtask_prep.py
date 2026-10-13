@@ -1,5 +1,5 @@
-"""Reusable per-sandbox prep — extracted from init_qa_node so single-app and
-multi-app QA flows share one implementation.
+"""Reusable per-sandbox prep, shared by the QA, onboarding and cache-warming
+flows that allocate a sandbox and clone into it.
 
 Two-phase API:
 
@@ -10,9 +10,8 @@ Two-phase API:
      Caller passes the full ``job_json`` dict (caller decides its contents and
      structure); the helper signs the canonical artifacts and writes the file.
 
-The split lets ``init_qa_node`` read+parse qa.yaml between (1) and (2), while
-the multi-app sub-task ``acquire_sandbox_node`` passes a pre-synthesized dict
-straight to (2).
+The split lets a caller do its own work between (1) and (2); the sub-task
+``acquire_sandbox_node`` passes a pre-synthesized dict straight to (2).
 
 Neither function allocates the sandbox or destroys it — caller owns lifecycle.
 """
@@ -70,7 +69,7 @@ async def prep_qa_sandbox_clone(
         ``.qa/{logs,pids}``.
     4. Capture HEAD sha via ``git rev-parse HEAD``.
 
-    Parameters match what ``init_qa_node`` has in hand after sandbox creation.
+    Parameters match what a caller has in hand after sandbox creation.
     ``runtime`` attaches the sandbox to the QA network, so only a DinD-mode
     caller needs it; ``docker`` runs the commands inside the sandbox.
 

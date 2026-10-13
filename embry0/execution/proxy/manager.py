@@ -32,7 +32,8 @@ from __future__ import annotations
 import asyncio
 import secrets
 import socket
-from collections.abc import Callable
+import time
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 import aiohttp
@@ -41,7 +42,15 @@ import structlog
 from embry0.execution.docker_client import DockerClient
 from embry0.execution.image_registry import qualify_image
 from embry0.execution.proxy.forge_scope import SCOPE_FIELD, normalize_github_repo, normalize_gitlab_project
-from embry0.execution.proxy.git_scope import PUSH_FIELD, UPSTREAM_FIELD, normalize_git_repo, normalize_upstream
+from embry0.execution.proxy.git_scope import (
+    JOB_FIELD,
+    PUSH_BRANCHES_FIELD,
+    PUSH_FIELD,
+    UPSTREAM_FIELD,
+    normalize_git_repo,
+    normalize_push_branch,
+    normalize_upstream,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -93,6 +102,20 @@ _DAEMON_UNREACHABLE_MARKERS: tuple[str, ...] = (
     "connection reset by peer",
     "dial tcp",
 )
+
+
+# What ``docker exec`` says when the proxy container exited or was removed
+# (#626). Distinct from the daemon being unreachable: the daemon answered.
+_PROXY_GONE_MARKERS: tuple[str, ...] = (
+    "is not running",
+    "no such container",
+)
+
+
+def _proxy_gone(exc: BaseException) -> bool:
+    """True when ``exc`` is ``docker exec`` refused because the proxy container is stopped or missing."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _PROXY_GONE_MARKERS)
 
 
 def _daemon_unreachable(exc: BaseException) -> bool:
@@ -161,6 +184,14 @@ class ProxyManager:
         self._enroll_ttl_seconds = enroll_ttl_seconds
         self._image = qualify_image(_BASE_IMAGE, image_registry)
         self._http: aiohttp.ClientSession | None = None
+        # #626: what a proxy found stopped is recreated from. The env is what
+        # start() launched it with; it holds credentials, as this process does.
+        self._launch_specs: dict[str, tuple[dict[str, str], bool]] = {}
+        # #626: the admin state each proxy holds in memory only, replayed into
+        # a recreated proxy: proxy -> key -> (path, port, body, monotonic expiry).
+        self._admin_state: dict[str, dict[str, tuple[str, int, dict[str, Any], float]]] = {}
+        self._revive_locks: dict[str, asyncio.Lock] = {}
+        self._on_recreated: Callable[[], Awaitable[None]] | None = None
         self.auth_proxy_url: str = ""
         self.xai_proxy_url: str = ""
         self.git_proxy_url: str = ""
@@ -183,6 +214,7 @@ class ProxyManager:
         orchestrator_api_key: str = "",
         context_container_allowlist: str = "",
         context_query_quota: int = 30,
+        log_redaction_fields: str = "",
         has_github_credential: bool | None = None,
         has_gitlab_credential: bool | None = None,
     ) -> None:
@@ -209,6 +241,8 @@ class ProxyManager:
         # is logged and left for the sweep only if it was a connect failure.
         failed_preclean = await self._remove_proxies(list(_PROXY_CONTAINER_NAMES), phase="start_preclean")
         self._pending_removal = set(failed_preclean)
+        # Fresh proxies hold no enrollment; a paused sandbox is re-enrolled on resume.
+        self._admin_state.clear()
 
         github_present = bool(github_token) if has_github_credential is None else has_github_credential
         gitlab_present = bool(gitlab_token) if has_gitlab_credential is None else has_gitlab_credential
@@ -357,6 +391,8 @@ class ProxyManager:
                     "ORCHESTRATOR_API_KEY": orchestrator_api_key,
                     "CONTAINER_ALLOWLIST": allowlist,
                     "QUERY_QUOTA": str(context_query_quota),
+                    # #294: the operator's PII field names, redacted in results.
+                    "LOG_REDACTION_FIELDS": log_redaction_fields,
                     "LISTEN_PORT": "9107",
                     "PROXY_ADMIN_TOKEN": self._proxy_admin_token,
                 },
@@ -389,12 +425,24 @@ class ProxyManager:
                 os.unlink(env_file_path)
             except OSError:
                 logger.warning("proxy_env_file_unlink_failed", path=env_file_path)
-        self._launched.append(name)
+        if name not in self._launched:
+            self._launched.append(name)
+        self._launch_specs[name] = (dict(env), attach_internet)
         self._pending_removal.discard(name)
         if attach_internet:
             connect_cmd = self._docker.build_network_cmd("connect", _INTERNET, name)
             await self._docker.run_cmd(connect_cmd)
-            self._internet_attached.append(name)
+            if name not in self._internet_attached:
+                self._internet_attached.append(name)
+
+    def on_proxy_recreated(self, hook: Callable[[], Awaitable[None]]) -> None:
+        """Run ``hook`` after a proxy found stopped was recreated (#626).
+
+        A recreated proxy may have new addresses, and the rules that let
+        sandboxes reach a proxy name its addresses; production passes
+        ``SandboxManager.refresh_proxy_policy``.
+        """
+        self._on_recreated = hook
 
     def internet_proxies(self) -> list[str]:
         """Names of the running proxies attached to ``sandbox-internet``."""
@@ -416,6 +464,8 @@ class ProxyManager:
         repo: str | None = None,
         git_upstream: str | None = None,
         git_push: bool = False,
+        git_push_branches: Sequence[str] = (),
+        job_id: str | None = None,
     ) -> str:
         """Enroll a new sandbox with all running credential proxies.
 
@@ -455,6 +505,13 @@ class ProxyManager:
         echo the grant runs an image older than forwarding, which hands the
         forge token to any holder of the bearer: the sandbox is unenrolled
         there and RuntimeError is raised, so the sandbox is never used.
+
+        ``git_push_branches`` are the branches a push may create or update
+        (#559, ADR 0009); the git-proxy refuses every other ref update and
+        every deletion. They are sent only with ``git_push``, and a git-proxy
+        that does not echo them runs an image older than ref scoping, which
+        would let the push touch any ref: refused the same way. ``job_id``
+        goes to the git-proxy so its refusals name the job.
 
         Raises RuntimeError if any enrollment exec fails, if such a stale
         proxy cannot be revoked, or if the git-proxy does not confirm its
@@ -508,7 +565,7 @@ class ProxyManager:
         # enroll_context() explicitly when the job carries the watcher flag —
         # a sandbox never enrolled here dead-ends at the proxy's 401 (RAV-1140).
 
-        git_grant = self._git_grant(repo, git_upstream, git_push)
+        git_grant = self._git_grant(repo, git_upstream, git_push, git_push_branches)
         for name, port in targets:
             body = dict(base)
             if forge_targets is None or name in forge_targets:
@@ -522,6 +579,8 @@ class ProxyManager:
                 body[SCOPE_FIELD] = scope
             if name == "git-proxy":
                 body.update(git_grant)
+                if job_id:
+                    body[JOB_FIELD] = job_id
             response = await self._exec_admin_request(
                 container=name,
                 method="POST",
@@ -561,9 +620,14 @@ class ProxyManager:
         return [normalized]
 
     @staticmethod
-    def _git_grant(repo: str | None, upstream: str | None, push: bool) -> dict[str, Any]:
-        """The git-proxy's enroll-body grant: ``allowed_repos``, ``git_upstream``, ``git_push``."""
+    def _git_grant(
+        repo: str | None, upstream: str | None, push: bool, push_branches: Sequence[str] = ()
+    ) -> dict[str, Any]:
+        """The git-proxy's enroll-body grant: ``allowed_repos``, ``git_upstream``, ``git_push``
+        and, with ``git_push``, ``git_push_branches``."""
         grant: dict[str, Any] = {SCOPE_FIELD: [], PUSH_FIELD: bool(push)}
+        if push:
+            grant[PUSH_BRANCHES_FIELD] = _push_branches(push_branches)
         normalized_upstream = normalize_upstream(upstream) if upstream else None
         if upstream and normalized_upstream is None:
             logger.warning("git_proxy_upstream_invalid", upstream=upstream[:200])
@@ -586,6 +650,13 @@ class ProxyManager:
             and sorted(str(r) for r in echoed[SCOPE_FIELD]) == sorted(grant[SCOPE_FIELD])
             and echoed.get(PUSH_FIELD) is grant[PUSH_FIELD]
             and echoed.get(UPSTREAM_FIELD, "") == grant.get(UPSTREAM_FIELD, "")
+            and (
+                PUSH_BRANCHES_FIELD not in grant
+                or (
+                    isinstance(echoed.get(PUSH_BRANCHES_FIELD), list)
+                    and sorted(str(b) for b in echoed[PUSH_BRANCHES_FIELD]) == grant[PUSH_BRANCHES_FIELD]
+                )
+            )
         )
         if confirmed:
             return
@@ -594,8 +665,9 @@ class ProxyManager:
             sandbox_id=sandbox_id,
             detail=(
                 "the git-proxy did not confirm the repository grant: its image predates smart-HTTP "
-                "forwarding and would hand the forge token to the sandbox, so the sandbox is unenrolled "
-                "there and refused; rebuild the proxy image"
+                "forwarding (it would hand the forge token to the sandbox) or push-branch scoping (it "
+                "would let a push touch any ref), so the sandbox is unenrolled there and refused; "
+                "rebuild the proxy image"
             ),
         )
         await self._exec_admin_request(
@@ -607,6 +679,45 @@ class ProxyManager:
             accept_404=True,
         )
         raise RuntimeError("git-proxy did not confirm the repository grant (proxy image older than the orchestrator?)")
+
+    async def set_git_push_branches(self, sandbox_id: str, branches: Sequence[str]) -> None:
+        """Replace the branches an enrolled sandbox may push (#559): the developer's chosen branch.
+
+        Raises RuntimeError when a branch is not one the git-proxy accepts,
+        when the git-proxy is not running, refuses, or does not echo exactly
+        ``branches`` (an image older than the route answers
+        404 or 405). The sandbox keeps the branches it had, so a failure never
+        widens what it may push.
+        """
+        if not self.git_proxy_url:
+            raise RuntimeError("git-proxy is not running")
+        wanted = _push_branches(branches)
+        if not wanted or len(wanted) != len(set(branches)):
+            raise RuntimeError(f"not branches the git-proxy accepts: {sorted(branches)!r}")
+        response = await self._exec_admin_request(
+            container="git-proxy",
+            method="PUT",
+            path=f"/admin/git-push-branches/{sandbox_id}",
+            port=9101,
+            body={PUSH_BRANCHES_FIELD: wanted},
+        )
+        echoed = response.get(PUSH_BRANCHES_FIELD) if isinstance(response, dict) else None
+        if not isinstance(echoed, list) or sorted(str(b) for b in echoed) != wanted:
+            raise RuntimeError("git-proxy did not confirm the push branches (proxy image older than the orchestrator?)")
+        # A recreated git-proxy is given the held enroll body back (#626): it
+        # must carry the branches confirmed now, not the create-time ones.
+        # Recorded only once confirmed, so a replay never grants more than the
+        # proxy accepted.
+        held = self._admin_state.get("git-proxy", {}).get(f"enroll:{sandbox_id}")
+        if held is not None:
+            path, port, body, expires = held
+            self._admin_state["git-proxy"][f"enroll:{sandbox_id}"] = (
+                path,
+                port,
+                {**body, PUSH_BRANCHES_FIELD: wanted},
+                expires,
+            )
+        logger.info("sandbox_git_push_branches_set", sandbox_id=sandbox_id, branches=wanted)
 
     async def _confirm_repo_scope(
         self, proxy: str, port: int, sandbox_id: str, scope: list[str], response: dict[str, Any]
@@ -796,6 +907,117 @@ class ProxyManager:
         return report if isinstance(report, dict) else {}
 
     async def _exec_admin_request(
+        self,
+        *,
+        container: str,
+        method: str,
+        path: str,
+        port: int,
+        body: dict[str, Any] | None,
+        accept_404: bool = False,
+    ) -> dict[str, Any]:
+        """One admin request to a proxy; a proxy found stopped or missing is recreated first (#626).
+
+        A proxy exits on its own (a crash, an OOM kill, a daemon restart) and
+        nothing else starts it again: every enroll and unenroll that needed it
+        failed until the next orchestrator start. When ``docker exec`` says the
+        container is not running or does not exist, the proxy is recreated as
+        ``start()`` launched it, the enrollments and tokens it held are
+        replayed, and the request is sent once more. Raises as
+        :meth:`_exec_admin_once` does when that fails too.
+        """
+        kwargs: dict[str, Any] = {
+            "container": container,
+            "method": method,
+            "path": path,
+            "port": port,
+            "body": body,
+            "accept_404": accept_404,
+        }
+        try:
+            response = await self._exec_admin_once(**kwargs)
+        except RuntimeError as exc:
+            if not _proxy_gone(exc) or not await self._revive(container):
+                raise
+            response = await self._exec_admin_once(**kwargs)
+        self._remember(container, method, path, port, body)
+        return response
+
+    def _remember(self, container: str, method: str, path: str, port: int, body: dict[str, Any] | None) -> None:
+        """Keep the admin state a proxy holds in memory, so a recreated proxy gets it back."""
+        held = self._admin_state.setdefault(container, {})
+        now = time.monotonic()
+        for key in [k for k, (_, _, _, expires) in held.items() if expires <= now]:
+            del held[key]
+        if method == "POST" and path == "/admin/enroll" and body and body.get("sandbox_id"):
+            ttl = float(body.get("ttl_seconds") or self._enroll_ttl_seconds)
+            held[f"enroll:{body['sandbox_id']}"] = (path, port, dict(body), now + ttl)
+        elif method == "DELETE" and path.startswith("/admin/enroll/"):
+            held.pop(f"enroll:{path.removeprefix('/admin/enroll/')}", None)
+        elif method == "POST" and path == "/admin/token" and body:
+            held[f"token:{body.get('credential_id') or ''}"] = (path, port, dict(body), float("inf"))
+
+    async def _revive(self, name: str) -> bool:
+        """Recreate the stopped proxy ``name`` and replay its admin state. True when it runs again.
+
+        Only a proxy this process launched is recreated, and not while
+        stopping. Concurrent callers wait for one recreation.
+        """
+        if self._stopping or name not in self._launch_specs:
+            return False
+        async with self._revive_locks.setdefault(name, asyncio.Lock()):
+            if await self._is_running(name):
+                return True  # another caller recreated it while this one waited
+            env, attach_internet = self._launch_specs[name]
+            logger.warning("proxy_not_running_recreating", proxy=name)
+            await self._remove_proxies([name], phase="revive")
+            try:
+                await self._launch(name=name, env=env, attach_internet=attach_internet)
+            except Exception as exc:  # noqa: BLE001 — the caller gets its original error
+                logger.error("proxy_recreate_failed", proxy=name, error=str(exc))
+                return False
+            restored, failed = await self._replay(name)
+            logger.warning("proxy_recreated", proxy=name, restored=restored, failed=failed)
+        if self._on_recreated is not None:
+            try:
+                await self._on_recreated()
+            except Exception as exc:  # noqa: BLE001 — the proxy runs; the rules are retried by every create
+                logger.error("proxy_recreated_rules_refresh_failed", proxy=name, error=str(exc))
+        return True
+
+    async def _is_running(self, name: str) -> bool:
+        try:
+            out = await self._docker.run_cmd(self._docker.build_inspect_running_cmd(name), timeout=10)
+        except Exception:  # noqa: BLE001 — missing or unreadable is not running
+            return False
+        return str(out).strip() == "true"
+
+    async def _replay(self, name: str) -> tuple[int, int]:
+        """Send a recreated proxy the enrollments and tokens it held. Returns (restored, failed).
+
+        An enrollment keeps the expiry it had; one already expired is dropped.
+        """
+        restored = failed = 0
+        held = self._admin_state.get(name, {})
+        now = time.monotonic()
+        for key, (path, port, body, expires) in list(held.items()):
+            if expires <= now:
+                del held[key]
+                continue
+            replay = dict(body)
+            if key.startswith("enroll:"):
+                replay["ttl_seconds"] = max(1, int(expires - now))
+            try:
+                await self._exec_admin_once(
+                    container=name, method="POST", path=path, port=port, body=replay, accept_404=False
+                )
+                restored += 1
+            except RuntimeError as exc:
+                failed += 1
+                logger.error("proxy_state_replay_failed", proxy=name, entry=key.split(":", 1)[0], error=str(exc))
+        return restored, failed
+
+    async def _exec_admin_once(
         self,
         *,
         container: str,
@@ -1014,3 +1236,19 @@ class ProxyManager:
                 )
         except asyncio.CancelledError:
             raise
+
+
+def _push_branches(branches: Sequence[str]) -> list[str]:
+    """Sorted, de-duplicated branch names the git-proxy accepts; a name it would refuse is dropped, loudly.
+
+    Dropping it fails closed: the proxy then refuses a push to that branch,
+    where sending it would have the whole enrollment refused.
+    """
+    kept: set[str] = set()
+    for branch in branches:
+        normalized = normalize_push_branch(branch)
+        if normalized is None:
+            logger.warning("git_proxy_push_branch_invalid", branch=str(branch)[:200])
+            continue
+        kept.add(normalized)
+    return sorted(kept)

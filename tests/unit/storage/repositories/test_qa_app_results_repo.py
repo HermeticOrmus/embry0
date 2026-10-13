@@ -33,7 +33,6 @@ def _result(app: str, status: SubTaskStatus, duration_ms: int = 100, **kw) -> Su
         status=status,
         duration_ms=duration_ms,
         cache_hits=CacheHits(),
-        trace_url=kw.get("trace_url"),
         failure_summary=kw.get("failure_summary"),
         raw_result=kw.get("raw_result", {"x": 1}),
     )
@@ -107,7 +106,6 @@ async def test_upsert_persists_boot_phase_payload(repo, db):
         status="boot_failure",
         duration_ms=600_000,
         cache_hits=CacheHits(),
-        trace_url=None,
         failure_summary="boot_command did not become ready within 600s",
         raw_result={},
         boot_phase=boot_phase,
@@ -130,7 +128,6 @@ async def test_upsert_with_boot_phase_none_stores_null(repo, db):
         status="passed",
         duration_ms=1500,
         cache_hits=CacheHits(),
-        trace_url=None,
         failure_summary=None,
         raw_result={},
         boot_phase=None,
@@ -500,7 +497,6 @@ async def test_upsert_preserves_cache_hits_roundtrip(repo, db):
             turbo_remote_hits=["apps/hub#build"],
             turbo_remote_misses=["apps/companion#build"],
         ),
-        trace_url="https://x/trace.zip",
     )
     await repo.upsert(job_id, result)
 
@@ -510,7 +506,6 @@ async def test_upsert_preserves_cache_hits_roundtrip(repo, db):
     assert rows[0].cache_hits.shared_volume is False
     assert rows[0].cache_hits.turbo_remote_hits == ["apps/hub#build"]
     assert rows[0].cache_hits.turbo_remote_misses == ["apps/companion#build"]
-    assert rows[0].trace_url == "https://x/trace.zip"
 
 
 # ─── Phase 5F: flake_window ──────────────────────────────────────────────

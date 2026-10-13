@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
+    from collections.abc import Coroutine, Mapping
 
     from embry0.api.events.bus import EventBus
     from embry0.orchestration.budget_gate import DispatchDecision
@@ -19,13 +19,16 @@ import embry0.services._executor_outcomes as _executor_outcomes
 import embry0.services._executor_run as _executor_run
 from embry0.audit.helpers import emit_audit
 from embry0.orchestration import dispatch_actors
+from embry0.orchestration.restart import ExecutorDraining, ShutdownInterrupt
 from embry0.orchestration.run_slots import RunSlot, RunSlots
+from embry0.safety.error_codes import ErrorCode
 from embry0.services._cost import resolve_job_total_cost
 from embry0.services._executor_outcomes import _fold_auto_answers_into_context
 from embry0.services.healing.recorder import record_case_event
 from embry0.storage.database import DatabasePool
 from embry0.storage.repositories.issues import IssuesRepository
 from embry0.storage.repositories.jobs import JobsRepository, StatusTransitionConflict
+from embry0.storage.repositories.repos import UnregisteredRepoError
 from embry0.storage.repositories.sandbox_profiles import SandboxProfilesRepository
 from embry0.storage.repositories.traces import TracesRepository
 from embry0.trackers import github_number_of
@@ -63,10 +66,10 @@ class IssueExecutor:
         # can tell GitHub from GitLab. None in tests → github.
         repos_repo: Any = None,
         secrets_provider: Any = None,  # FernetSecretsProvider; injected at startup
-        qa_minio: Any = None,  # QAMinioClient (internal endpoint) — used by report_node
-        qa_minio_sandbox: Any = None,  # QAMinioClient (sandbox-facing) — used by init_qa_node
-        qa_token_registry: Any = None,  # SandboxTokenRegistry — used by init_qa + report
-        profiles_repo: SandboxProfilesRepository | None = None,  # SandboxProfilesRepository — init_qa
+        qa_minio: Any = None,  # QAMinioClient (internal endpoint) — boot screenshots, deliverables
+        qa_minio_sandbox: Any = None,  # QAMinioClient (sandbox-facing) — used by acquire_sandbox_node
+        qa_token_registry: Any = None,  # SandboxTokenRegistry — used by acquire_sandbox + release_sandbox
+        profiles_repo: SandboxProfilesRepository | None = None,  # SandboxProfilesRepository — QA + onboarding sandboxes
         agent_sessions_repo: Any = None,  # AgentSessionsRepository — Plan C resume
         # Phase-A wiring: cache layers + dashboard reporting
         qa_app_results_repo: Any = None,
@@ -166,6 +169,16 @@ class IssueExecutor:
         # and reads as no cap.
         limit = getattr(config, "max_running_jobs", 0)
         self._run_slots = RunSlots(limit if isinstance(limit, int) and not isinstance(limit, bool) else 0)
+        # #307: set by drain() at shutdown. No job starts once it is set, and
+        # a running job stops at its next node boundary.
+        self._draining = False
+        # Jobs whose runner is past its run slot and doing work; the others
+        # tracked in _tasks_by_job are waiting to start.
+        self._started_jobs: set[str] = set()
+
+    @property
+    def draining(self) -> bool:
+        return getattr(self, "_draining", False)
 
     def _get_budget_gate(self) -> Any:
         """The dispatch-time BudgetGate, built from the shared pool on first
@@ -305,9 +318,10 @@ class IssueExecutor:
                 # Workspace-init strategies read allowlist/bounds off the app
                 # config (RAV-600).
                 "embry0_config": self._config,
-                # QA-specific deps. Read by embry0.workflows.qa.nodes.{init_qa,
-                # qa, report, retry}; harmless for non-QA workflows because they
-                # never look these keys up.
+                # QA-specific deps. Read by the QA orchestrator and sub-task
+                # nodes (embry0.workflows.qa.orchestrator, .subtask_nodes);
+                # harmless for non-QA workflows because they never look these
+                # keys up.
                 "qa_minio": self._qa_minio,
                 "qa_minio_sandbox": self._qa_minio_sandbox,
                 "qa_token_registry": self._qa_token_registry,
@@ -336,6 +350,35 @@ class IssueExecutor:
                 "github_token": self._github_token,
             },
         }
+
+    async def unregistered_repo_refusal(self, repo: str) -> str | None:
+        """Why ``repo`` must not be dispatched to, or None when it may be (#360).
+
+        A repo with no ``repos`` row — under any spelling ``REPO_RENAMES``
+        gives it — has no QA config, no env vars and no secrets in embry0, so
+        a job against it looks healthy for minutes and then fails at QA, or
+        runs without the environment it needs. That holds whatever
+        ``DEFAULT_FORGE`` says: the default forge only answers *where to
+        clone*, never *whether embry0 knows the repo*.
+
+        None as well when there is nothing to judge — no registry wired (unit
+        graphs), no repo on the issue — or the registry cannot answer (logged;
+        a database that is down fails the job's own writes anyway).
+        """
+        repos = getattr(self, "_repos", None)  # executors built bare in unit tests carry none
+        if repos is None or not repo:
+            return None
+        try:
+            if await repos.registered_as(repo) is not None:
+                return None
+        except Exception:
+            logger.warning("repo_registration_lookup_failed", repo=repo, exc_info=True)
+            return None
+        return (
+            f"{ErrorCode.REPO_UNREGISTERED}: repo {repo!r} is not registered in embry0, so it has no QA config, "
+            "env vars or secrets here. Register it (POST /api/v1/repos or the MCP repo_register tool), or fix "
+            "the tracker's repo mapping if it names the wrong or an old repo."
+        )
 
     async def execute(
         self,
@@ -372,6 +415,14 @@ class IssueExecutor:
                     f"Issue {issue_id} already has an active job: "
                     f"{existing_job['job_id']} (status={existing_job['status']})"
                 )
+
+        # #360: every dispatch ends here, so this is the one refusal for all of
+        # them. The callers return the issue to `open`; the Linear path asks
+        # unregistered_repo_refusal() itself first, to tell the ticket why.
+        refusal = await self.unregistered_repo_refusal(str(issue.get("repo") or ""))
+        if refusal is not None:
+            logger.warning("issue_dispatch_refused_unregistered_repo", issue_id=issue_id, repo=issue.get("repo"))
+            raise UnregisteredRepoError(refusal)
 
         task_text = issue["title"]
         if issue.get("body"):
@@ -413,6 +464,7 @@ class IssueExecutor:
             kind="workflow_execute",
             job_id=job_id,
             issue_id=issue_id,
+            launch={"runner": "workflow", "issue_id": issue_id, "additional_context": additional_context},
         )
 
         return job_id
@@ -447,6 +499,13 @@ class IssueExecutor:
             self._run_workflow(None, job_id, synthetic_issue, additional_context=additional_context),
             kind=kind,
             job_id=job_id,
+            launch={
+                "runner": "workflow",
+                "issue_id": None,
+                "issue": synthetic_issue,
+                "additional_context": additional_context,
+                "kind": kind,
+            },
         )
 
     def schedule_resume(
@@ -461,7 +520,12 @@ class IssueExecutor:
 
         Public wrapper so API routes never touch ``_track_task`` directly.
         ``issue_id`` is None for issue-less jobs (resume tolerates it).
+
+        Raises ExecutorDraining while the orchestrator shuts down (#307): the
+        answers would be lost with the process, so the caller must say so.
         """
+        if self.draining:
+            raise ExecutorDraining(f"embry0 is shutting down; resume job {job_id} once it is back")
         return self._track_task(
             self.resume(issue_id, job_id, answers),
             kind=kind,
@@ -542,7 +606,9 @@ class IssueExecutor:
         # issue path stores, so the job row surfaces it identically.
         if agent_models:
             pipeline_config["agent_models_override"] = dict(agent_models)
-        sandbox_profile = qa_overrides.get("sandbox_profile") or "qa-jvm"
+        # #537: the caller's override, or nothing until the run resolves the
+        # profile it uses — never a placeholder that reads like a fact.
+        sandbox_profile = qa_overrides.get("sandbox_profile") or None
         # `task` is required on the jobs row; synthesize a human-readable
         # placeholder so the dashboard has something to display.
         task_text = f"QA run on {repo}@{branch}"
@@ -577,6 +643,13 @@ class IssueExecutor:
             ),
             kind="qa_workflow_execute",
             job_id=job_id,
+            launch={
+                "runner": "qa",
+                "repo": repo,
+                "branch": branch,
+                "qa_overrides": qa_overrides,
+                "agent_models": agent_models,
+            },
         )
 
         return job_id
@@ -631,6 +704,13 @@ class IssueExecutor:
             ),
             kind="onboard_workflow_execute",
             job_id=job_id,
+            launch={
+                "runner": "onboard",
+                "repo": repo,
+                "branch": branch,
+                "skip_smoke": skip_smoke,
+                "agent_models": agent_models,
+            },
         )
         return job_id
 
@@ -642,12 +722,15 @@ class IssueExecutor:
         job_id: str,
         issue_id: str | None = None,
         run_slot: bool = True,
+        launch: dict[str, Any] | None = None,
     ) -> asyncio.Task[Any]:
         """Create an asyncio.Task from ``coro``, register it, and attach a
         done-callback that logs failures and publishes a ``job_failed`` event.
 
         With ``run_slot`` the coroutine starts only once it holds a run slot
-        (MAX_RUNNING_JOBS, #583) and gives it back when it returns.
+        (MAX_RUNNING_JOBS, #583) and gives it back when it returns, and never
+        while the executor drains (#307). ``launch`` is recorded on the job
+        row first, so a restart can start the job again (``relaunch``).
 
         Centralizes the former 3x duplication of create_task + set.add +
         add_done_callback(set.discard). The callback:
@@ -661,7 +744,7 @@ class IssueExecutor:
         """
         workflow = coro
         if run_slot:
-            coro = self._run_in_slot(workflow, job_id)
+            coro = self._run_in_slot(workflow, job_id, launch)
         task: asyncio.Task[Any] = asyncio.create_task(coro)
         if run_slot:
             # A task cancelled while queued, or before it ever ran, never
@@ -681,6 +764,10 @@ class IssueExecutor:
                 return
             exc = t.exception()
             if exc is None:
+                return
+            if isinstance(exc, ShutdownInterrupt):
+                # #307: stopped at a node boundary by a drain, not failed.
+                logger.info("job_stopped_for_shutdown", kind=kind, job_id=job_id)
                 return
             logger.error(
                 "background_task_failed",
@@ -748,14 +835,108 @@ class IssueExecutor:
         logger.info("job_run_slot_granted", job_id=job_id)
         return slot
 
-    async def _run_in_slot(self, coro: Coroutine[Any, Any, Any], job_id: str) -> Any:
-        """Run ``coro`` holding a run slot, and give the slot back however it ends."""
+    async def _run_in_slot(
+        self, coro: Coroutine[Any, Any, Any], job_id: str, launch: dict[str, Any] | None = None
+    ) -> Any:
+        """Run ``coro`` holding a run slot, and give the slot back however it ends.
+
+        ``launch`` is recorded before anything else, so a job that never gets
+        to run still carries what starting it takes. While the executor
+        drains (#307) the job is not started: it stays ``pending`` and the
+        next boot launches it.
+        """
+        if launch is not None:
+            try:
+                await self._jobs.record_launch(job_id, launch)
+            except Exception:
+                logger.warning("job_launch_record_failed", job_id=job_id, exc_info=True)
+        if self.draining:
+            await self._defer_for_shutdown(job_id)
+            return None
         slot = await self._acquire_run_slot(job_id)
         try:
+            started = getattr(self, "_started_jobs", None)
+            if started is not None:
+                started.add(job_id)
             return await coro
         finally:
+            started = getattr(self, "_started_jobs", None)
+            if started is not None:
+                started.discard(job_id)
             if slot is not None:
                 slot.release()
+
+    async def _defer_for_shutdown(self, job_id: str) -> None:
+        """Leave a job that has not started ``pending`` for the next boot (#307)."""
+        logger.info("job_start_deferred_for_shutdown", job_id=job_id)
+        try:
+            await self._jobs.mark_interrupted([job_id])
+        except Exception:
+            logger.warning("job_interrupt_mark_failed", job_id=job_id, exc_info=True)
+
+    async def drain(self, timeout: float) -> list[str]:
+        """Stop taking work and let the running jobs reach a checkpoint (#307).
+
+        Called once, at shutdown, before the background tasks are cancelled.
+        From here on no job starts: a job dispatched now, or waiting for a run
+        slot, stays ``pending`` with its launch record. A running job stops at
+        its next node boundary (``ShutdownInterrupt``), where LangGraph has
+        saved its progress. One still inside a node after ``timeout`` seconds
+        is cancelled; it resumes from its last saved node.
+
+        Every job stopped or deferred gets ``interrupted_at``, and the agent
+        a stopped job left running in its sandbox is killed. Returns the ids
+        stamped.
+        """
+        self._draining = True
+        tasks = dict(getattr(self, "_tasks_by_job", {}))
+        started: set[str] = getattr(self, "_started_jobs", set())
+        for job_id, task in tasks.items():
+            if job_id not in started and not task.done():
+                task.cancel()
+        alive = [t for t in tasks.values() if not t.done()]
+        logger.info("executor_draining", jobs=len(alive), timeout_seconds=timeout)
+        if alive:
+            _, still = await asyncio.wait(alive, timeout=timeout)
+            if still:
+                logger.warning(
+                    "executor_drain_timeout",
+                    job_ids=[job_id for job_id, t in tasks.items() if t in still],
+                    msg="Jobs still inside a node at the drain deadline are cancelled and resume from their last checkpoint.",
+                )
+                for task in still:
+                    task.cancel()
+                await asyncio.wait(still, timeout=10)
+        if not tasks:
+            return []
+        try:
+            stamped = await self._jobs.mark_interrupted(list(tasks))
+        except Exception:
+            logger.warning("job_interrupt_mark_failed", job_ids=list(tasks), exc_info=True)
+            return []
+
+        async def settle(job_id: str) -> None:
+            try:
+                await self._broadcast_event(
+                    job_id,
+                    {
+                        "type": "system",
+                        "message": "Interrupted: embry0 is shutting down. The job resumes from its last checkpoint when it is back.",
+                    },
+                )
+            except Exception:
+                logger.warning("job_interrupt_event_failed", job_id=job_id, exc_info=True)
+            if self._sandbox is not None:
+                try:
+                    await self._sandbox.stop_agent(f"sandbox-{job_id}")
+                except Exception:
+                    logger.warning("sandbox_agent_stop_failed", job_id=job_id, exc_info=True)
+
+        # Together: each stop_agent may take its 10 s timeout, and the grace
+        # period is shared.
+        await asyncio.gather(*(settle(job_id) for job_id in stamped))
+        logger.info("executor_drained", interrupted=stamped)
+        return stamped
 
     async def cancel_job(self, job_id: str, *, actor: str = "system") -> None:
         """Centralised cancellation: cancels the active task, purges the
@@ -791,8 +972,15 @@ class IssueExecutor:
                 await self._sandbox.destroy(container_name)
             except Exception:
                 logger.warning("sandbox_destroy_on_cancel_failed", job_id=job_id, exc_info=True)
+            # Nor does it reach QA's own teardown: sub-task sandboxes, QA
+            # networks and agent-started containers are released here (#328).
+            runtime = getattr(self._sandbox, "runtime", None)
+            if runtime is not None:
+                from embry0.workflows.qa.cleanup import cleanup_cancelled_qa_job
+
+                await cleanup_cancelled_qa_job(runtime, self._sandbox.destroy, job_id=job_id)
         # A cancelled graph never reaches its own cleanup, so the job's
-        # volumes are released here (#274) — after the sandbox, which mounts them.
+        # volumes are released here (#274) — after the sandboxes, which mount them.
         await self._cleanup_job_volumes(job_id)
 
         # 3. Update DB: job → cancelled, issue → open.
@@ -854,11 +1042,16 @@ class IssueExecutor:
 
         logger.info("job_cancelled", job_id=job_id, actor=actor)
 
-    async def resume(self, issue_id: str | None, job_id: str, answers: Any) -> None:
+    async def resume(self, issue_id: str | None, job_id: str, answers: Any, *, after_restart: bool = False) -> None:
         """Resume a paused pipeline with user answers using Command(resume=).
 
         ``issue_id`` is None for issue-less API-submitted jobs; issue-status
         updates no-op in that case (IssuesRepository.update skips missing rows).
+
+        ``after_restart`` (#307) continues a job a previous orchestrator left
+        ``running`` from its last checkpoint instead: there is no answer, the
+        job and its issue already read as running, and a sandbox the proxies
+        will not take back fails the job rather than pausing it.
 
         RAV-1406: like ``_run_workflow``, the terminal Linear outcome comment
         posts in the ``finally`` — resumed jobs used to finish silently
@@ -878,24 +1071,38 @@ class IssueExecutor:
         prior_issue_status: str | None = None
         slot: RunSlot | None = None
         try:
-            # Read before anything changes: a resume whose sandbox the proxies will
-            # not take back puts the job and issue back exactly as they were (#476).
-            # Best-effort: only that rare path uses it, so it must not change any other.
-            try:
-                prior_job_status = ((await self._jobs.get(job_id)) or {}).get("status")
-                if issue_id:
-                    prior_issue_status = ((await self._issues.get(issue_id)) or {}).get("status")
-            except Exception:
-                logger.warning("resume_prior_status_read_failed", job_id=job_id, exc_info=True)
-            await self._jobs.update(job_id, status="running")
-            await self._issues.update(issue_id, status="triaging")
+            if not after_restart:
+                # Read before anything changes: a resume whose sandbox the proxies will
+                # not take back puts the job and issue back exactly as they were (#476).
+                # Best-effort: only that rare path uses it, so it must not change any other.
+                try:
+                    prior_job_status = ((await self._jobs.get(job_id)) or {}).get("status")
+                    if issue_id:
+                        prior_issue_status = ((await self._issues.get(issue_id)) or {}).get("status")
+                except Exception:
+                    logger.warning("resume_prior_status_read_failed", job_id=job_id, exc_info=True)
+                await self._jobs.update(job_id, status="running")
+                await self._issues.update(issue_id, status="triaging")
             # #583: a paused job held no slot. Its resume waits for one after
             # the job reads `running`, so a restart in between fails it as
             # orphaned rather than leaving an answered job awaiting input.
-            slot = await self._acquire_run_slot(job_id, priority=True)
+            try:
+                slot = await self._acquire_run_slot(job_id, priority=True)
+            except asyncio.CancelledError:
+                if self.draining and not after_restart:
+                    # #307: a drain cancelled the wait. Nothing ran, so the job
+                    # goes back to waiting for its answer rather than resuming,
+                    # without that answer, after the restart.
+                    await self._jobs.update(job_id, status=prior_job_status or "awaiting_input")
+                    await self._issues.update(issue_id, status=prior_issue_status or "awaiting_input")
+                    logger.warning("resume_dropped_for_shutdown", job_id=job_id, msg="Send the answer again.")
+                raise
+            started = getattr(self, "_started_jobs", None)
+            if started is not None:
+                started.add(job_id)
 
             final_state, interrupted, interrupt_value = await self._execute_workflow_stream(
-                Command(resume=answers),
+                None if after_restart else Command(resume=answers),
                 issue_id,
                 job_id,
                 state_sink=streamed_state,
@@ -916,6 +1123,10 @@ class IssueExecutor:
                 await self._cleanup_sandbox(final_state, job_id)
 
         except SandboxReenrollError as exc:
+            if after_restart:
+                # #307: there is no pause to go back to; fail like any other error.
+                await self._fail_resume(issue_id, job_id, exc, final_state, streamed_state)
+                return
             # The sandbox exists but could not be re-enrolled (a proxy restarting).
             # Nothing ran and the checkpoint still holds the pause, so the job keeps
             # its sandbox and can be resumed again.
@@ -923,38 +1134,121 @@ class IssueExecutor:
             await self._jobs.update(job_id, status=prior_job_status or "paused")
             await self._issues.update(issue_id, status=prior_issue_status or "open")
         except Exception as exc:
-            logger.error("pipeline_resume_failed", issue_id=issue_id, job_id=job_id, error=str(exc))
-            from embry0.safety.error_codes import classify_failure
-
-            code = classify_failure(exc=exc, stage=(final_state or streamed_state or {}).get("current_stage"))
-            last_state = final_state or streamed_state or None
-            # #349: a resumed run that raised after pushing its branch still
-            # gets its PR; the carried facts (#482) name the branch.
-            pr_url, _ = await self._open_fallback_pr(issue_id, job_id, last_state or {}, error_code=code.value)
-            await self._jobs.update(
-                job_id,
-                status="failed",
-                error_message=str(exc),
-                error_code=code.value,
-                total_cost_usd=await resolve_job_total_cost(
-                    getattr(self, "_traces", None),
-                    job_id,
-                    float((last_state or {}).get("total_cost_usd") or 0.0),
-                ),
-                budget_overrun_usd=_executor_run._overrun_of(exc, last_state),
-                **({"pr_url": pr_url} if pr_url else {}),
-            )
-            await self._finish_credential_uses(job_id, error_code=code.value)
-            if pr_url:
-                await self._record_pr_opened(issue_id, job_id, pr_url)
-            await self._issues.update(issue_id, status="open")
-            # A resumed job owns a sandbox too, and this path never destroyed
-            # it — invisible until `hard` mode started raising mid-run.
-            await self._cleanup_sandbox(last_state, job_id)
+            await self._fail_resume(issue_id, job_id, exc, final_state, streamed_state)
         finally:
+            started = getattr(self, "_started_jobs", None)
+            if started is not None:
+                started.discard(job_id)
             if slot is not None:
                 slot.release()
             await self._post_tracker_outcome(issue_id, job_id)
+
+    async def _fail_resume(
+        self,
+        issue_id: str | None,
+        job_id: str,
+        exc: Exception,
+        final_state: dict[str, Any] | None,
+        streamed_state: dict[str, Any],
+    ) -> None:
+        """A resume raised: fail the job, open its fallback PR, free its sandbox."""
+        logger.error("pipeline_resume_failed", issue_id=issue_id, job_id=job_id, error=str(exc))
+        from embry0.safety.error_codes import classify_failure
+
+        code = classify_failure(exc=exc, stage=(final_state or streamed_state or {}).get("current_stage"))
+        last_state = final_state or streamed_state or None
+        # #349: a resumed run that raised after pushing its branch still
+        # gets its PR; the carried facts (#482) name the branch.
+        pr_url, _ = await self._open_fallback_pr(issue_id, job_id, last_state or {}, error_code=code.value)
+        await self._jobs.update(
+            job_id,
+            status="failed",
+            error_message=str(exc),
+            error_code=code.value,
+            total_cost_usd=await resolve_job_total_cost(
+                getattr(self, "_traces", None),
+                job_id,
+                float((last_state or {}).get("total_cost_usd") or 0.0),
+            ),
+            budget_overrun_usd=_executor_run._overrun_of(exc, last_state),
+            **({"pr_url": pr_url} if pr_url else {}),
+        )
+        await self._finish_credential_uses(job_id, error_code=code.value)
+        if pr_url:
+            await self._record_pr_opened(issue_id, job_id, pr_url)
+        await self._issues.update(issue_id, status="open")
+        # A resumed job owns a sandbox too, and this path never destroyed
+        # it — invisible until `hard` mode started raising mid-run.
+        await self._cleanup_sandbox(last_state, job_id)
+
+    def resume_after_restart(self, job: Mapping[str, Any]) -> asyncio.Task[Any]:
+        """Continue a job the previous orchestrator left ``running`` from its
+        last checkpoint (#307). ``job`` is a row from boot recovery."""
+        job_id = str(job["job_id"])
+        issue_id = job.get("issue_id")
+
+        async def run() -> None:
+            await self._announce_recovery(
+                job_id, "Resumed: embry0 restarted during this job, which goes on from its last checkpoint."
+            )
+            await self.resume(issue_id, job_id, None, after_restart=True)
+
+        return self._track_task(run(), kind="restart_resume", job_id=job_id, issue_id=issue_id, run_slot=False)
+
+    def relaunch(self, job: Mapping[str, Any]) -> asyncio.Task[Any]:
+        """Start again, from the beginning, a job the previous orchestrator left
+        ``pending`` or ``running`` before its graph began (#307), from the
+        launch record on its row. ``job`` is a row from boot recovery."""
+        job_id = str(job["job_id"])
+        return self._track_task(
+            self._relaunch(job_id, dict(job.get("launch") or {})),
+            kind="restart_relaunch",
+            job_id=job_id,
+            issue_id=job.get("issue_id"),
+        )
+
+    async def _relaunch(self, job_id: str, launch: dict[str, Any]) -> None:
+        await self._announce_recovery(job_id, "Restarted: embry0 restarted before this job got going; it starts now.")
+        runner = launch.get("runner")
+        if runner == "qa":
+            await self._run_qa_workflow(
+                job_id,
+                repo=str(launch.get("repo") or ""),
+                branch=str(launch.get("branch") or ""),
+                qa_overrides=dict(launch.get("qa_overrides") or {}),
+                agent_models=launch.get("agent_models"),
+            )
+            return
+        if runner == "onboard":
+            await self._run_onboard_workflow(
+                job_id,
+                repo=str(launch.get("repo") or ""),
+                branch=str(launch.get("branch") or ""),
+                skip_smoke=bool(launch.get("skip_smoke")),
+                agent_models=launch.get("agent_models"),
+            )
+            return
+        issue_id = launch.get("issue_id")
+        issue = (await self._issues.get(issue_id)) if issue_id else launch.get("issue")
+        if not issue:
+            from embry0.safety.error_codes import ErrorCode
+
+            await self._jobs.fail_jobs(
+                [job_id],
+                ErrorCode.ORPHANED.value,
+                "Orchestrator restarted and the job's issue no longer exists; nothing to start.",
+            )
+            return
+        await self._run_workflow(
+            issue_id, job_id, issue, additional_context=str(launch.get("additional_context") or "")
+        )
+
+    async def _announce_recovery(self, job_id: str, message: str) -> None:
+        logger.info("job_recovered_after_restart", job_id=job_id)
+        try:
+            await self._broadcast_event(job_id, {"type": "system", "message": message})
+        except Exception:
+            logger.warning("job_recovery_event_failed", job_id=job_id, exc_info=True)
 
     async def resume_for_issue(self, issue_id: str) -> None:
         """Resume the latest awaiting_input job for ``issue_id``.

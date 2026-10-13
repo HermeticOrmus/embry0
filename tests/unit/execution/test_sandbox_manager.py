@@ -52,9 +52,13 @@ def _permissive_isolation() -> MagicMock:
 
 @pytest.fixture(autouse=True)
 def _stub_isolation_unless_overridden(monkeypatch):
+    """Stub both rule sets that name proxy addresses: the isolation chain and,
+    for refresh_proxy_policy (#568), the shared egress exceptions."""
+    from embry0.execution.runtime import DockerRuntime
     from embry0.execution.runtime import isolation as isolation_mod
 
     monkeypatch.setattr(isolation_mod, "SandboxIsolation", MagicMock(return_value=_permissive_isolation()))
+    monkeypatch.setattr(DockerRuntime, "refresh_egress", AsyncMock(return_value=[]))
 
 
 @pytest.fixture
@@ -435,6 +439,8 @@ async def test_create_passes_resolved_token_to_enroll_sandbox(monkeypatch):
         # #521: the git-proxy forwards to where the sandbox clones from, read only by default.
         git_upstream="https://github.com",
         git_push=False,
+        git_push_branches=(),
+        job_id="job-repo",
     )
 
 
@@ -591,7 +597,7 @@ async def test_create_with_egress_allowlist_applies_rules(manager: SandboxManage
         egress_allowlist=["192.168.1.10", "api.anthropic.com"],
     )
     assert container_id == "container-abc123"
-    fake_enforcer.apply.assert_awaited_once_with("172.20.0.9", ["192.168.1.10", "api.anthropic.com"])
+    fake_enforcer.apply.assert_awaited_once_with("172.20.0.9", ["192.168.1.10", "api.anthropic.com"], proxy_ips=[])
 
 
 def _enforcer_with_addresses(addresses: dict[str, object]) -> MagicMock:
@@ -635,12 +641,14 @@ async def test_egress_rules_except_the_proxies_on_the_egress_network(manager: Sa
         profile={"extra_networks": ["sandbox-internet"]},
         egress_allowlist=["192.168.1.10"],
     )
-    enforcer.apply.assert_awaited_once_with("172.20.0.9", ["192.168.1.10", "172.20.0.2", "172.20.0.5", "172.20.0.6"])
+    enforcer.apply.assert_awaited_once_with(
+        "172.20.0.9", ["192.168.1.10"], proxy_ips=["172.20.0.2", "172.20.0.5", "172.20.0.6"]
+    )
 
     # With no allowlist the proxies are still excepted, and nothing else is.
     enforcer.apply.reset_mock()
     await manager.create(job_id="job-proxies-2", profile={"extra_networks": ["sandbox-internet"]})
-    enforcer.apply.assert_awaited_once_with("172.20.0.9", ["172.20.0.2", "172.20.0.5", "172.20.0.6"])
+    enforcer.apply.assert_awaited_once_with("172.20.0.9", [], proxy_ips=["172.20.0.2", "172.20.0.5", "172.20.0.6"])
 
 
 @pytest.mark.asyncio
@@ -662,7 +670,7 @@ async def test_a_proxy_whose_address_cannot_be_read_is_left_out(manager: Sandbox
 
     container_id, _tok = await manager.create(job_id="job-proxy-gone", profile={"extra_networks": ["sandbox-internet"]})
     assert container_id == "container-abc123"
-    enforcer.apply.assert_awaited_once_with("172.20.0.9", ["172.20.0.5"])
+    enforcer.apply.assert_awaited_once_with("172.20.0.9", [], proxy_ips=["172.20.0.5"])
 
 
 @pytest.mark.asyncio
@@ -684,7 +692,7 @@ async def test_a_proxy_manager_without_the_list_adds_no_exception(monkeypatch):
     monkeypatch.setattr(egress_mod, "EgressEnforcer", MagicMock(return_value=enforcer))
 
     await bare.create(job_id="job-bare", profile={"extra_networks": ["sandbox-internet"]})
-    enforcer.apply.assert_awaited_once_with("172.20.0.9", [])
+    enforcer.apply.assert_awaited_once_with("172.20.0.9", [], proxy_ips=[])
 
 
 @pytest.mark.asyncio
@@ -709,7 +717,7 @@ async def test_create_on_sandbox_internet_applies_private_drop_without_allowlist
     )
     assert container_id == "container-abc123"
     applied = fake_enforcer.apply.await_args_list
-    assert applied == [call("172.20.0.9", [])], (
+    assert applied == [call("172.20.0.9", [], proxy_ips=[])], (
         "joining sandbox-internet with egress_allowlist=None must apply the "
         "private-range drop for that container's sandbox-internet IP and an "
         f"empty destination list; got {applied!r}"

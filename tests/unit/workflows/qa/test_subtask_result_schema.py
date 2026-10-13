@@ -106,6 +106,5 @@ def _r(app_name: str, status: SubTaskStatus, duration_ms: int = 0) -> SubTaskRes
         status=status,
         duration_ms=duration_ms,
         cache_hits=CacheHits(),
-        trace_url=None,
         failure_summary=None,
     )

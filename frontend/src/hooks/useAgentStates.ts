@@ -274,13 +274,22 @@ export function useAgentStates(
 
     // If the job is in a terminal state, mark any "running" agents as failed
     // (they were orphaned by an orchestrator restart or crash and never completed).
-    const terminalStatuses = new Set(["failed", "cancelled", "expired", "completed", "pr_merged", "pr_closed"]);
+    const terminalStatuses = new Set([
+      "failed",
+      "cancelled",
+      "expired",
+      "completed",
+      "pr_merged",
+      "pr_closed",
+      "skipped",
+    ]);
     if (jobStatus && terminalStatuses.has(jobStatus)) {
       for (const agent of agents) {
         if (agent.status === "running") {
-          agent.status = jobStatus === "completed" || jobStatus === "pr_merged" ? "completed" : "failed";
+          const ok = jobStatus === "completed" || jobStatus === "pr_merged" || jobStatus === "skipped";
+          agent.status = ok ? "completed" : "failed";
           if (!agent.summary) {
-            agent.summary = jobStatus === "completed" ? "" : "Agent did not complete (orphaned)";
+            agent.summary = ok ? "" : "Agent did not complete (orphaned)";
           }
         }
       }

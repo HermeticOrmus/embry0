@@ -85,15 +85,46 @@ export async function getQaResult(jobId: string, attemptN: number): Promise<QARe
   return data;
 }
 
-export function artifactUrl(jobId: string, path: string): string {
-  // The browser follows the 302 to a presigned GET; safe for <img>, <a>, etc.
-  return `/api/v1/jobs/${jobId}/artifacts/${path}`;
+function encodePath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
 }
 
-export function latestScreenshotUrl(jobId: string, cacheBuster: number = 0): string {
-  return `/api/v1/jobs/${jobId}/artifacts/screenshots/latest?_t=${cacheBuster}`;
+/**
+ * axios path (no `/api/v1` prefix) to the bytes of one artifact of one
+ * attempt, e.g. an acceptance criterion's evidence file.
+ *
+ * Artifact bytes always come through the orchestrator (#541): the
+ * `/jobs/{id}/artifacts/...` routes answer with a 302 to a presigned GET on
+ * the storage endpoint, which is compose-internal and unreachable from a
+ * browser. Those redirects are for sandbox and agent callers only. Fetch
+ * these paths with `api.get(..., { responseType: "blob" })` so the Bearer
+ * header is attached, then hand the browser a blob: URL.
+ */
+export function attemptArtifactPath(jobId: string, attemptN: number, path: string): string {
+  return `/jobs/${encodeURIComponent(jobId)}/qa/attempts/${attemptN}/artifacts/${encodePath(path)}`;
 }
 
-export function logStreamUrl(jobId: string, service: string): string {
-  return `/api/v1/jobs/${jobId}/artifacts/logs/${encodeURIComponent(service)}?follow=true`;
+/** axios path to the bytes of the job's newest screenshot (any attempt). */
+export function latestScreenshotPath(jobId: string): string {
+  return `/jobs/${encodeURIComponent(jobId)}/qa/screenshots/latest`;
+}
+
+/** Fetch artifact bytes through the authenticated client as a Blob. */
+export async function fetchArtifactBlob(path: string): Promise<Blob> {
+  const { data } = await api.get<Blob>(path, { responseType: "blob" });
+  return data;
+}
+
+/**
+ * Mint a short-lived token that opens this job's live log stream (#634).
+ * EventSource cannot send an Authorization header, so the stream URL carries
+ * this job-scoped token instead — never the API key.
+ */
+export async function mintLogStreamToken(jobId: string): Promise<string> {
+  const { data } = await api.post<{ token: string }>(`/jobs/${jobId}/qa/log-stream-token`);
+  return data.token;
+}
+
+export function logStreamUrl(jobId: string, service: string, token: string): string {
+  return `/api/v1/jobs/${jobId}/artifacts/logs/${encodeURIComponent(service)}?follow=true&token=${encodeURIComponent(token)}`;
 }

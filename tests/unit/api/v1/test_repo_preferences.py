@@ -300,11 +300,9 @@ async def test_get_preferences_returns_the_stored_base_branch(app):
 
 
 @pytest.mark.asyncio
-async def test_put_without_base_branch_clears_the_stored_value(app):
-    """PUT replaces the whole row — omitting base_branch sends NULL, exactly as
-    omitting notes or dev_checks does. The dashboard compensates by carrying
-    every field it does not edit (see RepoPreferencesSection.handleSave), so
-    this pins the convention rather than inventing a merge for one field."""
+async def test_put_without_base_branch_leaves_it_alone(app):
+    """#350: PUT is a partial update — an omitted base_branch is not sent to
+    the repository at all, so the stored value survives; null clears it."""
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.put(
@@ -313,8 +311,7 @@ async def test_put_without_base_branch_clears_the_stored_value(app):
             headers={"X-Requested-With": "XMLHttpRequest"},
         )
     assert resp.status_code == 200
-    assert resp.json()["base_branch"] is None
-    assert app.state.repo_preferences_repo.upsert.await_args.kwargs["base_branch"] is None
+    assert app.state.repo_preferences_repo.upsert.await_args.kwargs == {"language_hint": "rust"}
 
 
 # ── verification (#298/#299) ─────────────────────────────────────────────
@@ -339,7 +336,7 @@ async def test_put_accepts_a_verification_config(app):
 @pytest.mark.asyncio
 async def test_put_without_verification_leaves_it_alone_and_empty_object_clears(app):
     await _put(app, {"notes": "x"})
-    assert app.state.repo_preferences_repo.upsert.await_args.kwargs["verification"] is None
+    assert "verification" not in app.state.repo_preferences_repo.upsert.await_args.kwargs
     await _put(app, {"verification": {}})
     assert app.state.repo_preferences_repo.upsert.await_args.kwargs["verification"] == {}
 

@@ -84,3 +84,35 @@ async def test_revoke_only_once():
     repo = ApiKeysRepository(db)
     assert await repo.revoke("key-x") is None
     assert "revoked_at IS NULL" in db.fetchrow.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_create_binds_the_allowlist_and_stores_empty_as_null():
+    db = MagicMock()
+    db.fetchrow = AsyncMock(return_value=_fake_row(allowed_repos=["acme/widgets"]))
+    repo = ApiKeysRepository(db)
+    row, _ = await repo.create(name="k", scope="read", user_id=None, created_by="t", allowed_repos=["acme/widgets"])
+    assert "allowed_repos" in db.fetchrow.call_args.args[0]
+    assert db.fetchrow.call_args.args[9] == ["acme/widgets"]
+    assert row.allowed_repos == ("acme/widgets",)
+
+    await repo.create(name="k", scope="read", user_id=None, created_by="t", allowed_repos=[])
+    assert db.fetchrow.call_args.args[9] is None, "an empty list must be stored as NULL (unrestricted)"
+
+
+@pytest.mark.asyncio
+async def test_a_row_without_the_column_is_unrestricted():
+    db = MagicMock()
+    db.fetchrow = AsyncMock(return_value=_fake_row())
+    row = await ApiKeysRepository(db).get("key-abc123def456")
+    assert row is not None and row.allowed_repos is None
+
+
+@pytest.mark.asyncio
+async def test_set_allowed_repos_updates_and_stores_empty_as_null():
+    db = MagicMock()
+    db.fetchrow = AsyncMock(return_value=_fake_row(allowed_repos=None))
+    repo = ApiKeysRepository(db)
+    await repo.set_allowed_repos("key-x", [])
+    sql, key_id, value = db.fetchrow.call_args.args
+    assert "UPDATE api_keys SET allowed_repos" in sql and key_id == "key-x" and value is None

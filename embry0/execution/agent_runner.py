@@ -137,6 +137,20 @@ def _diagnose(output: AgentOutput, stderr_text: str) -> AgentOutput:
     return output
 
 
+# #354: stderr that says the runner died in Python before the agent started.
+# A bad interpreter invocation or a missing / inconsistent baked module (a
+# partial image refresh: new agent_runner.py beside an old embry0/safety/)
+# fails here, before the runner's own error handling can report anything.
+_START_CRASH_MARKERS = ("Traceback (most recent call last)", "ImportError", "ModuleNotFoundError", "No module named")
+
+
+def _is_start_crash(exit_code: int | None, stdout_lines: int, stderr: str) -> bool:
+    """The sandbox could not start the agent: a non-zero exit before the
+    runner wrote one stdout line (it emits events from its first action),
+    with Python's own failure on stderr."""
+    return bool(exit_code) and stdout_lines == 0 and any(marker in stderr for marker in _START_CRASH_MARKERS)
+
+
 # #304 stale-image fallback. Linux caps ONE argv string at MAX_ARG_STRLEN
 # (128 KiB); stay well under it so `docker exec` framing never tips it over.
 _ARGV_FALLBACK_MAX_BYTES = 100 * 1024
@@ -461,6 +475,17 @@ class AgentRunner:
                 return output
 
             trailing = redact_secrets(stderr_text.strip()[-1500:], secret_env_values())
+            if _is_start_crash(proc.returncode, line_count, stderr_text):
+                # #354: not "the agent returned nothing" — it never started.
+                return AgentOutput(
+                    agent_type=config.get("agent_type", "unknown"),
+                    is_error=True,
+                    error_message=(
+                        f"The sandbox could not start the agent: the runner exited {proc.returncode} "
+                        f"before its first event; runner stderr: {trailing}"
+                    ),
+                    error_code=ErrorCode.SANDBOX_AGENT_START_FAILED.value,
+                )
             msg = "No final result received from sandbox"
             if trailing:
                 msg = f"{msg}; runner stderr: {trailing}"

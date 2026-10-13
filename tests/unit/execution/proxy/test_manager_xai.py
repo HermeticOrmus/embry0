@@ -23,7 +23,7 @@ async def _manager(monkeypatch):
         captured.append(kwargs)
         body = kwargs.get("body") or {}
         if "allowed_repos" in body:  # a current forge API proxy echoes its scope (#520), git-proxy its grant (#521)
-            return {k: body[k] for k in ("allowed_repos", "git_upstream", "git_push") if k in body}
+            return {k: body[k] for k in ("allowed_repos", "git_upstream", "git_push", "git_push_branches") if k in body}
         return {"credentials": {}}
 
     monkeypatch.setattr(pm, "_exec_admin_request", fake_exec)

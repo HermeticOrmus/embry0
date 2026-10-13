@@ -47,3 +47,20 @@ async def test_none_keeps_token_gates(monkeypatch):
     assert "git-proxy" in launched and "github-proxy" in launched and "gitlab-proxy" not in launched
     launched = await _started(monkeypatch)
     assert "git-proxy" not in launched
+
+
+async def test_context_proxy_receives_the_redaction_fields(monkeypatch):
+    """#294: an operator's PII field names must reach the proxy that redacts
+    drill-down results; the proxy starts happily without them, so pin it."""
+    pm = ProxyManager(docker=MagicMock(run_cmd=AsyncMock(return_value="")), proxy_admin_token="x" * 20)
+    pm._http = MagicMock()
+    envs: dict[str, dict[str, str]] = {}
+
+    async def fake_launch(*, name, env, attach_internet):
+        envs[name] = env
+
+    monkeypatch.setattr(pm, "_launch", fake_launch)
+    await pm.start(
+        enable_context_proxy=True, context_container_allowlist="svc-a", log_redaction_fields="phone,customer_name"
+    )
+    assert envs["context-proxy"].get("LOG_REDACTION_FIELDS") == "phone,customer_name", envs["context-proxy"]

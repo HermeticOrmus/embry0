@@ -58,16 +58,6 @@ export function QaAppResultCard({ app, repo, runId }: Props) {
         <div className="flex items-center gap-3 text-sm text-white/60">
           <span>{formatDuration(app.duration_ms)}</span>
           <CacheHitsRow hits={app.cache_hits} />
-          {app.trace_url && (
-            <a
-              href={app.trace_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-xs text-cyan-300 hover:underline"
-            >
-              trace
-            </a>
-          )}
         </div>
         {app.failure_summary && (
           <p

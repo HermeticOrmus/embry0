@@ -16,6 +16,7 @@ from typing import Any
 import structlog
 
 from embry0.storage.database import DatabasePool
+from embry0.storage.repo_renames import repo_slug_variants
 
 logger = structlog.get_logger(__name__)
 
@@ -155,6 +156,24 @@ class ReposRepository:
                 '{"repo": "<path>", "forge": "gitlab"} or the MCP repo_register tool).'
             )
         return self._default_forge
+
+    async def registered_as(self, repo: str) -> str | None:
+        """The ``repos`` row ``repo`` is registered under, or None (#360).
+
+        Looked up under every spelling the repo may carry — the slug itself,
+        its current name and each old name ``REPO_RENAMES`` maps to it — and
+        case-insensitively, as the forges treat paths. A repo registered
+        before a rename, or a tracker stamp still naming the old slug, is
+        therefore still registered. An inactive row counts: ``active=false``
+        hides a repo from listings, it does not unregister it.
+        """
+        spellings = {repo.lower(), *(slug.lower() for slug in repo_slug_variants(repo))}
+        row = await self._db.fetchrow(
+            "SELECT repo FROM repos WHERE lower(repo) = ANY($1::text[]) ORDER BY lower(repo) = $2 DESC, repo LIMIT 1",
+            sorted(spellings),
+            repo.lower(),
+        )
+        return str(row["repo"]) if row else None
 
     async def delete(self, repo: str) -> None:
         """Hard delete — cascades to repo_qa_configs. Env/preference rows are

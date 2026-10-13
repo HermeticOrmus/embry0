@@ -10,7 +10,7 @@ import asyncio
 import ipaddress
 import re
 import socket
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
 import structlog
@@ -200,6 +200,23 @@ class SandboxManager:
         async with self._isolation_lock:
             return await self._runtime.ensure_isolation(proxies)
 
+    async def refresh_proxy_policy(self) -> None:
+        """Rewrite every rule that names a proxy address, for the proxies running now (#568).
+
+        The proxies are recreated at every orchestrator start (and when one
+        is found stopped), and Docker may give them new addresses. Two rule
+        sets name those addresses, both shared by every sandbox: the egress
+        exceptions on ``sandbox-internet`` and the isolation chain on
+        ``sandbox-restricted``. Egress first, so the isolation jump that
+        ``ensure_isolation`` moves to the top stays above any sandbox rule
+        the egress refresh re-inserts. Raises when either cannot be written.
+        """
+        internet = getattr(self._proxy_manager, "internet_proxies", None)
+        launched = getattr(self._proxy_manager, "launched_proxies", None)
+        async with self._isolation_lock:
+            await self._runtime.refresh_egress(list(internet()) if callable(internet) else [])
+            await self._runtime.ensure_isolation(list(launched()) if callable(launched) else [])
+
     async def _docker_access_granted(self, profile: dict[str, Any], repo: str | None, job_id: str) -> bool:
         """Whether this sandbox gets the shared Docker daemon (#522).
 
@@ -379,12 +396,14 @@ class SandboxManager:
         llm_providers: Iterable[str] = (),
         parent_job_id: str | None = None,
         git_push: bool = False,
+        git_push_branches: Sequence[str] = (),
     ) -> tuple[str, str]:
         """Create a persistent sandbox container. Returns (container_id, sandbox_token).
 
         ``git_push`` lets the sandbox push to ``repo`` through the git-proxy
         (#521). Only a sandbox whose job pushes a branch asks for it; every
-        other sandbox can clone and fetch ``repo`` and nothing more.
+        other sandbox can clone and fetch ``repo`` and nothing more. Its pushes
+        may create or update only ``git_push_branches`` (#559).
 
         ``volumes`` is an optional list of ``(volume_name, mount_point)`` pairs.
         Each pair is translated to a ``--mount type=volume,source=<vol>,target=<mp>``
@@ -649,6 +668,8 @@ class SandboxManager:
                 repo=repo,
                 git_upstream=self._git_upstream(forge),
                 git_push=git_push,
+                git_push_branches=git_push_branches,
+                job_id=job_id,
             )
         except RuntimeError as exc:
             logger.error("sandbox_enroll_failed_rolling_back", container=name, error=str(exc))
@@ -769,13 +790,15 @@ class SandboxManager:
         xai_credential_id: str | None,
         context_scope: bool | list[str] | None,
         git_push: bool = False,
+        git_push_branches: Sequence[str] = (),
     ) -> None:
         """Give a paused job's existing sandbox its proxy access back, under a fresh bearer (#476).
 
         The proxies hold enrollments in memory, expire them after 24 h, and are
         recreated on every orchestrator start, so a paused sandbox has usually
         lost its bearer by the time the job resumes. This enrolls the container
-        with every proxy as ``create`` did (``git_push`` as at create), then
+        with every proxy as ``create`` did (``git_push`` as at create, and
+        ``git_push_branches`` as the job's state names them now), then
         writes the new bearer where the sandbox reads it: the xAI token file,
         git's proxy config (which also replaces the credential helper of a
         sandbox created before #521), and the context-proxy token when the job
@@ -809,13 +832,14 @@ class SandboxManager:
         except CredentialUnavailableError as exc:
             raise SandboxInitError(str(exc), error_code=ErrorCode.CREDENTIAL_UNAVAILABLE) from exc
 
-        # #554: the proxies were likely recreated since this sandbox started;
-        # the chain must allow their addresses now. Transient like the rest.
+        # #554, #568: the proxies were likely recreated since this sandbox
+        # started; the isolation chain and the egress exceptions must allow
+        # their addresses now. Transient like the rest.
         try:
-            await self.ensure_isolation()
+            await self.refresh_proxy_policy()
         except Exception as exc:  # noqa: BLE001 — the job stays paused, with its sandbox
             raise SandboxReenrollError(
-                f"sandbox {container} could not be re-enrolled: isolation chain not in place: {exc}",
+                f"sandbox {container} could not be re-enrolled: proxy rules not in place: {exc}",
                 error_code=ErrorCode.SANDBOX_INIT,
             ) from exc
 
@@ -831,6 +855,8 @@ class SandboxManager:
                 repo=repo,
                 git_upstream=self._git_upstream(forge),
                 git_push=git_push,
+                git_push_branches=git_push_branches,
+                job_id=job_id,
             )
             if getattr(proxy, "xai_proxy_url", ""):
                 await self._docker.run_cmd(
@@ -974,6 +1000,25 @@ class SandboxManager:
             logger.warning("sandbox_rm_failed", container=container)
 
         logger.info("sandbox_destroyed", container=container)
+
+    async def stop_agent(self, container: str) -> bool:
+        """Kill the agent runner left running in ``container``; True if one was.
+
+        The orchestrator drives an agent through a `docker exec` client, and
+        killing that client does not kill the runner inside: an orchestrator
+        that stops mid-turn leaves the agent working, and spending, on its own
+        (#307). A drain calls this on the jobs it stopped, and a resume after
+        a restart calls it before running the agent again, so two never share
+        one workspace. pkill exits 1 when nothing matched: False, not an error.
+        """
+        try:
+            await self._docker.run_cmd(
+                self._docker.build_exec_cmd(container, ["pkill", "-f", "embry0.sandbox.runner"]), timeout=10
+            )
+        except RuntimeError:
+            return False
+        logger.info("sandbox_agent_stopped", container=container)
+        return True
 
     async def connect_network(self, container: str, network: str) -> None:
         """Connect sandbox to an additional network."""

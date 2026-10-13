@@ -52,7 +52,7 @@ edge then dispatches to ``triage`` (failed under cap), ``qa_exhausted``
 (passed/exhausted).
 """
 
-from typing import Any
+from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
@@ -91,6 +91,16 @@ async def _branch_qa_orchestrator_node(state: dict[str, Any], config: RunnableCo
     with no review step). Standalone QA (``QAWorkflow``) keeps deployed apps.
     """
     qa = {**(state.get("qa") or {}), "exclude_deployed_apps": True}
+    # #468: the template's QA step config (model, tools, skills) reaches the
+    # QA agent the way the developer's and reviewer's step configs reach
+    # theirs. Sub-task states are built fresh per app, so it rides the
+    # configurable the sub-tasks inherit; qa_node hands it to run_agent_node.
+    from embry0.workflows.issue_to_pr.route_plan import step_template_config
+
+    step_config = step_template_config(state, "qa")
+    if step_config:
+        configurable = {**((config or {}).get("configurable") or {}), "qa_template_config": step_config}
+        config = cast(RunnableConfig, {**(config or {}), "configurable": configurable})
     return await qa_orchestrator_node({**state, "qa": qa}, config)
 
 

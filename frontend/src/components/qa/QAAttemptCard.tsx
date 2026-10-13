@@ -67,7 +67,11 @@ export function QAAttemptCard({ jobId, attempt }: Props): JSX.Element {
                 </ul>
               </div>
             )}
-            <QAAcceptanceResults jobId={jobId} results={result.acceptance_results} />
+            <QAAcceptanceResults
+              jobId={jobId}
+              attemptN={attempt.attempt_n}
+              results={result.acceptance_results}
+            />
           </div>
         ) : null}
       </CardContent>

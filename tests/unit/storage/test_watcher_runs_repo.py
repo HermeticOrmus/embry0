@@ -260,3 +260,23 @@ def test_a_quiet_tick_is_the_one_verdict_that_is_not_an_analysis():
     assert ANALYSED_ACTIONS < VERDICT_ACTIONS < WATCHER_ACTIONS
     for never_a_verdict in ("skipped_backlog", "skipped_analysis_cap", "skipped_unparseable", "error"):
         assert never_a_verdict not in VERDICT_ACTIONS, never_a_verdict
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_action_is_recorded_as_an_error_naming_it():
+    # #347: the tick's last write must not raise and lose the whole row.
+    db = MagicMock()
+    db.execute = AsyncMock()
+    repo = WatcherRunsRepository(db)
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    try:
+        run_id = await repo.create(now, now, "brand_new_action", log_lines=7, detail="what the tick saw")
+    except ValueError as exc:
+        pytest.fail(f"an unknown action must still produce a row, not raise: {exc}")
+    assert run_id.startswith("wr-")
+    _sql, *args = db.execute.await_args.args
+    action, detail = args[4], args[5]
+    assert action == "error", f"unknown action should be stored as 'error', got {action!r}"
+    assert "brand_new_action" in detail and "what the tick saw" in detail, detail

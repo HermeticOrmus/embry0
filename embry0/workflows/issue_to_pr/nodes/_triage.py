@@ -197,6 +197,12 @@ async def triage_node(state: dict[str, Any], config: RunnableConfig) -> dict[str
         triage_agent_definition["model"] = model
     elif not triage_agent_definition.get("model"):
         triage_agent_definition["model"] = model
+    # #468: a template the job named up front is known before triage runs,
+    # so its triage node's config (model, tools, skills) applies here the way
+    # a step's config applies to its agent.
+    from embry0.workflows.issue_to_pr.plan_route import pinned_triage_template_config
+
+    triage_template_config = await pinned_triage_template_config(state, templates_repo)
 
     # Collect agent events locally so we can scan for agent_ask_user events
     # after the agent finishes. We still forward every event to the graph
@@ -260,6 +266,7 @@ async def triage_node(state: dict[str, Any], config: RunnableConfig) -> dict[str
         agent_type="triage",
         prompt=prompt,
         agent_definition=triage_agent_definition,
+        template_config=triage_template_config,
         timeout_seconds=180,
         on_event=_forward_event,
         credentials=credentials,
@@ -298,6 +305,7 @@ async def triage_node(state: dict[str, Any], config: RunnableConfig) -> dict[str
                 + (" — including the qa_failure_action." if qa_failure_block else ".")
             ),
             agent_definition=triage_agent_definition,
+            template_config=triage_template_config,
             max_turns=DECIDE_NOW_MAX_TURNS,
             timeout_seconds=180,
             on_event=_forward_event,
@@ -342,15 +350,36 @@ async def triage_node(state: dict[str, Any], config: RunnableConfig) -> dict[str
     if result.get("agent_outputs"):
         last = result["agent_outputs"][-1]
         if not last.get("is_error"):
+            from typing import cast as _cast
+
+            from embry0.orchestration.nodes.triage import apply_job_config_overrides
             from embry0.orchestration.state import TriageParseError
             from embry0.safety.error_codes import ErrorCode
 
+            parsed: Any
             try:
-                from typing import cast as _cast
-
-                triage_dict: dict[str, Any] = _cast(dict[str, Any], parse_triage_response(last.get("output", "")))
-                from embry0.orchestration.nodes.triage import apply_job_config_overrides
-
+                parsed = parse_triage_response(last.get("output", ""))
+            except TriageParseError as first_error:
+                # #455: one schema slip gets one repair turn, not a failed job.
+                result, parsed = await _repair_triage_decision(
+                    error=first_error,
+                    state=state,
+                    result=result,
+                    full_prompt=prompt,
+                    agent_runner=agent_runner,
+                    agent_definition=triage_agent_definition,
+                    on_event=_forward_event,
+                    credentials=credentials,
+                    config=config,
+                    agent_sessions_repo=agent_sessions_repo,
+                    prior_session=resume_session,
+                    writer=writer,
+                    template_config=triage_template_config,
+                )
+            try:
+                if isinstance(parsed, Exception):
+                    raise parsed
+                triage_dict: dict[str, Any] = _cast(dict[str, Any], parsed)
                 result["pipeline_config"] = apply_job_config_overrides(triage_dict.get("pipeline_config") or {}, state)
                 result["triage_decision"] = triage_dict
                 result["current_stage"] = "triage_complete"
@@ -531,6 +560,7 @@ async def triage_node(state: dict[str, Any], config: RunnableConfig) -> dict[str
             agent_type="triage",
             prompt=rerun_prompt,
             agent_definition=triage_agent_definition,
+            template_config=triage_template_config,
             timeout_seconds=180,
             on_event=_forward_event,
             credentials=credentials,
@@ -702,6 +732,7 @@ async def triage_node(state: dict[str, Any], config: RunnableConfig) -> dict[str
                 full_prompt=prompt,
                 agent_runner=agent_runner,
                 agent_definition=triage_agent_definition,
+                template_config=triage_template_config,
                 on_event=_forward_event,
                 credentials=credentials,
                 config=config,
@@ -721,7 +752,9 @@ async def triage_node(state: dict[str, Any], config: RunnableConfig) -> dict[str
     # catches exact ticket matches). Validate the flag against the open-PR
     # list the executor injected: an unknown number is ignored with a
     # warning (never fail a job on a bad dup flag). Skip+link is the house
-    # default policy — the job ends as a SUCCESS linking the existing PR.
+    # default policy: the job ends ``skipped`` (#474) and the executor links
+    # the existing PR to the case — never to the job's own ``pr_url``, which
+    # is what says a job opened a PR (_skip_as_duplicate).
     _final_decision = result.get("triage_decision") or {}
     _dup_flag = _final_decision.get("duplicate_of_pr") if isinstance(_final_decision, dict) else None
     if isinstance(_dup_flag, dict) and _dup_flag.get("pr_number") is not None:
@@ -732,8 +765,10 @@ async def triage_node(state: dict[str, Any], config: RunnableConfig) -> dict[str
         if _dup_match is not None:
             _dup_reason = str(_dup_flag.get("reason") or "").strip()
             _dup_summary = (
-                f"Skipped: triage judged this task a duplicate of open PR "
-                f"#{_dup_match['number']} ({_dup_match['url']})." + (f" {_dup_reason}" if _dup_reason else "")
+                f"Skipped: a pull request for this issue already exists: #{_dup_match['number']} "
+                f"({_dup_match['url']}); triage judged this task a duplicate of it."
+                + (f" {_dup_reason}" if _dup_reason else "")
+                + " No new pull request was opened; review or merge the existing one instead."
             )
             logger.info(
                 "triage_flagged_duplicate_pr",
@@ -748,7 +783,6 @@ async def triage_node(state: dict[str, Any], config: RunnableConfig) -> dict[str
                 update={
                     **result,
                     "current_stage": "skipped_duplicate",
-                    "pr_url": _dup_match["url"],
                     "result_summary": _dup_summary,
                 },
             )
@@ -790,7 +824,7 @@ def _route_qa_failure_action(
         → ``Command(goto="developer", update={...})`` with
         ``developer_prompt_addendum`` and ``developer_focus_files`` set.
       - ``{"kind": "rerun_qa", "reason": str}``
-        → ``Command(goto="init_qa", update={"qa_rerun_reason": ...})``
+        → ``Command(goto="init_orchestrator", update={"qa_rerun_reason": ...})``
         (re-enters the QA subpath without changing the developer's diff).
       - ``{"kind": "ask_user", "question": str}``
         → ``Command(goto="ask_user_interrupt", update={...})`` with the
@@ -892,12 +926,11 @@ def _route_qa_failure_action(
     )
 
 
-async def _repair_qa_failure_action(
+async def _rerun_triage_once(
     *,
-    invalid: Any,
     state: dict[str, Any],
     result: dict[str, Any],
-    triage_decision: dict[str, Any],
+    repair_block: str,
     full_prompt: str,
     agent_runner: Any,
     agent_definition: dict[str, Any],
@@ -906,36 +939,24 @@ async def _repair_qa_failure_action(
     config: RunnableConfig,
     agent_sessions_repo: Any,
     prior_session: Any,
-    writer: Any,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Re-run triage ONCE with the validation error fed back (#304).
+    event_prefix: str,
+    template_config: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """One repair turn of triage: ``repair_block`` sent on the conversation
+    that produced the rejected answer (#304, #455).
 
-    Returns ``(result, triage_decision)`` for ``_route_qa_failure_action`` to
-    validate again. Only the ``qa_failure_action`` is taken from the repair
-    answer — the pipeline_config / QA decision of the original answer stand,
-    so a repair turn can never silently re-plan the job. The repair run's
-    output and cost are always folded into ``result``; when the run errors or
-    its answer holds no action object, the original (invalid) decision is returned
-    unchanged and the caller terminates with ERR_TRIAGE_QA_ACTION_INVALID.
-    Not a loop: the caller invokes this at most once per triage entry.
+    Resumes that conversation so the turn is a cheap delta (EMB-35); without
+    a resumable session the full prompt is replayed ahead of the block. The
+    repair run's output and cost are always folded into the returned result.
+    Returns ``(merged_result, repair_output)``; ``repair_output`` is None when
+    the run errored or produced nothing. Not a loop: each caller invokes it
+    at most once per triage entry.
     """
     from typing import Literal, cast
 
     from embry0.agents.session import AgentSession, merged_resume_messages, session_resumable
-    from embry0.workflows.issue_to_pr.nodes._qa_failure_action import build_repair_prompt, extract_repaired_action
 
     job_id = state.get("job_id", "")
-    logger.warning(
-        "triage_qa_failure_action_repair_retry",
-        job_id=job_id,
-        reason=invalid.reason,
-        error=invalid.detail[:300],
-    )
-    writer({"type": "progress", "message": "Triage's qa_failure_action failed validation — asking once for a fix"})
-
-    # Resume the conversation that produced the invalid answer so the repair
-    # turn is a cheap delta (EMB-35); without a resumable session, replay the
-    # full prompt ahead of the repair block.
     first_outputs = list(result.get("agent_outputs") or [])
     last = first_outputs[-1] if first_outputs else {}
     mode = cast(
@@ -950,7 +971,6 @@ async def _repair_qa_failure_action(
         session_id=last.get("session_id"),
         session_blob=last.get("session_blob"),
     )
-    repair_block = build_repair_prompt(invalid)
     resumable = session_resumable(session)
 
     repair = await _nodes.run_agent_node(
@@ -959,6 +979,7 @@ async def _repair_qa_failure_action(
         agent_type="triage",
         prompt=repair_block if resumable else f"{full_prompt}\n\n{repair_block}",
         agent_definition=agent_definition,
+        template_config=template_config,
         max_turns=DECIDE_NOW_MAX_TURNS,
         timeout_seconds=180,
         on_event=on_event,
@@ -975,12 +996,8 @@ async def _repair_qa_failure_action(
 
     repair_last = repair_outputs[-1] if repair_outputs else None
     if not repair_last or repair_last.get("is_error"):
-        logger.warning("triage_qa_failure_action_repair_run_failed", job_id=job_id)
-        return merged, triage_decision
-    repaired_action = extract_repaired_action(repair_last.get("output", ""))
-    if repaired_action is None:
-        logger.warning("triage_qa_failure_action_repair_unparseable", job_id=job_id)
-        return merged, triage_decision
+        logger.warning(f"{event_prefix}_repair_run_failed", job_id=job_id)
+        return merged, None
 
     if agent_sessions_repo is not None:
         new_messages = merged_resume_messages(session, repair_last.get("messages"))
@@ -997,10 +1014,151 @@ async def _repair_qa_failure_action(
                 )
             except Exception:
                 logger.warning("triage_session_persist_failed", job_id=job_id, exc_info=True)
+    return merged, repair_last
+
+
+async def _repair_qa_failure_action(
+    *,
+    invalid: Any,
+    state: dict[str, Any],
+    result: dict[str, Any],
+    triage_decision: dict[str, Any],
+    full_prompt: str,
+    agent_runner: Any,
+    agent_definition: dict[str, Any],
+    on_event: Any,
+    credentials: dict[str, str],
+    config: RunnableConfig,
+    agent_sessions_repo: Any,
+    prior_session: Any,
+    writer: Any,
+    template_config: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Re-run triage ONCE with the validation error fed back (#304).
+
+    Returns ``(result, triage_decision)`` for ``_route_qa_failure_action`` to
+    validate again. Only the ``qa_failure_action`` is taken from the repair
+    answer — the pipeline_config / QA decision of the original answer stand,
+    so a repair turn can never silently re-plan the job. The repair run's
+    output and cost are always folded into ``result``; when the run errors or
+    its answer holds no action object, the original (invalid) decision is returned
+    unchanged and the caller terminates with ERR_TRIAGE_QA_ACTION_INVALID.
+    Not a loop: the caller invokes this at most once per triage entry.
+    """
+    from embry0.workflows.issue_to_pr.nodes._qa_failure_action import build_repair_prompt, extract_repaired_action
+
+    job_id = state.get("job_id", "")
+    logger.warning(
+        "triage_qa_failure_action_repair_retry",
+        job_id=job_id,
+        reason=invalid.reason,
+        error=invalid.detail[:300],
+    )
+    writer({"type": "progress", "message": "Triage's qa_failure_action failed validation — asking once for a fix"})
+
+    merged, repair_last = await _rerun_triage_once(
+        state=state,
+        result=result,
+        repair_block=build_repair_prompt(invalid),
+        full_prompt=full_prompt,
+        agent_runner=agent_runner,
+        agent_definition=agent_definition,
+        template_config=template_config,
+        on_event=on_event,
+        credentials=credentials,
+        config=config,
+        agent_sessions_repo=agent_sessions_repo,
+        prior_session=prior_session,
+        event_prefix="triage_qa_failure_action",
+    )
+    if repair_last is None:
+        return merged, triage_decision
+    repaired_action = extract_repaired_action(repair_last.get("output", ""))
+    if repaired_action is None:
+        logger.warning("triage_qa_failure_action_repair_unparseable", job_id=job_id)
+        return merged, triage_decision
 
     fixed_decision = {**triage_decision, "qa_failure_action": repaired_action}
     merged["triage_decision"] = fixed_decision
     return merged, fixed_decision
+
+
+# #455: how much of the rejected answer the repair turn quotes back.
+_REJECTED_DECISION_PREVIEW_CHARS = 4000
+
+
+def _decision_repair_prompt(error: str, rejected: str) -> str:
+    """The one-shot repair turn for a triage answer that failed to parse.
+    Self-contained — on the non-resumable path the model has no memory of
+    what it sent."""
+    return (
+        "Your triage decision was rejected and NOT applied. This is what you sent:\n"
+        f"{rejected[-_REJECTED_DECISION_PREVIEW_CHARS:]}\n\n"
+        "It failed with:\n"
+        f"  {error[:1500]}\n\n"
+        "Do not investigate further. Reply with ONLY your complete, corrected triage decision as one JSON "
+        "object, exactly as instructed previously: every required field present, no fields the schema does not "
+        "define, and nothing before or after the JSON."
+    )
+
+
+async def _repair_triage_decision(
+    *,
+    error: Exception,
+    state: dict[str, Any],
+    result: dict[str, Any],
+    full_prompt: str,
+    agent_runner: Any,
+    agent_definition: dict[str, Any],
+    on_event: Any,
+    credentials: dict[str, str],
+    config: RunnableConfig,
+    agent_sessions_repo: Any,
+    prior_session: Any,
+    writer: Any,
+    template_config: dict[str, Any] | None,
+) -> tuple[dict[str, Any], Any]:
+    """Re-ask triage ONCE for a decision that failed to parse (#455).
+
+    One omitted field (a missing ``confidence``) used to fail the whole job
+    with ERR_TRIAGE_MALFORMED — for a watcher analysis job, a paid tick
+    recorded as an error. The model gets the validation error and its own
+    answer back and one chance to correct it, the pattern the QA failure
+    action uses (#304). Returns ``(result, decision)``: ``decision`` is the
+    parsed repair answer, or the TriageParseError that still stands — the
+    caller fails the job with it. The repair run's output and cost are in
+    ``result`` either way.
+    """
+    from embry0.orchestration.nodes.triage import parse_triage_response
+    from embry0.orchestration.state import TriageParseError
+
+    job_id = state.get("job_id", "")
+    rejected = str(((result.get("agent_outputs") or [{}])[-1]).get("output") or "")
+    logger.warning("triage_decision_repair_retry", job_id=job_id, error=str(error)[:300])
+    writer({"type": "progress", "message": "Triage's decision failed validation — asking once for a fix"})
+
+    merged, repair_last = await _rerun_triage_once(
+        state=state,
+        result=result,
+        repair_block=_decision_repair_prompt(str(error), rejected),
+        full_prompt=full_prompt,
+        agent_runner=agent_runner,
+        agent_definition=agent_definition,
+        on_event=on_event,
+        credentials=credentials,
+        config=config,
+        agent_sessions_repo=agent_sessions_repo,
+        prior_session=prior_session,
+        event_prefix="triage_decision",
+        template_config=template_config,
+    )
+    if repair_last is None:
+        return merged, error
+    try:
+        return merged, parse_triage_response(repair_last.get("output", ""))
+    except TriageParseError as again:
+        logger.warning("triage_decision_repair_rejected", job_id=job_id, error=str(again)[:300])
+        return merged, again
 
 
 def _extract_qa_decision_from_triage_dict(

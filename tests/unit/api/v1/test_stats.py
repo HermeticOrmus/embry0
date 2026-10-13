@@ -127,6 +127,7 @@ async def test_stats_report_job_outcome_and_delivery_apart(db_with_migrations):
         ("failed", "none", None),
         ("running", "pr_open", "pr/1"),  # same PR as the open one above
         ("partial", "none", None),
+        ("skipped", "none", None),  # #474: did no work — out of the rates
     ]
     for n, (status, delivery, pr_url) in enumerate(rows):
         await db.execute(
@@ -143,14 +144,14 @@ async def test_stats_report_job_outcome_and_delivery_apart(db_with_migrations):
         data = (await client.get("/api/v1/stats")).json()
 
     # existing keys keep their meaning
-    assert (data["total_jobs"], data["completed"], data["failed"], data["partial"]) == (10, 2, 3, 1)
-    assert (data["job_succeeded"], data["cancelled"]) == (4, 1)
+    assert (data["total_jobs"], data["completed"], data["failed"], data["partial"]) == (11, 2, 3, 1)
+    assert (data["job_succeeded"], data["cancelled"], data["skipped"]) == (4, 1, 1)
     assert data["job_success_rate"] == pytest.approx(0.4)
     assert data["success_rate"] == pytest.approx(0.6)  # 4 succeeded + 2 delivered despite their status
     # Jobs and PRs are counted apart: 3 job rows are `merged` but they are
     # only 2 distinct pull requests, and the merge rate is a PR rate.
     assert data["delivery"] == {
-        "none": 3,
+        "none": 4,
         "pr_open": 2,
         "merged": 3,
         "closed": 2,

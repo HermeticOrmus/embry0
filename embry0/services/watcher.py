@@ -27,12 +27,19 @@ analyses had no cost before and so no budget of their own; they now have one
 (``WATCHER_MAX_FULL_CAP_ANALYSES_PER_DAY``, counted from ``watcher_runs``).
 Every finding, recurrence, released draft and deploy marker is also reported
 to the ledger (#278), fail-open: the ledger never stops a tick.
+
+Nothing raw leaves (#294): the analysis task is redacted as a whole before it
+is dispatched, every briefing item is redacted before it is cut, and the
+model's verdict — the draft's title and body, its rationale and memory — is
+redacted as it is parsed, so the ticket, the ledger and the notifications all
+carry the redacted text (``embry0/safety/redaction.py``, log-text profile).
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import re
 import uuid
@@ -46,6 +53,7 @@ import structlog
 from embry0.config_redaction import mask_url_credentials
 from embry0.metrics import NULL_METRICS, LoopMetrics
 from embry0.orchestration import dispatch_actors
+from embry0.safety.redaction import redact_bounded, redact_log_text
 from embry0.services.healing.deploys import DeployMarker, parse_deploy_marker
 from embry0.services.healing.recorder import DEFERRED_EXPIRED_NOTE, DEFERRED_UNRECOVERABLE_NOTE
 from embry0.services.healing.service import TrackerRef
@@ -75,7 +83,7 @@ from embry0.trackers.filing import DRAFT_TITLE_PREFIX
 
 logger = structlog.get_logger(__name__)
 
-_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "partial", "expired"}
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "partial", "expired", "skipped"}
 _POLL_SECONDS = 20
 # #335: consecutive failures to record a tick attempt before the watcher calls
 # itself unhealthy. No mark, no tick (a tick that cannot be recorded would be
@@ -360,6 +368,17 @@ def parse_verdict(text: str) -> dict[str, Any]:
                 memory.append((slug, summary))
             if len(memory) >= _MAX_MEMORY_LINES:
                 break
+    # #294: the model quotes log lines; what it wrote is filed in a tracker,
+    # stored, announced and fed back into later briefings — redact it once here.
+    if proposal is not None:
+        proposal = {
+            **proposal,
+            "title": redact_log_text(proposal["title"]),
+            "body": redact_log_text(proposal["body"]),
+        }
+    if rationale is not None:
+        rationale = redact_log_text(rationale)
+    memory = [(slug, redact_log_text(summary)) for slug, summary in memory]
     return {"kind": kind, "proposal": proposal, "reason": reason, "rationale": rationale, "memory": memory}
 
 
@@ -396,6 +415,10 @@ def _fresh_entries(entries: Sequence[LogEntry], prior: dict[str, Any]) -> list[L
         if seen is None or entry.timestamp is None or entry.timestamp > seen:
             fresh.append(entry)
     return fresh
+
+
+async def _no_refusal(_repo: str) -> None:
+    return None
 
 
 class WatcherService:
@@ -793,7 +816,9 @@ class WatcherService:
             sha = str(c.get("sha") or "")[:7]
             commit = c.get("commit") or {}
             date = str(((commit.get("committer") or {}).get("date")) or "")
-            subject = str(commit.get("message") or "").splitlines()[0][:100] if commit.get("message") else ""
+            subject = (
+                redact_bounded(str(commit.get("message") or "").splitlines()[0], 100) if commit.get("message") else ""
+            )
             out.append(f"commit {sha} {date} {subject}")
         return out
 
@@ -814,7 +839,7 @@ class WatcherService:
                     continue
                 what = f"recreated {m.group(1)} container(s)"
             else:
-                what = line.strip()[:_DEPLOY_MARKER_CHARS]
+                what = redact_bounded(line.strip(), _DEPLOY_MARKER_CHARS)
                 if not what:
                     continue
             when = datetime.fromtimestamp(int(ts) / 1e9, tz=UTC).strftime("%Y-%m-%d %H:%M")
@@ -930,7 +955,7 @@ class WatcherService:
         open_lines = (
             None
             if open_issues is None
-            else [f"- {i['identifier']} [{i['state']}] {i['title'][:100]}" for i in open_issues]
+            else [f"- {i['identifier']} [{i['state']}] {redact_bounded(i['title'], 100)}" for i in open_issues]
         )
         finding_lines = (
             None
@@ -938,14 +963,17 @@ class WatcherService:
             else [
                 f"- {f['created_at']:%Y-%m-%d %H:%M} {f['action']}"
                 + (f" [{f['fingerprint']}]" if f.get("fingerprint") else "")
-                + f": {(f.get('rationale') or f.get('detail') or 'no rationale recorded')[:200]}"
+                + f": {redact_bounded(f.get('rationale') or f.get('detail') or 'no rationale recorded', 200)}"
                 for f in findings
             ]
         )
         pattern_lines = (
             None
             if patterns is None
-            else [f"- {p['fingerprint']}: {p['summary'][:200]} (confirmed {p['occurrences']}x)" for p in patterns]
+            else [
+                f"- {p['fingerprint']}: {redact_bounded(p['summary'], 200)} (confirmed {p['occurrences']}x)"
+                for p in patterns
+            ]
         )
         change_lines: list[str] | None
         if commits is None and deploys is None:
@@ -1282,6 +1310,10 @@ class WatcherService:
 
     async def _run_analysis_job(self, task: str) -> dict[str, Any] | None:
         """Dispatch an issue-less analysis job and poll it to a terminal state."""
+        # #294: this text is the prompt, and the job row stores it. The items
+        # cut to a length were redacted before the cut; this pass covers the
+        # whole of it — the raw excerpt lines above all.
+        task = redact_log_text(task)
         trace_id = f"trc-{uuid.uuid4().hex[:12]}"
         # RAV-1140: the context dict is the one job-creation channel that is
         # watcher-writable but not user-spoofable (JobContext is extra="forbid",
@@ -1495,6 +1527,15 @@ class WatcherService:
                 # Reachable via POST /watcher/run with WATCHER_ENABLED=false,
                 # the one case the config validator does not cover (#270).
                 return await record("error", detail="WATCHER_LOGQL not configured")
+            # #360: an analysis job carries the stack's repo, and embry0 runs
+            # no job for a repo it holds no registry row for. Refused here,
+            # before logs are fetched or an analysis paid for. isinstance, not
+            # truthiness: test doubles answer any attribute.
+            refusal = getattr(self._executor, "unregistered_repo_refusal", _no_refusal)(self._repo)
+            if inspect.isawaitable(refusal):
+                refusal = await refusal
+            if isinstance(refusal, str):
+                return await record("error", detail=refusal[:500])
 
             try:
                 window_days = self._config.watcher_proposal_window_days
@@ -1617,7 +1658,7 @@ class WatcherService:
 
                 excerpt_block = "\n".join(lines)
                 if clusters and self._clustering_mode() == "on":
-                    excerpt_block = format_cluster_table(clusters)
+                    excerpt_block = format_cluster_table(clusters, redact=redact_log_text)
 
                 task = _ANALYSIS_TASK_TEMPLATE.format(
                     window_start=window_start.strftime("%Y-%m-%d %H:%M"),

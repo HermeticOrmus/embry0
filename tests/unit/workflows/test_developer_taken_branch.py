@@ -214,10 +214,15 @@ async def test_a_developer_that_reports_the_earlier_branch_cannot_claim_it() -> 
 
 
 @pytest.mark.asyncio
-async def test_only_the_earlier_branch_is_refused_not_any_reported_branch() -> None:
-    """The guard is that narrow: a branch the developer names otherwise is still taken at its word."""
+async def test_no_reported_branch_replaces_the_jobs_own() -> None:
+    """Since #559 no reported branch is taken at its word, not only the earlier one.
+
+    The git-proxy lets this sandbox push only its own branch, so another
+    branch the developer names holds none of its work, and a resume would
+    enroll whatever state records.
+    """
     docker = _Docker(heads=_taken())
 
     _, update = await _run(_state(), docker, reports="embry0/its-own-idea")
 
-    assert update["branch_name"] == "embry0/its-own-idea", update["branch_name"]
+    assert update["branch_name"] == OWN, update["branch_name"]

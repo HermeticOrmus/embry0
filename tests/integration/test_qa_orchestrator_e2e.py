@@ -98,7 +98,6 @@ async def test_e2e_three_apps_two_pass_one_fails(monkeypatch):
                 status=SubTaskStatus.QA_FAILURE,
                 duration_ms=2200,
                 cache_hits=CacheHits(),
-                trace_url="https://x/companion-trace.zip",
                 failure_summary="customer list did not render",
             )
         return SubTaskResult(
@@ -144,7 +143,6 @@ async def test_e2e_three_apps_two_pass_one_fails(monkeypatch):
     assert by_app["companion"]["status"] == "qa_failure"
     assert by_app["hub"]["status"] == "passed"
     assert by_app["lane"]["status"] == "passed"
-    assert by_app["companion"]["trace_url"] == "https://x/companion-trace.zip"
 
 
 @pytest.mark.asyncio
@@ -184,7 +182,6 @@ async def test_e2e_qa_report_writes_comment(monkeypatch):
                         "turbo_remote_hits": [],
                         "turbo_remote_misses": [],
                     },
-                    "trace_url": None,
                     "failure_summary": None,
                     "raw_result": {},
                 },
@@ -198,7 +195,6 @@ async def test_e2e_qa_report_writes_comment(monkeypatch):
                         "turbo_remote_hits": [],
                         "turbo_remote_misses": [],
                     },
-                    "trace_url": "https://x/trace.zip",
                     "failure_summary": "loads page did not render",
                     "raw_result": {},
                 },

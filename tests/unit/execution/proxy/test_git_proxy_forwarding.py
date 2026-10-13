@@ -77,6 +77,7 @@ async def _enroll_job(proxy: TestClient, forge: FakeForge, *, push: bool, **over
         "allowed_repos": [REPO],
         "git_upstream": forge.origin,  # type: ignore[attr-defined]
         "git_push": push,
+        "git_push_branches": ["feature"] if push else None,
         **overrides,
     }
     return await enroll(proxy, "sbx-1", BEARER, **fields)

@@ -94,10 +94,11 @@ async def test_dev_checks_round_trip(prefs_repo: RepoPreferencesRepository):
     checks = [{"name": "python", "paths": ["ml"], "command": "cd ml && poetry run pytest -q"}]
     row = await prefs_repo.upsert(repo="acme/crm", dev_checks=checks)
     assert row["dev_checks"] == checks
-    # Omitting dev_checks on a later upsert resets to [] (full-row semantics,
-    # same as every other repo_preferences field).
+    # Omitting dev_checks on a later upsert keeps them (#350); None clears.
     row2 = await prefs_repo.upsert(repo="acme/crm", sandbox_profile="dev-python")
-    assert row2["dev_checks"] == []
+    assert row2["dev_checks"] == checks
+    row3 = await prefs_repo.upsert(repo="acme/crm", dev_checks=None)
+    assert row3["dev_checks"] == []
 
 
 @pytest.mark.asyncio
@@ -146,3 +147,40 @@ async def test_an_empty_object_clears_verification(prefs_repo: RepoPreferencesRe
     assert (await prefs_repo.upsert(repo="acme/app", verification={}))["verification"] is None
     # …and a fresh row without one stores SQL NULL, not JSON null.
     assert (await prefs_repo.upsert(repo="acme/new"))["verification"] is None
+
+
+# ── partial update (#350) ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_an_upsert_naming_one_field_leaves_the_others_untouched(prefs_repo: RepoPreferencesRepository):
+    checks = [{"name": "py", "paths": [], "command": "pytest -q"}]
+    full = {
+        "sandbox_profile": "python-3.12",
+        "language_hint": "python",
+        "notes": "keep me",
+        "execution_mode": "cli",
+        "auth_mode": "oauth",
+        "git_author_name": "Bot",
+        "git_author_email": "bot@example.com",
+        "dev_checks": checks,
+        "base_branch": "dev",
+        "verification": _VERIFICATION,
+    }
+    await prefs_repo.upsert(repo="acme/partial", **full)
+    row = await prefs_repo.upsert(repo="acme/partial", language_hint="rust")
+    kept = {k: row[k] for k in full}
+    assert kept == {**full, "language_hint": "rust"}, f"fields wiped by a one-field upsert: {kept}"
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_none_clears_a_field(prefs_repo: RepoPreferencesRepository):
+    await prefs_repo.upsert(repo="acme/clear", base_branch="dev", notes="n", verification=_VERIFICATION)
+    row = await prefs_repo.upsert(repo="acme/clear", base_branch=None, notes=None, verification=None)
+    assert (row["base_branch"], row["notes"], row["verification"]) == (None, "", None)
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_field_is_refused(prefs_repo: RepoPreferencesRepository):
+    with pytest.raises(TypeError, match="repo; DROP"):
+        await prefs_repo.upsert(repo="acme/x", **{"repo; DROP": "x"})

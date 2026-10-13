@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, field_validator
 
+from embry0.api.repo_allowlist import enforce_repo_allowlist
 from embry0.api.schemas.repo_path import validate_repo_path
 from embry0.services.bootstrap import BootstrapError, bootstrap_repo
 
@@ -42,6 +43,7 @@ class BootstrapRequest(BaseModel):
 
 @router.post("/repos/bootstrap")
 async def bootstrap(req: BootstrapRequest, request: Request) -> dict[str, Any]:
+    await enforce_repo_allowlist(request, req.repo, action="bootstrap a repository")
     config = request.app.state.config
     try:
         result = await bootstrap_repo(

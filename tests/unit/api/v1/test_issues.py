@@ -283,80 +283,108 @@ async def test_triage_surfaces_a_failed_dispatch(api_client, monkeypatch):
     assert body["status"] == "open"
 
 
-# ---- credential registry: cancelling an issue closes its jobs' use ledger ----
+# ---- DELETE /issues/{id} stops its active jobs through the executor (#449) ----
 
 
-def _delete_issue_request(credentials_repo):
+def _delete_issue_request(executor):
     request = MagicMock()
-    request.app.state.credentials_repo = credentials_repo
+    request.app.state.issue_executor = executor
     request.app.state.config = MagicMock(audit_log_path=None)
     request.app.state.db = MagicMock()
     return request
 
 
-def _delete_issue_repos():
+def _delete_issue_repos(job_rows, order):
+    async def _issue_update(issue_id, **kw):
+        order.append(("issue", issue_id, kw.get("status")))
+
     issues = MagicMock(
-        get=AsyncMock(return_value={"id": "iss-1", "status": "open"}),
-        get_children=AsyncMock(return_value=[]),
+        get=AsyncMock(return_value={"id": "iss-1", "status": "in_progress"}),
+        get_children=AsyncMock(return_value=[{"id": "iss-child"}]),
+        update=AsyncMock(side_effect=_issue_update),
+    )
+    jobs = MagicMock(
+        list_all=AsyncMock(side_effect=lambda issue_id, **kw: (job_rows.get(issue_id, []), 0)),
         update=AsyncMock(),
     )
+    return issues, jobs
+
+
+@pytest.mark.asyncio
+async def test_delete_issue_cancels_every_active_job_through_the_executor(monkeypatch):
+    import embry0.api.v1.issues as issues_mod
+
+    monkeypatch.setattr(issues_mod, "emit_audit", AsyncMock())
+    monkeypatch.setattr(issues_mod, "_actor", lambda request: "tester")
     order: list[tuple] = []
+    statuses = ["pending", "running", "awaiting_input", "paused", "completed", "failed", "cancelled"]
+    job_rows = {
+        "iss-1": [{"job_id": f"job-{s}", "status": s} for s in statuses],
+        "iss-child": [{"job_id": "job-child", "status": "running"}],
+    }
+    issues, jobs = _delete_issue_repos(job_rows, order)
 
-    async def _update(job_id, **kw):
-        order.append(("update", job_id, kw.get("status")))
+    async def _cancel(job_id, *, actor):
+        order.append(("cancel_job", job_id, actor))
 
-    jobs = MagicMock(
-        list_all=AsyncMock(
-            return_value=([{"job_id": "job-1", "status": "running"}, {"job_id": "job-2", "status": "completed"}], 2)
-        ),
-        update=AsyncMock(side_effect=_update),
+    executor = MagicMock(cancel_job=AsyncMock(side_effect=_cancel))
+
+    await issues_mod.delete_issue("iss-1", _delete_issue_request(executor), issues=issues, jobs=jobs)
+
+    cancelled = [e[1] for e in order if e[0] == "cancel_job"]
+    assert cancelled == ["job-pending", "job-running", "job-awaiting_input", "job-paused", "job-child"], (
+        f"executor.cancel_job not called for every active job: {order}"
     )
-    return issues, jobs, order
+    assert all(e[2] == "tester" for e in order if e[0] == "cancel_job")
+    jobs.update.assert_not_awaited()
+    # cancel_job reopens the job's issue, so the issues are cancelled last.
+    assert order[-2:] == [("issue", "iss-child", "cancelled"), ("issue", "iss-1", "cancelled")], order
 
 
 @pytest.mark.asyncio
-async def test_delete_issue_stamps_cancelled_credential_uses(monkeypatch):
+async def test_delete_issue_stops_a_running_job_task_and_its_sandbox(monkeypatch):
+    """End to end through the real IssueExecutor.cancel_job: the job's live
+    workflow task is cancelled and its sandbox destroyed, not just the row."""
+    import asyncio
+
     import embry0.api.v1.issues as issues_mod
+    import embry0.orchestration.checkpoint as ckpt_mod
+    import embry0.services.issue_executor as exec_mod
+    from embry0.api.events.bus import EventBus
+    from embry0.services.issue_executor import IssueExecutor
 
     monkeypatch.setattr(issues_mod, "emit_audit", AsyncMock())
     monkeypatch.setattr(issues_mod, "_actor", lambda request: "tester")
-    issues, jobs, order = _delete_issue_repos()
+    monkeypatch.setattr(exec_mod, "emit_audit", AsyncMock())
+    monkeypatch.setattr(ckpt_mod, "purge_thread", AsyncMock())
 
-    async def _finish(job_id, outcome):
-        order.append(("finish", job_id, outcome))
+    order: list[tuple] = []
+    issues, jobs = _delete_issue_repos({"iss-1": [{"job_id": "job-1", "status": "running"}]}, order)
+    jobs.get = AsyncMock(return_value={"job_id": "job-1", "issue_id": "iss-1"})
 
-    repo = MagicMock(finish_uses=AsyncMock(side_effect=_finish))
+    executor = IssueExecutor.__new__(IssueExecutor)
+    executor._background_tasks = set()
+    executor._tasks_by_job = {}
+    executor._event_bus = EventBus()
+    executor._database_url = "postgres://stub"
+    executor._audit_log_path = None
+    executor._db = MagicMock()
+    executor._jobs = jobs
+    executor._issues = issues
+    executor._sandbox = MagicMock(destroy=AsyncMock())
 
-    await issues_mod.delete_issue("iss-1", _delete_issue_request(repo), issues=issues, jobs=jobs)
+    started = asyncio.Event()
 
-    # Only the job the route actually cancelled is stamped, after its write.
-    assert order == [("update", "job-1", "cancelled"), ("finish", "job-1", "cancelled")], order
+    async def _workflow() -> None:
+        started.set()
+        await asyncio.sleep(30)
 
+    task = executor._track_task(_workflow(), kind="workflow", job_id="job-1")
+    await started.wait()
 
-@pytest.mark.asyncio
-async def test_delete_issue_survives_credential_ledger_failure(monkeypatch):
-    import embry0.api.v1.issues as issues_mod
+    await issues_mod.delete_issue("iss-1", _delete_issue_request(executor), issues=issues, jobs=jobs)
 
-    monkeypatch.setattr(issues_mod, "emit_audit", AsyncMock())
-    monkeypatch.setattr(issues_mod, "_actor", lambda request: "tester")
-    issues, jobs, _ = _delete_issue_repos()
-    repo = MagicMock(finish_uses=AsyncMock(side_effect=RuntimeError("db down")))
-
-    await issues_mod.delete_issue("iss-1", _delete_issue_request(repo), issues=issues, jobs=jobs)
-
-    repo.finish_uses.assert_awaited_once_with("job-1", "cancelled")
-    issues.update.assert_any_await("iss-1", status="cancelled")
-
-
-@pytest.mark.asyncio
-async def test_delete_issue_without_credentials_repo(monkeypatch):
-    import embry0.api.v1.issues as issues_mod
-
-    monkeypatch.setattr(issues_mod, "emit_audit", AsyncMock())
-    monkeypatch.setattr(issues_mod, "_actor", lambda request: "tester")
-    issues, jobs, order = _delete_issue_repos()
-    request = _delete_issue_request(None)
-
-    await issues_mod.delete_issue("iss-1", request, issues=issues, jobs=jobs)
-
-    assert order == [("update", "job-1", "cancelled")]
+    assert task.cancelled(), "the running job's workflow task was left running"
+    executor._sandbox.destroy.assert_awaited_once_with("sandbox-job-1")
+    jobs.update.assert_any_await("job-1", status="cancelled")
+    assert order[-1] == ("issue", "iss-1", "cancelled"), order

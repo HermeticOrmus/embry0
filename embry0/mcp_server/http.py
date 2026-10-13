@@ -6,7 +6,7 @@ https://<host>/mcp --header "Authorization: Bearer <key>"``.
 
 Auth model: the service itself holds NO credential. Every incoming MCP
 request must carry ``Authorization: Bearer <key>``; the middleware stashes
-it in a contextvar and :class:`embry0_mcp.client.Embry0Client` forwards it
+it in a contextvar and :class:`embry0.mcp_server.client.Embry0Client` forwards it
 upstream per request, so the orchestrator enforces the caller's own key and
 scope on every tool call. A request without a bearer is rejected at the
 door — the tool surface is not enumerable anonymously.
@@ -19,8 +19,8 @@ import os
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from embry0_mcp.client import caller_bearer
-from embry0_mcp.server import mcp
+from embry0.mcp_server.client import caller_bearer
+from embry0.mcp_server.server import mcp
 
 _UNAUTHORIZED_BODY = b'{"error":"unauthorized","detail":"Authorization: Bearer <embry0 API key> is required"}'
 

@@ -24,7 +24,10 @@
 #                           from the root .env (the watcher's own Loki); empty =
 #                           no marker, said out loud.
 #   EMBRY0_DEPLOY_DRY_RUN=1 print the marker line instead of pushing it.
-#   EMBRY0_DEPLOY_FORCE=1   deploy even while a job is running (a recreate kills it).
+#   EMBRY0_DEPLOY_FORCE=1   deploy even while a job is running. The recreate
+#                           interrupts it: the orchestrator drains, and the
+#                           job resumes from its last checkpoint when the new
+#                           one starts, re-running the node it was in (#307).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -99,7 +102,7 @@ if [ "${EMBRY0_DEPLOY_FORCE-}" != "1" ] && [ -n "$api_key" ]; then
   running="$(curl -fsS -m 5 -H "Authorization: Bearer $api_key" \
     "http://localhost:$port/api/v1/jobs?status=running&limit=1" 2>/dev/null | grep -c '"job_id"' || true)"
   if [ "${running:-0}" != "0" ]; then
-    echo "deploy: a job is running and a recreate would kill it — wait, or EMBRY0_DEPLOY_FORCE=1" >&2
+    echo "deploy: a job is running; a recreate interrupts it and it resumes after, re-running its current step — wait, or EMBRY0_DEPLOY_FORCE=1" >&2
     exit 1
   fi
 fi

@@ -263,14 +263,22 @@ async def _apply_pr_labels(
         logger.warning("pr_label_failed", repo=repo, pr_number=pr_number, labels=labels, error=str(exc))
 
 
+class OpenPRListError(RuntimeError):
+    """The open-PR listing failed, so nobody can say which PRs exist (#305).
+
+    An empty list would read as "no open PRs" and let a job open a duplicate
+    of one that does exist; the caller fails closed on this instead.
+    """
+
+
 class OpenPRService:
     """Lists a repo's open PRs with pre-extracted issue references.
 
     Fetches orchestrator-side (per-repo token via the credential resolver
     when one is wired, else ``resolve_for_repo``, same as every other GitHub
     client here) — the sandbox never needs to
-    query PRs itself. ``list_open_prs`` NEVER raises: any failure logs and
-    returns [] so callers stay fail-open by construction.
+    query PRs itself. ``list_open_prs`` raises :class:`OpenPRListError` when
+    the forge cannot answer (#305): "could not list" is not "none open".
     """
 
     def __init__(
@@ -305,10 +313,23 @@ class OpenPRService:
             raw = resp.json()
         except Exception as exc:
             logger.warning("open_pr_list_failed", repo=repo, error=str(exc))
-            return []
+            # Only the failure's type reaches the message: it lands on the
+            # job row, and an HTTP error's text carries the request URL.
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            detail = f"HTTP {status}" if status else type(exc).__name__
+            raise OpenPRListError(
+                f"could not list the open pull requests of {repo} ({detail}); "
+                "the duplicate-PR check cannot run, so the job stopped rather than risk a second PR"
+            ) from exc
+        if not isinstance(raw, list):
+            logger.warning("open_pr_list_malformed", repo=repo, payload_type=type(raw).__name__)
+            raise OpenPRListError(
+                f"the open pull request listing of {repo} was not a list; "
+                "the duplicate-PR check cannot run, so the job stopped rather than risk a second PR"
+            )
 
         prs: list[dict[str, Any]] = []
-        for item in raw if isinstance(raw, list) else []:
+        for item in raw:
             if not isinstance(item, dict):
                 continue
             head_ref = ((item.get("head") or {}).get("ref")) or ""

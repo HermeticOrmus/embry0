@@ -11,6 +11,7 @@ from structlog.testing import capture_logs
 
 from embry0.storage.database import DatabasePool
 from embry0.storage.migrations.runner import MIGRATIONS, run_migrations
+from tests.fixtures.postgres import postgres_unavailable
 
 
 @pytest.fixture
@@ -31,7 +32,7 @@ async def scratch_database_url() -> AsyncIterator[str]:
     try:
         sys_conn = await asyncpg.connect(sys_url)
     except (OSError, asyncpg.PostgresError) as exc:
-        pytest.skip(f"PostgreSQL unavailable: {exc}")
+        postgres_unavailable(exc)
 
     try:
         await sys_conn.execute(f"CREATE DATABASE {db_name}")

@@ -24,6 +24,23 @@ class DisabledModelError(ValueError):
     """An explicitly-selected model is disabled in provider settings."""
 
 
+class UnpricedModelError(ValueError):
+    """A model routes to a provider whose price table does not list it (#219)."""
+
+
+def ensure_models_priced(models: Iterable[str]) -> None:
+    """Raise UnpricedModelError if any of ``models`` would run unmetered.
+
+    Needs no provider settings, so unlike the enablement check it never
+    fails open.
+    """
+    from embry0.agents.providers import unpriced_models, unpriced_models_message
+
+    unpriced = unpriced_models(models)
+    if unpriced:
+        raise UnpricedModelError(unpriced_models_message(unpriced))
+
+
 async def get_disabled_models(provider_repo: Any) -> set[str]:
     cfg = await provider_repo.get()
     return set(cfg.get("disabled_models") or [])

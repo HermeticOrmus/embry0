@@ -206,7 +206,7 @@ def resolve_agent_invocation(
         job_agent_models=job_agent_models,
     )
 
-    from embry0.agents.providers import provider_for_model
+    from embry0.agents.providers import provider_for_model, unpriced_models, unpriced_models_message
 
     final_model = resolved.model or "claude-sonnet-5"
 
@@ -238,6 +238,14 @@ def resolve_agent_invocation(
                 disabled_model=final_model,
             )
 
+    # #219: a provider-routed model with no price entry would run unmetered —
+    # the provider reports no cost, so the price table is the only accounting.
+    # Refused at configuration time; this catches what reached the run anyway
+    # (an env tier model, triage's pick, a row saved before the check).
+    unpriced = unpriced_models([final_model])
+    if unpriced:
+        raise AuthConfigError(ErrorCode.INVALID_CONFIG, unpriced_models_message(unpriced))
+
     provider = provider_for_model(final_model)
 
     # The caller's budget is sized for Claude; a provider whose models need more turns and
@@ -261,7 +269,9 @@ def resolve_agent_invocation(
                     ErrorCode.MISSING_API_KEY,
                     f"auth_mode=api_key but the resolved account is {kind}",
                 )
-            if not api_key:
+            # A resolved llm_api_key account is the key (registry or env, #572);
+            # the env string is only consulted when no account was resolved.
+            if not api_key and kind != "llm_api_key":
                 raise AuthConfigError(
                     ErrorCode.MISSING_API_KEY,
                     "auth_mode=api_key but ANTHROPIC_API_KEY is empty",
@@ -272,7 +282,7 @@ def resolve_agent_invocation(
                     ErrorCode.MISSING_OAUTH_TOKEN,
                     f"auth_mode=oauth but the resolved account is {kind}",
                 )
-            if not oauth_token:
+            if not oauth_token and kind != "llm_oauth":
                 raise AuthConfigError(
                     ErrorCode.MISSING_OAUTH_TOKEN,
                     "auth_mode=oauth but no CLAUDE_CODE_OAUTH_TOKEN available",

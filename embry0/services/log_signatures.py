@@ -237,6 +237,7 @@ def format_cluster_table(
     *,
     max_clusters: int = 25,
     max_sample_chars: int = 220,
+    redact: Callable[[str], str] | None = None,
 ) -> str:
     """The ranked cluster block that replaces the raw tail in the prompt.
 
@@ -244,6 +245,9 @@ def format_cluster_table(
     window — the whole point of #289. The omitted tail is stated rather than
     silently dropped, because "there were 40 more signatures" is itself a
     finding the model should see.
+
+    ``redact`` is applied to each sample BEFORE it is trimmed: a cut first
+    could leave half a token that no rule recognises (#294).
     """
     if not clusters:
         return "(no matching log lines in this window)"
@@ -258,7 +262,8 @@ def format_cluster_table(
             head += f" ~{rate:,.0f}/h over {cluster.span_seconds:,.0f}s"
         parts.append(head)
         parts.append(f"   template: {cluster.template}")
-        for sample in cluster.samples:
+        for raw_sample in cluster.samples:
+            sample = redact(raw_sample) if redact is not None else raw_sample
             trimmed = sample if len(sample) <= max_sample_chars else sample[:max_sample_chars] + "…"
             parts.append(f"   sample:   {trimmed}")
     hidden = clusters[max_clusters:]

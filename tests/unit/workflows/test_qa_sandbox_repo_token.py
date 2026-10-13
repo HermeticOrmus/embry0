@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from embry0.execution.runtime import DockerRuntime
-from embry0.workflows.qa import nodes, orchestrator, subtask_nodes
+from embry0.workflows.qa import orchestrator, subtask_nodes
 
 
 class _Sentinel(RuntimeError):
@@ -36,29 +36,6 @@ def _profiles_repo(profile: dict | None = None) -> MagicMock:
     repo = MagicMock()
     repo.get = AsyncMock(return_value=profile or {"dind_enabled": False})
     return repo
-
-
-@pytest.mark.asyncio
-async def test_init_qa_node_passes_repo_to_create():
-    sandbox_mgr = _sandbox_mgr()
-    config = {
-        "configurable": {
-            "docker": _docker(),
-            "runtime": DockerRuntime(_docker()),
-            "sandbox_manager": sandbox_mgr,
-            "profiles_repo": _profiles_repo(),
-            "qa_minio_sandbox": MagicMock(),
-            "qa_token_registry": MagicMock(),
-            "proxy_manager": MagicMock(git_proxy_url=""),
-        }
-    }
-    state = {"job_id": "job-1", "repo": "acme-corp/widgets", "branch_name": "main"}
-
-    with pytest.raises(_Sentinel):
-        await nodes.init_qa_node(state, config)
-
-    _, kwargs = sandbox_mgr.create.call_args
-    assert kwargs.get("repo") == "acme-corp/widgets"
 
 
 @pytest.mark.asyncio

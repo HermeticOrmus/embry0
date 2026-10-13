@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from tests.fixtures.postgres import postgres_unavailable
+
 try:
     from embry0.api.app import _check_postgres_password, create_app, lifespan
     from embry0.storage.database import DatabasePool
@@ -256,7 +258,7 @@ async def test_ca_pem_reaches_the_sandbox_and_proxy_managers(tmp_path, monkeypat
         conn = await asyncpg.connect(database_url)
         await conn.close()
     except (OSError, asyncpg.PostgresError) as exc:
-        pytest.skip(f"PostgreSQL unavailable: {exc}")
+        postgres_unavailable(exc)
 
     bundle = tmp_path / "ca.pem"
     bundle.write_text(CA_PEM)

@@ -45,17 +45,15 @@ Code: `embry0/workflows/verification/` (pure logic + the sandbox runner),
 | `total_timeout_seconds` | `3600` | Budget for the whole gate. Runs that do not fit are recorded as not run → verdict `error`. |
 | `tiers.*_paths` | built-in | Each list REPLACES the built-in list of that class; omit to keep it; `[]` = "no such paths". |
 
-`verification` is the one preferences field a `PUT` does **not** replace when
-omitted (every other field is full-replace): absent/`null` keeps the stored
-value, `{}` clears it. Older clients PUT the whole object without knowing the
-field and must not switch a repo's gate off by accident. Note the other fields
-ARE replaced — re-send `dev_checks` etc. when you PUT:
+A preferences `PUT` is a partial update (#350): only the fields in the body
+are written, so setting `verification` leaves `dev_checks`, `base_branch` and
+the rest alone. Omit it to keep the stored value; send `{}` or `null` to clear
+it:
 
 ```bash
 API=http://localhost:8200/api/v1/repos/acme/backend/preferences
 AUTH=(-H "Authorization: Bearer $API_KEY" -H "X-Requested-With: XMLHttpRequest")
-curl -s "${AUTH[@]}" "$API" \
-  | jq 'del(.repo, .updated_at) | .verification = input' - verification.json \
+jq '{verification: .}' verification.json \
   | curl -s -X PUT "${AUTH[@]}" -H 'Content-Type: application/json' -d @- "$API"
 ```
 

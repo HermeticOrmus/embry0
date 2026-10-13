@@ -102,36 +102,6 @@ def test_qa_dind_runs_on_the_dind_runtime() -> None:
     assert dind_mode_refusal(DockerRuntime(MagicMock()), mode="dind", dind_profile=True) is None
 
 
-async def test_init_qa_refuses_dind_mode_before_creating_anything() -> None:
-    from embry0.workflows.qa.nodes import init_qa_node
-
-    runtime = MagicMock(spec=RootlessDockerRuntime)
-    runtime.kind = "rootless"
-    runtime.sandbox_docker_access = False
-    sandbox_mgr = MagicMock()
-    sandbox_mgr.create = AsyncMock()
-    profiles = MagicMock()
-    profiles.get = AsyncMock(return_value={"name": "qa-jvm", "dind_enabled": False})
-    repos = MagicMock()
-    repos.get = AsyncMock(return_value={"forge": "github"})
-    state = {"job_id": "job-1", "repo": "acme/app", "qa": {"qa_yaml_parsed": {"mode": "dind"}}}
-    config = {
-        "configurable": {
-            "docker": MagicMock(),
-            "runtime": runtime,
-            "sandbox_manager": sandbox_mgr,
-            "profiles_repo": profiles,
-            "qa_minio_sandbox": MagicMock(),
-            "qa_token_registry": MagicMock(),
-            "repos_repo": repos,
-        }
-    }
-    with pytest.raises(RuntimeError, match="ERR_INCOHERENT_CONFIG: QA mode: dind is not available"):
-        await init_qa_node(state, config)
-    runtime.create_network.assert_not_called()
-    sandbox_mgr.create.assert_not_awaited()
-
-
 async def test_a_dind_mode_subtask_is_refused_before_creating_anything() -> None:
     from embry0.workflows.qa.subtask_nodes import acquire_sandbox_node
     from tests.unit.workflows.qa.test_subtask_nodes import _make_acquire_config, _make_acquire_state, _resolved_app

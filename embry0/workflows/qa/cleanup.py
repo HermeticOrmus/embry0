@@ -7,13 +7,14 @@ Two label families to filter on:
 Plus the per-job network qa-net-<job_id>.
 
 Called from:
-  - report_node, every attempt (whether the attempt succeeded or failed)
+  - release_sandbox_node, after every QA sub-task (passed or failed)
   - ContainerReaper, periodically, to sweep orphans from crashed jobs
+  - IssueExecutor.cancel_job, through ``cleanup_cancelled_qa_job`` (#328)
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 import structlog
@@ -59,3 +60,44 @@ async def cleanup_qa_resources(runtime: AgentRuntime, *, job_id: str) -> None:
     await _run("remove network", runtime.remove_network(f"qa-net-{job_id}", timeout=15), None)
 
     logger.info("qa_cleanup_done", job_id=job_id)
+
+
+async def cleanup_cancelled_qa_job(
+    runtime: AgentRuntime,
+    destroy_sandbox: Callable[[str], Awaitable[None]],
+    *,
+    job_id: str,
+) -> None:
+    """Release the QA resources of a job that was cancelled (#328).
+
+    A cancelled graph never reaches the nodes that clean up after QA, so its
+    fan-out sub-task sandboxes, their per-sub-task networks and anything the
+    QA agent started inside DinD would linger until the reaper. Sub-task
+    sandboxes are found by name — ``sandbox-<job_id>__<app>``, created for
+    sub-job ``<job_id>__<app>`` — and destroyed through ``destroy_sandbox``
+    (the sandbox manager, which also unenrols them from the proxies) before
+    their networks are removed: a network with an attached container cannot
+    be. Best-effort; never raises.
+    """
+    prefix = f"sandbox-{job_id}__"
+    try:
+        found = await runtime.list_containers(name=prefix, timeout=15)
+    except Exception as exc:
+        logger.warning("qa_cancel_cleanup_list_failed", job_id=job_id, error=str(exc))
+        found = []
+    # Docker's name filter is a substring match: keep the exact prefix only.
+    subtasks = [c.name for c in found if c.name.startswith(prefix)]
+
+    sub_job_ids = []
+    for name in subtasks:
+        try:
+            await destroy_sandbox(name)
+        except Exception as exc:
+            logger.warning("qa_cancel_subtask_destroy_failed", job_id=job_id, sandbox=name, error=str(exc))
+        sub_job_ids.append(f"{job_id}__{name[len(prefix) :]}")
+
+    for qa_job_id in (job_id, *sub_job_ids):
+        try:
+            await cleanup_qa_resources(runtime, job_id=qa_job_id)
+        except Exception as exc:
+            logger.warning("qa_cancel_cleanup_failed", job_id=qa_job_id, error=str(exc))

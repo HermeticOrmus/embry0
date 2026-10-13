@@ -49,6 +49,12 @@ def dedupe(code: str, *, job_id: str = "", job_status: str = "", pr_url: str = "
             "Please review that pull request. If it is closed without merging and you want embry0 to try again, "
             f"{_DASHBOARD_JOB}."
         )
+    if code == "existing_pr":
+        return (
+            f"**Did not start a new job** because job `{job_id}` found an open pull request that already covers "
+            "this ticket (linked in its result comment). Please review that pull request. If it is closed without "
+            f"merging and you want embry0 to try, {_DASHBOARD_JOB}."
+        )
     if code == "work_delivered":
         return (
             f"**Did not start a new job** because job `{job_id}` already finished this ticket (`{job_status}`). "
@@ -70,6 +76,22 @@ def unmapped_repo(project: str, *, auto_retry: bool) -> str:
         f"**Did not start work on this ticket** because its Linear project `{project or '(none)'}` does not say "
         "which code repository it belongs to. Someone who manages the project needs to add a line "
         f"`repo: owner/name` to the project summary. {after}"
+    )
+
+
+def unregistered_repo(repo: str, project: str, *, auto_retry: bool) -> str:
+    after = (
+        "After that you do not need to do anything: embry0 picks the ticket up by itself within a few minutes."
+        if auto_retry
+        else f"After that, {_RELABEL}."
+    )
+    return (
+        f"**Did not start work on this ticket** because its Linear project `{project or '(none)'}` points at "
+        f"the repository `{repo}`, which is not registered in embry0 (`ERR_REPO_UNREGISTERED`): embry0 holds no "
+        "QA config, environment variables or secrets for it, so a job there would run without them. If the "
+        "repository was renamed or the project names the wrong one, correct the `repo: owner/name` line in the "
+        "project summary; otherwise ask the embry0 operator to register the repository. "
+        f"{after}"
     )
 
 

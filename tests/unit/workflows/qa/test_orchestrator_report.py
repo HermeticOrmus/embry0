@@ -36,7 +36,6 @@ def _state(**qa_overrides):
                     "turbo_remote_hits": [],
                     "turbo_remote_misses": [],
                 },
-                "trace_url": None,
                 "failure_summary": None,
                 "raw_result": {},
             }

@@ -132,8 +132,9 @@ is what lists it under the repo and routes its notifications, so proposals,
 jobs and runs about embry0 reach whatever the deployment's webhook consumer
 routes that repo to. The workspace stays `type: none` — nothing is cloned,
 the log excerpt rides the task — but the repo **must be registered** (#360
-refuses jobs for unregistered repos). This applies to every stack, not only
-the self stack.
+refuses jobs for unregistered repos: a tick on an unregistered stack records
+an `error` naming `ERR_REPO_UNREGISTERED`, before any logs are fetched or an
+analysis is paid for). This applies to every stack, not only the self stack.
 
 ## Setting it up
 

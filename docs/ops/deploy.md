@@ -10,7 +10,7 @@ rotation are [backup-restore.md](backup-restore.md).
 
 - **Two `.env` files — know which one you're editing.** Container runtime env comes from the **repo-root `.env`** (`env_file: ../.env` on the orchestrator service): all secrets and tokens (`GITHUB_TOKEN`, `GITHUB_TOKEN__<OWNER>`, `CLAUDE_CODE_OAUTH_TOKEN`, `PROXY_ADMIN_TOKEN`, `API_KEY`, tunnel tokens) must be edited there. `infra/.env` feeds only docker-compose `${…}` interpolation (`POSTGRES_*`, `PROD_PORT`, `COMPOSE_PROFILES`, resource caps) and is not loaded into any container. The values both files carry (`POSTGRES_*`, `MINIO_ROOT_*`, `CLOUDFLARED_TUNNEL_TOKEN`) must be equal (`infra/.env.example`); any other secret still in `infra/.env` is dead weight. When another doc says "`.env`" for a secret, it means the root file.
 - embry0 runs in Docker via `infra/docker-compose.yml`. After any code changes, you **must** rebuild and restart the affected containers — with the deploy script, which also leaves the deploy marker the self stack needs (below):
-  - Both: `infra/deploy.sh` (from the `main` checkout; refuses on any other branch, and refuses while a job is `running` unless `EMBRY0_DEPLOY_FORCE=1`, because a recreate kills it)
+  - Both: `infra/deploy.sh` (from the `main` checkout; refuses on any other branch, and refuses while a job is `running` unless `EMBRY0_DEPLOY_FORCE=1`: the recreate interrupts it, and although it resumes, the step it was in runs again — see [Deploying while jobs run](#deploying-while-jobs-run))
   - Backend only: `infra/deploy.sh orchestrator` — Frontend only: `infra/deploy.sh frontend`
   - What it runs, if you need it by hand: `cd infra && docker compose build orchestrator frontend && docker compose up -d orchestrator mcp frontend --force-recreate`, then `infra/deploy.sh marker <sha> orchestrator frontend` for the marker.
   - `mcp` runs the **orchestrator image** (`image: embry0-orchestrator`, no build of its own), so every orchestrator rebuild leaves it on the old image until it is recreated too; the script recreates it with the orchestrator. Left out of the manual recipe until 2026-09-23, when a deploy shipped a four-day-old MCP server next to a fresh orchestrator.
@@ -18,6 +18,48 @@ rotation are [backup-restore.md](backup-restore.md).
 - `infra/deploy.sh` builds the orchestrator and frontend, or the services you name. It does not rebuild the sandbox, QA or proxy images: a change to the code baked into them needs a [rebuild recipe](#images-registry-pins-and-rebuilds) too.
 - The frontend is served via nginx on port 8200 and proxies `/api` to the orchestrator container.
 - Always verify health after restart: `curl -s http://localhost:8200/health`
+
+### Deploying while jobs run
+
+Sandboxes run on the agent runtime (the `dind` service, or the rootless
+daemon), not in the orchestrator container, and LangGraph saves each job's
+graph in Postgres after every node. Recreating the orchestrator therefore
+stops a job without losing it (#307):
+
+1. **Drain.** On SIGTERM uvicorn closes its connections (up to 30 s), then the
+   orchestrator starts no more jobs: anything dispatched now, and every job
+   waiting for a run slot, stays `pending` with its launch record. Running
+   jobs get `SHUTDOWN_DRAIN_SECONDS` (default 90) to finish the node they are
+   in; each stops at that boundary. One still inside a node at the deadline
+   (an agent turn can take far longer) is stopped where it is. Every job
+   stopped or held back gets `jobs.interrupted_at` and an "Interrupted" line
+   on its timeline, and the agent it left running in its sandbox is killed.
+   The orchestrator's `stop_grace_period: 180s` in `infra/docker-compose.yml`
+   covers all of this; compose's default 10 s would kill it mid-drain, and
+   systemd's `docker compose down` gets `TimeoutStopSec=300` for the same
+   reason. Raising `SHUTDOWN_DRAIN_SECONDS` means raising both
+   (`tests/unit/infra/test_shutdown_grace.py` holds the arithmetic).
+2. **Recovery.** At boot a `running` issue-to-PR job with a checkpoint
+   resumes from it: the stale agent in its sandbox is killed, the sandbox is
+   re-enrolled with the proxies, and the node that was cut off runs again
+   from its start — its agent turn's spend is spent twice. A job that never
+   started, or stopped before its graph began, starts again from its launch
+   record. Each says so on its timeline.
+3. **What still fails.** A QA or onboard job that had begun its graph
+   (their sub-sandboxes are not re-enrolled), a job with nothing to resume
+   from, and a job whose sandbox is gone (the daemon restarted with it:
+   `ERR_SANDBOX_GONE`) fail as before. One the drain stopped reads
+   `ERR_INTERRUPTED_BY_SHUTDOWN`; one a crash left behind reads
+   `ERR_ORPHANED`. Both are stamped `finished_at`, and their issues reopen.
+4. **Crash loops are bounded.** A recovery after an unclean stop (a crash,
+   an OOM kill, no drain stamp) spends one of `MAX_RESUME_ATTEMPTS` (3); the
+   next boot after the last fails the job with `ERR_RESUME_LIMIT`. Clean
+   drains never count, so a long job may cross any number of deploys.
+
+Restarting `dind` (or the rootless daemon) still kills every sandbox, and
+with them the jobs; `infra/deploy.sh` never touches it. A recreate is safe;
+the deploy script still asks before one while a job runs because of the
+re-run node in 2.
 
 ## Ingress
 
@@ -79,7 +121,7 @@ no host port; everything below reaches it through the frontend's nginx.
   docker compose up -d minio
   docker inspect embry0-minio --format '{{.State.Health.Status}}'   # healthy within a minute
   ```
-  The orchestrator needs no restart. It prepares the `qa-artifacts` bucket in the background and retries until MinIO answers (`qa_minio_unavailable` warnings, then `qa_minio_ready`). Until then the QA routes answer 503 and QA jobs fail at `init_qa`. A plain `docker compose up -d` or `embry0 start` also switches, because the `minio` service changed.
+  The orchestrator needs no restart. It prepares the `qa-artifacts` bucket in the background and retries until MinIO answers (`qa_minio_unavailable` warnings, then `qa_minio_ready`). Until then the QA routes answer 503 and QA jobs fail at sandbox setup. A plain `docker compose up -d` or `embry0 start` also switches, because the `minio` service changed.
 - **First-time bootstrap (fresh deploy).** From `infra/` (a new host also needs the rest of [provisioning.md](provisioning.md)):
   ```bash
   cd infra

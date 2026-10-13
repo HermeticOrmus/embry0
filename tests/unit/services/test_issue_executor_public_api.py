@@ -65,7 +65,20 @@ async def test_submit_job_builds_synthetic_issue_and_dispatches():
         "tracker_key": "7",
     }
     assert captured["additional_context"] == "ctx"
-    assert tracked == [{"kind": "watcher_analysis", "job_id": "job-1"}]
+    assert tracked == [
+        {
+            "kind": "watcher_analysis",
+            "job_id": "job-1",
+            # #307: what a restart needs to start the job again.
+            "launch": {
+                "runner": "workflow",
+                "issue_id": None,
+                "issue": captured["issue"],
+                "additional_context": "ctx",
+                "kind": "watcher_analysis",
+            },
+        }
+    ]
 
 
 @pytest.mark.asyncio

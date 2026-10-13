@@ -2,7 +2,7 @@
 
 A confidential client: authorization-code + PKCE against the deployment's
 own Auth0 tenant, with roles read off the ID token claim named by
-``SSO_ROLES_CLAIM``. Built on FastAPI + authlib-jose. Mounted WITHOUT the router-level API-key
+``SSO_ROLES_CLAIM``. Built on FastAPI + joserfc. Mounted WITHOUT the router-level API-key
 dependency — /login and /callback are the unauthenticated entry, /check is
 the frontend's cheap probe, /me and /logout act on the session cookie.
 
@@ -152,7 +152,9 @@ async def login(request: Request) -> RedirectResponse:
 
 @router.get("/callback")
 async def callback(request: Request, code: str = "", state: str = "") -> RedirectResponse:
-    from authlib.jose import JsonWebKey, jwt
+    from joserfc import jwt
+    from joserfc.jwk import KeySet
+    from joserfc.jwt import JWTClaimsRegistry
 
     config = request.app.state.config
     if not config.sso_enabled:
@@ -181,19 +183,19 @@ async def callback(request: Request, code: str = "", state: str = "") -> Redirec
     if not id_token:
         raise HTTPException(status_code=400, detail="No id_token in token response")
 
-    claims = None
+    # #506: joserfc, not the deprecated authlib.jose. decode() checks the
+    # signature; the registry checks iss, aud and the time claims.
+    registry = JWTClaimsRegistry(
+        iss={"essential": True, "value": _issuer(config)},
+        aud={"essential": True, "value": config.auth0_client_id},
+    )
+    claims: dict[str, Any] | None = None
     for refresh in (False, True):
-        key_set = JsonWebKey.import_key_set(await _jwks(request, refresh=refresh))
+        key_set = KeySet.import_key_set(await _jwks(request, refresh=refresh))  # type: ignore[arg-type]
         try:
-            claims = jwt.decode(
-                id_token,
-                key_set,
-                claims_options={
-                    "iss": {"essential": True, "value": _issuer(config)},
-                    "aud": {"essential": True, "value": config.auth0_client_id},
-                },
-            )
-            claims.validate()
+            token = jwt.decode(id_token, key_set)
+            registry.validate(token.claims)
+            claims = token.claims
             break
         except Exception:  # noqa: BLE001 — one retry with fresh JWKS (key rotation)
             if refresh:

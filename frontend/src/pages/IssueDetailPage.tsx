@@ -97,14 +97,13 @@ export function IssueDetailPage(): JSX.Element {
     });
   };
 
-  const handleDelete = () => {
-    if (!confirm("Delete this issue? This cannot be undone.")) return;
+  // DELETE /issues/{id} soft-cancels: the issue, its children and their active
+  // jobs become cancelled and the row stays (cancelled -> open is allowed).
+  const handleCancel = () => {
+    if (!confirm("Cancel this issue? Its running jobs are cancelled too.")) return;
     deleteIssue.mutate(id!, {
-      onSuccess: () => {
-        toast.success("Issue deleted");
-        navigate("/issues");
-      },
-      onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to delete"),
+      onSuccess: () => toast.success("Issue cancelled"),
+      onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to cancel"),
     });
   };
 
@@ -165,7 +164,7 @@ export function IssueDetailPage(): JSX.Element {
               size="sm"
               variant="outline"
               disabled={deleteIssue.isPending}
-              onClick={handleDelete}
+              onClick={handleCancel}
               className="gap-1.5 text-destructive hover:text-destructive border-destructive/30 hover:border-destructive/50"
             >
               <X className="h-3.5 w-3.5" />

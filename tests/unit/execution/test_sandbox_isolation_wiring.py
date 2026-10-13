@@ -18,8 +18,12 @@ from embry0.execution.runtime.isolation import IsolationError
 from embry0.execution.sandbox_manager import SandboxInitError, SandboxManager, SandboxReenrollError
 from embry0.safety.error_codes import ErrorCode
 
-# Autouse: the egress helper cannot run against the docker mock either.
-from tests.unit.execution.test_sandbox_manager import _stub_egress_unless_overridden  # noqa: F401
+# Autouse: the egress helper cannot run against the docker mock either, and
+# neither can the egress-exception refresh a re-enrollment runs (#568).
+from tests.unit.execution.test_sandbox_manager import (  # noqa: F401
+    _stub_egress_unless_overridden,
+    _stub_isolation_unless_overridden,
+)
 
 PROXIES = ["git-proxy", "minio-proxy", "presign-proxy"]
 
@@ -181,13 +185,37 @@ async def test_reenroll_rewrites_the_chain_before_it_enrolls(monkeypatch):
     assert order == ["isolation", "enroll"]
 
 
+async def test_reenroll_rewrites_the_egress_exceptions_before_the_chain(monkeypatch):
+    """#568: a sandbox that outlived a restart gets the proxies' new sandbox-internet addresses."""
+    from embry0.execution.runtime import DockerRuntime
+
+    order: list[str] = []
+    refresh = AsyncMock(side_effect=lambda proxies: order.append("egress") or ["10.89.0.2"])
+    monkeypatch.setattr(DockerRuntime, "refresh_egress", refresh)
+    _install_isolation(monkeypatch, AsyncMock(side_effect=lambda proxies: order.append("isolation") or ["10.88.0.2"]))
+    pm = _proxy_manager()
+    pm.internet_proxies = MagicMock(return_value=["git-proxy", "minio-proxy"])
+    pm.enroll_sandbox = AsyncMock(side_effect=lambda *a, **k: order.append("enroll") or "tok-new")
+    docker = _docker()
+    docker.run_cmd = AsyncMock(return_value="true")
+
+    await SandboxManager(docker=docker, proxy_manager=pm).reenroll(
+        "cid-1", job_id="job-1", repo="acme/widgets", forge="github", xai_credential_id=None, context_scope=None
+    )
+
+    refresh.assert_awaited_once_with(["git-proxy", "minio-proxy"])
+    assert order == ["egress", "isolation", "enroll"], (
+        f"egress exceptions, then the isolation chain (its jump above them), then the enrollment: {order}"
+    )
+
+
 async def test_reenroll_keeps_the_job_paused_when_the_chain_cannot_be_written(monkeypatch):
     _install_isolation(monkeypatch, AsyncMock(side_effect=IsolationError("no proxy is running")))
     pm = _proxy_manager()
     docker = _docker()
     docker.run_cmd = AsyncMock(return_value="true")
 
-    with pytest.raises(SandboxReenrollError, match="isolation chain not in place: no proxy is running"):
+    with pytest.raises(SandboxReenrollError, match="proxy rules not in place: no proxy is running"):
         await SandboxManager(docker=docker, proxy_manager=pm).reenroll(
             "cid-1", job_id="job-1", repo="acme/widgets", forge="github", xai_credential_id=None, context_scope=None
         )

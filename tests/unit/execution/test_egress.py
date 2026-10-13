@@ -8,21 +8,19 @@ generated commands (mirroring test_network_assertion.py's approach).
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from embry0.execution.runtime.egress import (
     BLOCKED_PRIVATE_RANGES,
+    EGRESS_CHAIN,
     LOG_PREFIX,
     EgressEnforcer,
     derive_deployed_egress_allowlist,
     resolve_allowlist_to_ips,
 )
+from tests.unit.execution.fake_iptables import _chain_docker
 
 # ---------------------------------------------------------------------------
 # allowlist derivation + resolution
@@ -95,24 +93,23 @@ def _helper_script(docker: MagicMock, call_idx: int = 0) -> str:
 async def test_apply_builds_private_range_blocklist():
     docker = _docker()
     enforcer = EgressEnforcer(docker)
-    await enforcer.apply("172.20.0.5", ["192.168.1.10", "10.1.2.3"])
+    await enforcer.apply("172.20.0.5", ["192.168.1.10", "10.1.2.3"], proxy_ips=["172.20.0.2"])
 
     script = _helper_script(docker)
-    # Every rule is keyed on the sandbox source IP.
-    assert "-s 172.20.0.5" in script
-    # Declared LAN exceptions.
-    assert "-d 192.168.1.10 -j RETURN" in script
-    assert "-d 10.1.2.3 -j RETURN" in script
-    # Every private range gets LOG + DROP; nothing is a blanket DROP.
+    # The sandbox's own rules are keyed on its source IP: its declared LAN
+    # exceptions, then the jump to the shared chain.
+    assert "-s 172.20.0.5 -d 192.168.1.10/32 -j RETURN" in script
+    assert "-s 172.20.0.5 -d 10.1.2.3/32 -j RETURN" in script
+    assert f"-s 172.20.0.5 -j {EGRESS_CHAIN}" in script
+    # The shared chain: replies, the proxies, then LOG + DROP per private range.
     for blocked in BLOCKED_PRIVATE_RANGES:
-        assert f"-d {blocked} -j DROP" in script
-        assert f"-d {blocked} " in script
+        assert f"-A {EGRESS_CHAIN} -d {blocked} -j DROP" in script
+    assert f"-A {EGRESS_CHAIN} -d 172.20.0.2/32 -j RETURN" in script
     assert "-s 172.20.0.5 -j DROP" not in script  # public egress stays open
     assert LOG_PREFIX in script
     assert "--ctstate ESTABLISHED,RELATED" in script
-    # DROPs inserted first (end up below the allows after position-1 inserts).
-    assert script.index("-j DROP") < script.index("LOG")
-    assert script.index("LOG") < script.index("-j RETURN")
+    # The chain is written and checked before the jump to it exists.
+    assert script.index("iptables-restore") < script.index(f"-j {EGRESS_CHAIN}\n")
 
 
 @pytest.mark.asyncio
@@ -133,73 +130,17 @@ async def test_clear_deletes_by_line_number():
     assert "iptables -D DOCKER-USER" in script
 
 
-# A stand-in for iptables that keeps DOCKER-USER in a file and prints it
-# the way iptables does for -S and for -L --line-numbers -n, so the helper
-# scripts run for real instead of being matched as strings (#566).
-_FAKE_IPTABLES = r"""
-import os, shlex, sys
-
-state = os.environ["FAKE_IPTABLES_STATE"]
-rules = open(state).read().splitlines() if os.path.exists(state) else []
-args = sys.argv[1:]
-if args[:1] == ["-I"]:
-    spec = args[3:]
-    for i, word in enumerate(spec[:-1]):  # iptables stores a bare address as /32
-        if word in ("-s", "-d") and "/" not in spec[i + 1]:
-            spec[i + 1] += "/32"
-    rules.insert(int(args[2]) - 1, "-A DOCKER-USER " + shlex.join(spec))
-elif args[:1] == ["-D"]:
-    del rules[int(args[2]) - 1]
-elif args[:1] == ["-S"]:
-    for line in ["-N DOCKER-USER", *rules]:
-        print(line)
-elif args[:1] == ["-L"]:
-    print("Chain DOCKER-USER (1 references)")
-    print("num  target     prot opt source               destination")
-    for num, rule in enumerate(rules, 1):
-        f = shlex.split(rule)
-        get = lambda flag: f[f.index(flag) + 1] if flag in f else "0.0.0.0/0"
-        src, dst = (get(x).removesuffix("/32") for x in ("-s", "-d"))
-        print(f"{num:<4} {get('-j'):<10} all  --  {src:<20} {dst}")
-else:
-    sys.exit(f"fake iptables: unsupported {args}")
-with open(state, "w") as out:
-    out.writelines(rule + "\n" for rule in rules)
-"""
-
-
-def _chain_docker(tmp_path) -> tuple[MagicMock, Callable[[], list[str]]]:
-    """A DockerClient mock that runs each helper script against the fake chain.
-
-    Returns the mock and a reader for the chain's rules in ``-S`` form.
-    """
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    fake = bindir / "iptables"
-    fake.write_text(f"#!{sys.executable}\n{_FAKE_IPTABLES}")
-    fake.chmod(0o755)
-    state = tmp_path / "docker-user.rules"
-    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "FAKE_IPTABLES_STATE": str(state)}
-
-    async def run_cmd(cmd: list[str], timeout: int = 30) -> str:
-        return subprocess.run(["sh", "-c", cmd[-1]], env=env, check=True, capture_output=True, text=True).stdout
-
-    docker = MagicMock()
-    docker._build_base_cmd = MagicMock(side_effect=lambda: ["docker", "--host", "tcp://dind:2376"])
-    docker.run_cmd = AsyncMock(side_effect=run_cmd)
-    return docker, lambda: state.read_text().splitlines() if state.exists() else []
-
-
 @pytest.mark.asyncio
 async def test_clear_leaves_rules_of_an_address_it_prefixes(tmp_path):
     """Clearing x.y.z.8 must not touch the rules of x.y.z.80 (#566)."""
-    docker, rules = _chain_docker(tmp_path)
+    docker, table = _chain_docker(tmp_path)
+    rules = table.chain
     enforcer = EgressEnforcer(docker)
     await enforcer.apply("10.77.0.8", [])
     await enforcer.apply("10.77.0.80", [])
     # A third sandbox whose DESTINATION allow contains the cleared address.
     await enforcer.apply("10.77.0.9", ["10.77.0.8"])
-    per_sandbox = 2 * len(BLOCKED_PRIVATE_RANGES) + 1
+    per_sandbox = 1  # the jump to the shared chain
     assert sum("-s 10.77.0.8/32 " in r for r in rules()) == per_sandbox, rules()
 
     await enforcer.clear("10.77.0.8")
@@ -216,9 +157,9 @@ async def test_clear_leaves_rules_of_an_address_it_prefixes(tmp_path):
 
 @pytest.mark.asyncio
 async def test_clear_on_an_empty_chain_is_a_no_op(tmp_path):
-    docker, rules = _chain_docker(tmp_path)
+    docker, table = _chain_docker(tmp_path)
     await EgressEnforcer(docker).clear("10.77.0.8")
-    assert rules() == []
+    assert table.chain() == []
 
 
 @pytest.mark.asyncio
@@ -255,3 +196,104 @@ async def test_ensure_helper_image_skips_build_when_present():
     # Single inspect call, no build.
     assert docker.run_cmd.await_count == 1
     assert "image" in docker.run_cmd.await_args.args[0]
+
+
+# ---------------------------------------------------------------------------
+# the shared proxy chain (#568), on the fake filter table
+# ---------------------------------------------------------------------------
+
+SANDBOX = "172.20.0.9"
+LAN_TARGET = "192.168.1.10"
+SUBNET = "172.20.0.0/16"
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_reaches_its_targets_and_the_proxies_and_no_other_private_address(tmp_path):
+    docker, table = _chain_docker(tmp_path)
+    await EgressEnforcer(docker).apply(SANDBOX, [LAN_TARGET], proxy_ips=["172.20.0.2"])
+
+    assert table.verdict(SANDBOX, "172.20.0.2") == "pass", "the sandbox cannot reach the proxy"
+    assert table.verdict(SANDBOX, LAN_TARGET) == "pass", "the sandbox cannot reach its declared target"
+    assert table.verdict(SANDBOX, "93.184.216.34") == "pass", "public egress is closed"
+    assert table.verdict(SANDBOX, "172.20.0.3") == "drop", "the sandbox reaches another sandbox"
+    assert table.verdict(SANDBOX, "192.168.1.11") == "drop", "the sandbox reaches the LAN"
+    assert table.verdict(SANDBOX, "172.20.0.3", established=True) == "pass", "replies are dropped"
+    assert table.verdict("172.20.0.3", "172.20.0.4") == "pass", "a container without rules was restricted"
+
+
+@pytest.mark.asyncio
+async def test_applying_twice_replaces_the_block(tmp_path):
+    docker, table = _chain_docker(tmp_path)
+    enforcer = EgressEnforcer(docker)
+    await enforcer.apply(SANDBOX, [LAN_TARGET], proxy_ips=["172.20.0.2"])
+    await enforcer.apply(SANDBOX, [], proxy_ips=["172.20.0.2"])
+
+    rules = [r for r in table.chain() if f"-s {SANDBOX}/32 " in r]
+    assert rules == [f"-A DOCKER-USER -s {SANDBOX}/32 -j {EGRESS_CHAIN}"], rules
+    assert table.verdict(SANDBOX, LAN_TARGET) == "drop", "the earlier block's exception survived"
+
+
+@pytest.mark.asyncio
+async def test_refresh_moves_every_sandbox_to_the_proxies_running_now(tmp_path):
+    """The proxies were recreated at new addresses; a sandbox from before must follow them."""
+    docker, table = _chain_docker(tmp_path)
+    enforcer = EgressEnforcer(docker)
+    await enforcer.apply(SANDBOX, [LAN_TARGET], proxy_ips=["172.20.0.2"])
+
+    converted = await enforcer.refresh(["172.20.0.7"], [SUBNET])
+
+    assert converted == []
+    assert table.verdict(SANDBOX, "172.20.0.7") == "pass", "the sandbox cannot reach the proxy at its new address"
+    assert table.verdict(SANDBOX, "172.20.0.2") == "drop", (
+        "the sandbox still reaches the proxy's old address, which Docker may give to a new sandbox"
+    )
+    assert table.verdict(SANDBOX, LAN_TARGET) == "pass", "the refresh dropped the sandbox's declared target"
+
+
+def _pre_chain_block(source: str, returns: list[str]) -> list[str]:
+    """DOCKER-USER rules as the per-sandbox egress of an earlier release wrote them."""
+    src = f"-A DOCKER-USER -s {source}/32"
+    rules = [f"{src} -d {d}/32 -j RETURN" for d in returns]
+    rules.append(f"{src} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN")
+    rules += [f'{src} -d {r} -m limit --limit 6/min -j LOG --log-prefix "{LOG_PREFIX}"' for r in BLOCKED_PRIVATE_RANGES]
+    rules += [f"{src} -d {r} -j DROP" for r in BLOCKED_PRIVATE_RANGES]
+    return rules
+
+
+@pytest.mark.asyncio
+async def test_refresh_converts_a_sandbox_from_before_the_shared_chain(tmp_path):
+    docker, table = _chain_docker(tmp_path)
+    table.seed(
+        {
+            "DOCKER-USER": [
+                *_pre_chain_block(SANDBOX, ["172.20.0.2", LAN_TARGET]),
+                "-A DOCKER-USER -s 10.9.9.9/32 -d 10.0.0.1/32 -j RETURN",  # not embry0's
+                "-A DOCKER-USER -j RETURN",
+            ]
+        }
+    )
+
+    converted = await EgressEnforcer(docker).refresh(["172.20.0.7"], [SUBNET])
+
+    assert converted == [SANDBOX]
+    rules = [r for r in table.chain() if f"-s {SANDBOX}/32 " in r]
+    assert rules == [
+        f"-A DOCKER-USER -s {SANDBOX}/32 -d {LAN_TARGET}/32 -j RETURN",
+        f"-A DOCKER-USER -s {SANDBOX}/32 -j {EGRESS_CHAIN}",
+    ], rules
+    assert table.verdict(SANDBOX, "172.20.0.7") == "pass", "the converted sandbox cannot reach the proxy"
+    assert table.verdict(SANDBOX, "172.20.0.2") == "drop", "the converted sandbox kept the old proxy exception"
+    assert table.verdict(SANDBOX, LAN_TARGET) == "pass", "the conversion lost the declared target"
+    assert "-A DOCKER-USER -s 10.9.9.9/32 -d 10.0.0.1/32 -j RETURN" in table.chain(), "a foreign rule was removed"
+
+
+@pytest.mark.asyncio
+async def test_no_jump_is_written_to_a_chain_that_is_not_in_place(tmp_path):
+    """An empty chain allows everything, so the jump to it waits for the check."""
+    docker, table = _chain_docker(tmp_path, restore_broken=True)
+    table.seed({"DOCKER-USER": [], EGRESS_CHAIN: []})
+
+    with pytest.raises(RuntimeError, match="not in place"):
+        await EgressEnforcer(docker).apply(SANDBOX, [], proxy_ips=["172.20.0.2"])
+
+    assert table.chain() == [], f"a jump was written to an empty chain: {table.chain()}"

@@ -153,6 +153,9 @@ async def test_init_node_makes_the_git_proxy_the_remote_and_grants_push():
     assert sandbox_mgr.create.await_args.kwargs.get("git_push") is True, (
         "the issue-to-pr sandbox must be created with the push right, or the developer cannot push its branch"
     )
+    assert sandbox_mgr.create.await_args.kwargs.get("git_push_branches") == ["embry0/unknown-task-xyz"], (
+        "#559: the push right must name the job's own branch, or the git-proxy refuses every push"
+    )
     setup = [" ".join(str(p) for p in c.args[0]) for c in docker.run_cmd.await_args_list if "insteadOf" in str(c.args)]
     assert setup, f"No git proxy setup exec call found. All calls: {docker.run_cmd.await_args_list}"
     cmd_str = setup[0]

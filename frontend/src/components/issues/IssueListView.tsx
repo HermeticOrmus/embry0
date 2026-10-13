@@ -8,9 +8,9 @@ import { IssuePriorityBadge } from "./IssuePriorityBadge";
 import { AgentIndicator } from "./AgentIndicator";
 import { formatDate } from "@/lib/utils";
 import { useNavigate } from "react-router";
-import type { IssueResponse } from "@/lib/types";
+import type { IssueResponse, IssueStatus } from "@/lib/types";
 
-const STATUS_OPTIONS = ["open", "triaging", "in_progress", "closed", "cancelled"];
+const STATUS_OPTIONS: IssueStatus[] = ["open", "triaging", "awaiting_input", "in_progress", "closed", "cancelled"];
 const PRIORITY_OPTIONS = ["critical", "high", "medium", "low"];
 
 interface IssueListViewProps {

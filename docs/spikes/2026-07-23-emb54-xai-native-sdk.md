@@ -1,5 +1,13 @@
 # EMB-54 spike — xAI native SDK vs the Anthropic-compat layer
 
+> **Superseded on which grok executor is the default.** This spike says the
+> direct xAI executor (`DirectXaiExecutor`) is the default and the Agent-SDK
+> path a fallback. The shipped code is the other way round: grok runs on the
+> Agent SDK over the xai-proxy, and the direct executor is opt-in
+> (`XAI_DIRECT_EXECUTOR=true`, `embry0/agents/executor_factory.py`). See
+> [`docs/providers.md`](../providers.md#supergrok-oauth-path-emb-45emb-46)
+> for the current behaviour. The no-go verdict on a native transport stands.
+
 **Verdict: NO-GO on a native gRPC transport.** The caching economics that
 motivated the spike turn out not to be a compat-shim artifact for the path
 we actually run, and a native transport would buy a new credential problem

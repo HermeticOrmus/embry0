@@ -27,7 +27,6 @@ async def test_qa_app_results_has_expected_columns(db_with_migrations):
         "started_at",
         "duration_ms",
         "cache_hits",
-        "trace_url",
         "failure_summary",
         "raw_result",
         "created_at",

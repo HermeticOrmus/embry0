@@ -49,7 +49,4 @@ async def test_real_cli_writes_to_a_path_we_can_discover() -> None:
     discovery hierarchy." Failure means either Anthropic moved the file
     or the discovery hierarchy regressed.
     """
-    pytest.skip(
-        "scaffold — implement when boot_qa_node lands so we have a "
-        "lightweight sandbox-boot fixture available to integration tests"
-    )
+    pytest.skip("scaffold — implement once a lightweight sandbox-boot fixture is available to integration tests")

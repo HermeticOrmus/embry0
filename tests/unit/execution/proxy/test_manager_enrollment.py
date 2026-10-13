@@ -154,7 +154,7 @@ async def _manager_with_git_proxy(monkeypatch):
         captured.append(kwargs)
         # A current git-proxy echoes the grant it stored (#521).
         body = kwargs.get("body") or {}
-        return {k: body[k] for k in ("allowed_repos", "git_upstream", "git_push") if k in body}
+        return {k: body[k] for k in ("allowed_repos", "git_upstream", "git_push", "git_push_branches") if k in body}
 
     monkeypatch.setattr(pm, "_exec_admin_request", fake_exec)
     return pm, captured

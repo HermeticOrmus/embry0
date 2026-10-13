@@ -340,3 +340,48 @@ async def test_force_conditional_groups_absent_when_not_set():
         )
 
     assert "force_conditional_groups" not in captured.get("qa", {})
+
+
+@pytest.mark.asyncio
+async def test_sandbox_profile_override_seeded_into_qa_state():
+    """#537: the override must reach qa["sandbox_profile"], where
+    qa_orchestrator_node applies it; nothing is invented when it is absent."""
+    captured: list[dict] = []
+
+    async def fake_execute(initial_state, *args, **kwargs):
+        captured.append(initial_state)
+        return None, False, None
+
+    executor = _make_executor()
+    with patch.object(executor, "_execute_workflow_stream", side_effect=fake_execute):
+        await executor._run_qa_workflow(
+            job_id="job-5", repo="org/r", branch="b", qa_overrides={"sandbox_profile": "qa-custom"}
+        )
+        await executor._run_qa_workflow(job_id="job-6", repo="org/r", branch="b", qa_overrides={})
+
+    assert captured[0]["qa"].get("sandbox_profile") == "qa-custom", (
+        f"the sandbox_profile override never reached the orchestrator's state: {captured[0]['qa']}"
+    )
+    assert "sandbox_profile" not in captured[1]["qa"]
+    assert "sandbox_profile_name" not in captured[1]["qa"], "a qa-jvm placeholder must not be seeded"
+
+
+@pytest.mark.asyncio
+async def test_job_row_records_the_profile_the_run_used():
+    """#537: the terminal update writes the profile the orchestrator resolved."""
+    executor = _make_executor()
+    executor._traces.get_job_cost = AsyncMock(return_value=None)
+
+    async def fake_execute(initial_state, *args, **kwargs):
+        return {"qa": {"final_status": "passed", "sandbox_profile_used": "slim", "per_app_results": []}}, False, None
+
+    with (
+        patch.object(executor, "_execute_workflow_stream", side_effect=fake_execute),
+        patch("embry0.services._executor_run.resolve_job_total_cost", AsyncMock(return_value=0.0)),
+    ):
+        await executor._run_qa_workflow(job_id="job-7", repo="org/r", branch="b", qa_overrides={})
+
+    terminal = [c.kwargs for c in executor._jobs.update.await_args_list if c.kwargs.get("status") == "completed"]
+    assert terminal and terminal[0].get("sandbox_profile") == "slim", (
+        f"the jobs row must record the profile the run used; terminal update was {terminal}"
+    )

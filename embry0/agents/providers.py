@@ -24,6 +24,7 @@ Caveats (documented on EMB-36):
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 
@@ -98,3 +99,31 @@ def provider_for_model(model: str) -> ModelProvider | None:
 def known_models() -> set[str]:
     """Every model id any catalog provider declares."""
     return {m for provider in CATALOG_PROVIDERS for m in provider.models}
+
+
+def unpriced_models(models: Iterable[str]) -> list[str]:
+    """The ids in ``models`` that route to a non-Anthropic provider with no price entry.
+
+    Such a provider reports no cost of its own, so its token counts priced from
+    ``pricing_usd_per_mtok`` are the only accounting there is (#219). A model that
+    routes there by prefix but has no rates would run unmetered, so it is refused
+    wherever a model id is configured, and again when an agent's model resolves.
+    Anthropic models are not checked: the Claude CLI reports their cost.
+    """
+    found: set[str] = set()
+    for model in models:
+        if not model:
+            continue
+        provider = provider_for_model(model)
+        if provider is not None and model not in provider.pricing_usd_per_mtok:
+            found.add(model)
+    return sorted(found)
+
+
+def unpriced_models_message(models: Iterable[str]) -> str:
+    """The operator-facing refusal for ``unpriced_models``' result."""
+    return (
+        f"model(s) have no price entry: {', '.join(models)} — a provider-routed model "
+        "must be listed in pricing_usd_per_mtok (embry0/agents/providers.py), or its "
+        "runs would be metered at $0"
+    )

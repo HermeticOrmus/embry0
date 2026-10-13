@@ -341,3 +341,78 @@ async def test_ensure_image_self_builds_when_context_present(tmp_path):
     assert built is True
     issued = [c[0][0] for c in docker.run_cmd.call_args_list]
     assert any("build" in cmd for cmd in issued), "self-build must still occur"
+
+
+class _RegistryRuntime:
+    """Runtime stub for #622: the daemon's local store lacks the image; the registry may have it."""
+
+    def __init__(self, *, in_registry: bool) -> None:
+        self._in_registry = in_registry
+        self.local: set[str] = set()
+        self.pulled: list[str] = []
+        self.built: list[str] = []
+
+    async def image_exists(self, image: str, *, timeout: int = 60) -> bool:
+        return image in self.local
+
+    async def pull_image(self, image: str, *, timeout: int = 180) -> None:
+        self.pulled.append(image)
+        if not self._in_registry:
+            raise RuntimeError("manifest unknown")
+        self.local.add(image)
+
+    async def build_image(self, tag: str, **_kwargs) -> None:  # pragma: no cover — must not be called
+        self.built.append(tag)
+
+
+_PINNED = "registry:5000/embry0-sandbox:latest@sha256:" + "5f" * 32
+
+
+@pytest.mark.asyncio
+async def test_ensure_image_pulls_a_pinned_image_the_daemon_has_not_pulled_yet(tmp_path, monkeypatch):
+    """#622: after a rebuild the new digest is in the registry but not yet in the daemon's store."""
+    from structlog.testing import capture_logs
+
+    import embry0.execution.image_manager as im
+
+    monkeypatch.setattr(im, "qualify_image", lambda image, registry: _PINNED)
+    runtime = _RegistryRuntime(in_registry=True)
+    mgr = SandboxImageManager(runtime, app_root=str(tmp_path), image_registry="registry:5000")  # type: ignore[arg-type]
+
+    with capture_logs() as logs:
+        built = await mgr.ensure_image("embry0-sandbox:latest")
+
+    assert built is False
+    errors = [e for e in logs if e["log_level"] == "error"]
+    assert not errors, f"an image the registry holds must not be reported missing: {errors}"
+    assert runtime.pulled == [_PINNED], f"startup must pull the pinned reference, pulled {runtime.pulled}"
+    assert runtime.built == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_image_reports_an_image_absent_from_the_registry_too(tmp_path, monkeypatch):
+    from structlog.testing import capture_logs
+
+    import embry0.execution.image_manager as im
+
+    monkeypatch.setattr(im, "qualify_image", lambda image, registry: _PINNED)
+    runtime = _RegistryRuntime(in_registry=False)
+    mgr = SandboxImageManager(runtime, app_root=str(tmp_path), image_registry="registry:5000")  # type: ignore[arg-type]
+
+    with capture_logs() as logs:
+        built = await mgr.ensure_image("embry0-sandbox:latest")
+
+    assert built is False
+    errors = [e for e in logs if e["event"] == "sandbox_image_unavailable_no_build_context"]
+    assert errors and errors[0]["log_level"] == "error", f"a genuinely absent image is an error, got {logs}"
+    assert "manifest unknown" in errors[0]["pull_error"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_image_does_not_pull_an_unqualified_name(tmp_path):
+    """Without a registry the name would resolve to Docker Hub; nothing is pulled."""
+    runtime = _RegistryRuntime(in_registry=True)
+    mgr = SandboxImageManager(runtime, app_root=str(tmp_path))  # type: ignore[arg-type]
+
+    assert await mgr.ensure_image("embry0-sandbox:latest") is False
+    assert runtime.pulled == []

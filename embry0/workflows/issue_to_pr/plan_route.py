@@ -23,7 +23,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 
 from embry0.workflows._validation import validate_graph_definition
-from embry0.workflows.issue_to_pr.route_plan import LEGACY_ROUTE_PLAN, build_route_plan
+from embry0.workflows.issue_to_pr.route_plan import LEGACY_ROUTE_PLAN, build_route_plan, triage_template_config
 
 logger = structlog.get_logger(__name__)
 
@@ -249,6 +249,26 @@ async def _find_template(
     return None
 
 
+async def pinned_triage_template_config(state: dict[str, Any], templates_repo: Any) -> dict[str, Any] | None:
+    """The triage node config of the template the job named up front (#468).
+
+    Only a template named on the job (``pipeline_template_request``) is known
+    before triage runs; one that triage picks, or a kind default, is resolved
+    after it. Best-effort: a lookup failure leaves triage on its usual model.
+    """
+    requested = str(state.get("pipeline_template_request") or "")
+    if templates_repo is None or requested in _LEGACY_TEMPLATE_VALUES:
+        return None
+    try:
+        row = await _find_template(templates_repo, name=requested)
+    except Exception:
+        logger.warning("triage_template_lookup_failed", template=requested, exc_info=True)
+        return None
+    if row is None:
+        return None
+    return triage_template_config(row.get("graph_definition") or {})
+
+
 async def plan_route_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     """Resolve template → route_plan snapshot. Resolution order:
 
@@ -259,6 +279,13 @@ async def plan_route_node(state: dict[str, Any], config: RunnableConfig) -> dict
     An invalid template falls through to the next tier — except an
     *explicitly requested* invalid template with no kind default, which
     fails loudly (silently-wrong routing would be worse).
+
+    #306: a job working a watcher-origin case (``pin_full_pipeline``) always
+    runs the full code pipeline — the ``code`` kind default (review and QA),
+    or the legacy plan. Triage's template pick and job kind are ignored for
+    it, so triage cannot route an unattended self-healing fix to
+    ``quick-fix`` or to a kind without review. An operator's explicit
+    ``pipeline_template_request`` still wins: that is a person's call.
     """
     writer = get_stream_writer()
     writer({"type": "node_started", "node": "plan_route"})
@@ -266,6 +293,15 @@ async def plan_route_node(state: dict[str, Any], config: RunnableConfig) -> dict
     decision = state.get("triage_decision") or {}
     job_kind = str(decision.get("job_kind") or "code")
     requested = str(decision.get("pipeline_template") or "")
+    if state.get("pin_full_pipeline") and (requested not in _LEGACY_TEMPLATE_VALUES or job_kind != "code"):
+        logger.info(
+            "plan_route_triage_pick_overridden",
+            job_id=state.get("job_id"),
+            reason="watcher-origin case runs the full pipeline",
+            triage_template=requested or None,
+            triage_kind=job_kind,
+        )
+        requested, job_kind = "", "code"
     explicit = requested not in _LEGACY_TEMPLATE_VALUES
 
     # RAV-1058: a template named on JobCreateRequest.pipeline_template is an

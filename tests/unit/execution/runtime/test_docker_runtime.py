@@ -331,7 +331,7 @@ async def test_attach_policy_allows_the_declared_targets_and_the_readable_proxie
         reachable_containers=["github-proxy", "xai-proxy", "gone-proxy", "github-proxy"],
     )
     fake.ensure_helper_image.assert_awaited_once()
-    fake.apply.assert_awaited_once_with("172.20.0.9", ["10.0.0.5", "172.20.0.2"])
+    fake.apply.assert_awaited_once_with("172.20.0.9", ["10.0.0.5"], proxy_ips=["172.20.0.2"])
 
 
 @pytest.mark.asyncio

@@ -56,14 +56,21 @@ def _row(*, last_seen_at: datetime, occurrences: int = 400, span_hours: float = 
 class _Service:
     def __init__(self) -> None:
         self.verdicts: list[tuple[str, Any, str | None]] = []
+        self.evidence: list[dict[str, Any]] = []
+        self.reopens: list[tuple[str, str, str | None]] = []
 
     async def record_verdict(self, case_id, verdict, *, evidence, event_key=None, checked_at=None):
         self.verdicts.append((case_id, verdict, event_key))
+        self.evidence.append(evidence)
         return None
 
+    async def reopen(self, case_id, *, reason, at=None, event_key=None):
+        self.reopens.append((case_id, reason, event_key))
+        return {"id": case_id, "stage": "accepted"}
 
-def _sweep(cases, row, *, comments=None, **cfg):
-    repo = SimpleNamespace(awaiting_verdict=_async(cases))
+
+def _sweep(cases, row, *, comments=None, retry=(), **cfg):
+    repo = SimpleNamespace(awaiting_verdict=_async(cases), not_healed_awaiting_retry=_async(list(retry)))
     signatures = SimpleNamespace(get=_async(row))
     service = _Service()
 
@@ -361,3 +368,50 @@ def test_production_wires_the_linear_commenter() -> None:
             assert "linear_commenter(" in ast.unparse(commenter), ast.unparse(commenter)
             return
     pytest.fail("ConfirmHealedSweep is not constructed in app.py")
+
+
+# ---- #451: a not_healed verdict earns a retry ------------------------------
+
+
+def _not_healed(**over: Any) -> dict[str, Any]:
+    return _case(stage="verified", healed_verdict="not_healed", reopens=0, **over)
+
+
+@pytest.mark.asyncio
+async def test_a_not_healed_case_with_retries_left_is_reopened() -> None:
+    comments: list[tuple[str, str]] = []
+    sweep, service = _sweep([], None, comments=comments, retry=[_not_healed()])
+    tally = await sweep.run_once()
+    assert tally["reopened"] == 1, f"a not_healed case with retries left was not reopened: {tally}"
+    case_id, reason, key = service.reopens[0]
+    assert case_id == "hc-1"
+    assert "retry 1 of 1" in reason, reason
+    assert key and "hc-1" in key
+    assert any("another fix attempt" in body for _k, body in comments), comments
+
+
+@pytest.mark.asyncio
+async def test_the_reopen_key_is_stable_across_passes() -> None:
+    """Two passes over the same failed attempt reopen it once: the ledger
+    drops the repeated event_key."""
+    sweep, service = _sweep([], None, retry=[_not_healed()])
+    await sweep.run_once()
+    await sweep.run_once()
+    assert len({key for _, _, key in service.reopens}) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_not_healed_verdict_says_whether_a_retry_follows() -> None:
+    sweep, service = _sweep([_case(reopens=0)], _row(last_seen_at=NOW - timedelta(minutes=30)))
+    await sweep.run_once()
+    assert service.evidence[0]["retries"] == {"used": 0, "allowed": 1, "next": "reopen"}
+
+
+@pytest.mark.asyncio
+async def test_a_not_healed_verdict_past_the_budget_stops_and_says_why() -> None:
+    comments: list[tuple[str, str]] = []
+    sweep, service = _sweep([_case(reopens=1)], _row(last_seen_at=NOW - timedelta(minutes=30)), comments=comments)
+    tally = await sweep.run_once()
+    assert tally["not_healed"] == 1
+    assert service.evidence[0]["retries"] == {"used": 1, "allowed": 1, "next": "a person decides"}, service.evidence
+    assert "retries are spent" in comments[0][1], comments

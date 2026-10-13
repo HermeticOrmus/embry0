@@ -5,7 +5,7 @@ import os
 import secrets
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from fastapi import FastAPI
@@ -501,7 +501,9 @@ async def _clean_orphaned_sandboxes(runtime: "AgentRuntime", sandbox_mgr: object
         logger.warning("orphaned_container_scan_skipped", reason="active jobs unavailable", exc_info=True)
         return
     try:
-        containers = await runtime.list_containers(name="sandbox-", timeout=15)
+        from embry0.execution.sandbox_listing import list_sandbox_containers
+
+        containers = await list_sandbox_containers(runtime, timeout=15)
         total = 0
         failed = 0
         for container_name in (c.name for c in containers):
@@ -621,7 +623,7 @@ async def _bring_up_qa_minio(
 
     Runs as a background task so the orchestrator boots without MinIO, and
     compose need not start MinIO first (#573). Until it returns, ``qa_minio``
-    stays None: the QA routes answer 503 and ``init_qa`` fails fast, as
+    stays None: the QA routes answer 503 and a QA run fails fast, as
     before. The executor may already exist by then, so it is updated too.
     """
     await internal.prepare_bucket("qa-artifacts", expire_days=expire_days, retry_delays=retry_delays)
@@ -818,7 +820,7 @@ async def _init_app_state(
         repos_repo=app.state.repos_repo,
         secrets_provider=getattr(app.state, "secrets_provider", None),
         # QA deps may be absent in tests / when MinIO is unconfigured; the
-        # executor tolerates None and only init_qa_node will fail at runtime.
+        # executor tolerates None and only a QA run will fail at runtime.
         qa_minio=getattr(app.state, "qa_minio", None),
         qa_minio_sandbox=getattr(app.state, "qa_minio_sandbox", None),
         qa_token_registry=getattr(app.state, "qa_token_registry", None),
@@ -982,23 +984,46 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.qa_event_bus = QAEventBus()
 
-    # Recover orphaned jobs from previous orchestrator lifecycle. Lifecycle
-    # knowledge lives in the repositories (RAV-1063): fail_orphaned /
+    # Recover the jobs the previous orchestrator lifecycle left in flight.
+    # Lifecycle knowledge lives in the repositories (RAV-1063): fail_orphaned /
     # reopen_stuck_for_jobs are the set-based boot-reconciliation writes.
     # RAV-1221: _init_app_state runs later in this lifespan, so the app.state
     # repos don't exist yet — build repos on the pool directly (same pattern
     # as the Linear-sync wiring below), or every restart skips reconciliation.
+    # #307: jobs that can go on are taken back here and started at the end of
+    # startup, once the executor and the proxies exist (_recover_jobs below);
+    # the rest fail as before.
+    recovering: list[dict[str, Any]] = []
     try:
+        from embry0.orchestration.restart import take_back_jobs
         from embry0.safety.error_codes import ErrorCode
         from embry0.storage.repositories.issues import IssuesRepository
 
         boot_jobs_repo = JobsRepository(db, metrics=getattr(app.state, "loop_metrics", None))
+        exhausted: list[str] = []
+        try:
+            recovering, exhausted = await take_back_jobs(boot_jobs_repo, db, max_attempts=config.max_resume_attempts)
+        except Exception:
+            # Recovery is the extra; failing the orphans is the floor.
+            logger.exception("job_recovery_planning_failed")
+            recovering = []
         orphan_message = "Orchestrator restarted — job was orphaned"
-        # #583: a job queued for a run slot never ran, and nothing resumes it.
+        # #583: a job queued for a run slot never ran. Since #307 one is
+        # started again at boot only when its row records how (launch).
         not_started = "Orchestrator restarted before the job started; nothing ran. Dispatch it again."
-        orphaned_ids = await boot_jobs_repo.fail_orphaned(
-            ErrorCode.ORPHANED.value, orphan_message, never_started_message=not_started
+        drained = (
+            "Orchestrator shut down during the job and could not resume it "
+            "(QA and onboard jobs, and jobs without a checkpoint, start over). Dispatch it again."
         )
+        orphaned_ids = await boot_jobs_repo.fail_orphaned(
+            ErrorCode.ORPHANED.value,
+            orphan_message,
+            never_started_message=not_started,
+            keep=[job["job_id"] for job in recovering],
+            interrupted_code=ErrorCode.INTERRUPTED_BY_SHUTDOWN.value,
+            interrupted_message=drained,
+        )
+        orphaned_ids += exhausted
         if orphaned_ids:
             logger.warning("recovering_orphaned_jobs", count=len(orphaned_ids), job_ids=orphaned_ids)
             # The executor's credential-use stamp never runs for these jobs;
@@ -1008,8 +1033,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
             boot_credentials_repo = _BootCredentialsRepo(db)
             for jid in orphaned_ids:
+                outcome = ErrorCode.RESUME_LIMIT if jid in exhausted else ErrorCode.ORPHANED
                 try:
-                    await boot_credentials_repo.finish_uses(jid, ErrorCode.ORPHANED.value)
+                    await boot_credentials_repo.finish_uses(jid, outcome.value)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("credential_uses_finish_failed", job_id=jid, error=type(exc).__name__)
             # Append synthetic node_failed events to job_logs so the frontend
@@ -1303,18 +1329,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         orchestrator_api_key=context_proxy_key,
         context_container_allowlist=config.context_proxy_container_allowlist,
         context_query_quota=config.context_proxy_query_quota,
+        log_redaction_fields=config.log_redaction_fields,
     )
 
-    # #554: a sandbox on sandbox-restricted may reach the proxies just
-    # launched and no other sandbox. Written now, not at the first create:
-    # the proxies' addresses change with every start, and the paused
-    # sandboxes kept from the previous process need the new ones. Not fatal,
-    # like the egress probe above: create() writes the chain again and
-    # refuses every sandbox while it cannot.
+    # #554, #568: a sandbox may reach the proxies just launched and no other
+    # sandbox. Written now, not at the first create: the proxies' addresses
+    # change with every start, and the paused sandboxes kept from the
+    # previous process need the new ones (on sandbox-internet as well as
+    # sandbox-restricted). Not fatal, like the egress probe above: create()
+    # writes both again and refuses every sandbox while it cannot, and a
+    # resume refreshes them before it re-enrolls.
     try:
-        await sandbox_mgr.ensure_isolation()
+        await sandbox_mgr.refresh_proxy_policy()
     except Exception as exc:  # noqa: BLE001
         logger.error("sandbox_isolation_unavailable", error=str(exc))
+    # #626: a proxy found stopped is recreated, maybe at new addresses, and
+    # the rules naming its addresses must follow it.
+    proxy_mgr.on_proxy_recreated(sandbox_mgr.refresh_proxy_policy)
 
     # Provision the xai-proxy with each registered account so the first grok
     # request doesn't race the background refresh loop.
@@ -1352,6 +1383,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         volume_reaper = VolumeReaper(
             runtime,
             JobsRepository(db),
+            # Its own repository: _init_app_state, which sets
+            # app.state.qa_volume_state_repo, runs later in this lifespan.
+            state_repo=QAVolumeStateRepository(db),
             instance_id=volume_instance_id,
             interval_seconds=config.volume_reaper_interval_seconds,
             dry_run=config.volume_reaper_dry_run,
@@ -1522,9 +1556,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     # Seed the log scrubbers with every registry secret before any job runs.
-    from embry0.safety.redaction import register_known_secrets
+    from embry0.safety.redaction import register_known_secrets, register_redacted_fields
 
     register_known_secrets(await app.state.credential_resolver.known_secret_values())
+    register_redacted_fields(config.log_redaction_fields)
 
     # Now that _init_app_state has populated the repos and docker is ready,
     # construct SharedVolumeManager and update both the placeholder on app.state
@@ -1904,6 +1939,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         agent_sessions_repo=app.state.agent_sessions_repo,
         executor=app.state.issue_executor,
         credential_resolver=app.state.credential_resolver,
+        case_recorder=app.state.case_recorder,
     )
     if config.comment_dispatch_enabled:
         logger.info(
@@ -1926,10 +1962,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         app.state.telegram_webhook_secret = ""
 
+    # #307: the jobs boot took back above, now that the executor, the proxies
+    # and the volume manager exist. Each runs as an ordinary job task.
+    _start_recovered_jobs(app.state.issue_executor, recovering)
+
     logger.info("embry0_started")
     yield
 
     logger.info("embry0_stopping")
+    # #307: drain first, while every intake loop is still running: from here
+    # on a dispatch stays pending for the next boot instead of starting, and
+    # the running jobs stop at a checkpoint (or the deadline) and are stamped
+    # as interrupted. Only then are the loops and leftover tasks cancelled.
+    try:
+        await app.state.issue_executor.drain(config.shutdown_drain_seconds)
+    except Exception:
+        logger.exception("executor_drain_failed")
     from embry0.orchestration.channels import set_fold_observer as _set_fold_observer
 
     _set_fold_observer(None)
@@ -1999,6 +2047,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         logger.warning("database_close_failed", exc_info=True)
     logger.info("embry0_stopped")
+
+
+def _start_recovered_jobs(executor: Any, jobs: list[dict[str, Any]]) -> None:
+    """Start the jobs boot recovery took back (#307): resume a checkpointed
+    one, launch the others again. One that cannot be started stays in flight
+    and the next boot decides again."""
+    for job in jobs:
+        try:
+            if job["action"] == "resume":
+                executor.resume_after_restart(job)
+            else:
+                executor.relaunch(job)
+        except Exception:
+            logger.exception("job_recovery_start_failed", job_id=job.get("job_id"))
+    if jobs:
+        logger.info(
+            "jobs_recovered_after_restart",
+            resumed=[j["job_id"] for j in jobs if j["action"] == "resume"],
+            relaunched=[j["job_id"] for j in jobs if j["action"] != "resume"],
+        )
 
 
 def create_app(
@@ -2131,6 +2199,10 @@ def _register_routers(app: FastAPI) -> None:
     app.include_router(deliverables.router, prefix="/api/v1", tags=["deliverables"], dependencies=auth_deps)
     # RAV-1057: on-demand container-log queries (Loki proxy).
     app.include_router(logs.router, prefix="/api/v1", tags=["logs"], dependencies=auth_deps)
+    # #634: the live log tail is an EventSource, so its route takes a
+    # job-scoped token as well as the header. Included first: the artifacts
+    # router's `{path:path}` catch-all would otherwise shadow it.
+    app.include_router(qa_artifacts.log_stream_router, prefix="/api/v1", tags=["qa-artifacts"])
     app.include_router(qa_artifacts.router, prefix="/api/v1", tags=["qa-artifacts"], dependencies=auth_deps)
     app.include_router(qa_dashboard.router, prefix="/api/v1", tags=["qa-dashboard"], dependencies=auth_deps)
     # EMB-42: per-repo pre-baked QA cache-image builds. Synchronous and

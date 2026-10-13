@@ -9,9 +9,7 @@ from embry0.storage.database import DatabasePool
 
 logger = structlog.get_logger(__name__)
 
-_UPDATABLE_FIELDS = frozenset(
-    {"name", "description", "graph_definition", "agent_models", "sandbox_profile", "default_for_kind"}
-)
+_UPDATABLE_FIELDS = frozenset({"name", "description", "graph_definition", "sandbox_profile", "default_for_kind"})
 
 
 class PipelineTemplatesRepository:
@@ -40,7 +38,6 @@ class PipelineTemplatesRepository:
         name: str,
         graph_definition: dict[str, Any],
         description: str = "",
-        agent_models: dict[str, Any] | None = None,
         sandbox_profile: str | None = None,
         default_for_kind: str | None = None,
     ) -> dict[str, Any]:
@@ -49,15 +46,14 @@ class PipelineTemplatesRepository:
         await self._db.execute(
             """
             INSERT INTO pipeline_templates (
-                id, name, description, graph_definition, agent_models, sandbox_profile, default_for_kind
+                id, name, description, graph_definition, sandbox_profile, default_for_kind
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            VALUES ($1, $2, $3, $4, $5, $6)
             """,
             template_id,
             name,
             description,
             graph_definition,
-            agent_models or {},
             sandbox_profile,
             default_for_kind,
         )
@@ -95,7 +91,6 @@ class PipelineTemplatesRepository:
         name: str,
         graph_definition: dict[str, Any],
         description: str = "",
-        agent_models: dict[str, Any] | None = None,
         sandbox_profile: str | None = None,
         default_for_kind: str | None = None,
     ) -> dict[str, Any]:
@@ -114,14 +109,13 @@ class PipelineTemplatesRepository:
         await self._db.execute(
             """
             INSERT INTO pipeline_templates (
-                id, name, description, graph_definition, agent_models,
+                id, name, description, graph_definition,
                 sandbox_profile, default_for_kind, is_builtin, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, TRUE, NOW())
             ON CONFLICT (name) DO UPDATE SET
                 description = EXCLUDED.description,
                 graph_definition = EXCLUDED.graph_definition,
-                agent_models = EXCLUDED.agent_models,
                 sandbox_profile = EXCLUDED.sandbox_profile,
                 default_for_kind = EXCLUDED.default_for_kind,
                 is_builtin = TRUE,
@@ -131,7 +125,6 @@ class PipelineTemplatesRepository:
             name,
             description,
             graph_definition,
-            agent_models or {},
             sandbox_profile,
             default_for_kind,
         )
@@ -150,6 +143,5 @@ class PipelineTemplatesRepository:
         return await self.create(
             name=new_name,
             graph_definition=source["graph_definition"],
-            agent_models=source["agent_models"],
             sandbox_profile=source["sandbox_profile"],
         )

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 from aiohttp.test_utils import TestClient
@@ -415,14 +417,45 @@ async def test_scoped_unparseable_upstream_body_is_withheld(ctx):
     assert "secret=abc" not in await resp.text()
 
 
-async def test_unscoped_results_pass_through_unchanged(ctx):
-    """Redaction of the watcher's own drill-down is issue #294, not this change."""
+async def test_unscoped_results_are_redacted_too(ctx):
+    """#294: the watcher's analysis agent (an unscoped enrollment) hands what
+    it reads to a model provider exactly as the developer does."""
     client, fake = ctx
-    body = b'{"lines": [{"line": "user jane@example.com"}]}'
-    fake.response = _FakeUpstreamResponse(content=body)
+    from tests.fixtures.redaction_corpus import CORPUS
+
+    lines = [{"ts": str(i), "container": "acme-backend", "line": line} for i, (line, _) in enumerate(CORPUS)]
+    fake.response = _FakeUpstreamResponse(content=json.dumps({"count": len(lines), "lines": lines}).encode())
     await _enroll(client)
     resp = await client.get("/api/v1/logs/query", params={"container": "acme-backend"}, headers=_bearer())
-    assert await resp.read() == body
+    text = await resp.text()
+    assert resp.status == 200
+    leaked = [secret for _, secret in CORPUS if secret in text]
+    assert leaked == [], f"an unscoped (watcher) drill-down returned raw {leaked}"
+    assert "<email>" in text
+
+
+async def test_unscoped_unparseable_upstream_body_is_withheld(ctx):
+    client, fake = ctx
+    fake.response = _FakeUpstreamResponse(content=b"secret=abc not json")
+    await _enroll(client)
+    resp = await client.get("/api/v1/logs/query", params={"container": "acme-backend"}, headers=_bearer())
+    assert resp.status == 502
+    assert "secret=abc" not in await resp.text()
+
+
+async def test_configured_payload_fields_are_redacted_in_results(ctx):
+    from embry0.safety.redaction import register_redacted_fields
+
+    client, fake = ctx
+    fake.response = _FakeUpstreamResponse(content=b'{"lines": [{"line": "lead phone=+15551234 created"}]}')
+    register_redacted_fields("phone")
+    try:
+        await _enroll(client)
+        resp = await client.get("/api/v1/logs/query", params={"container": "acme-backend"}, headers=_bearer())
+        line = (await resp.json())["lines"][0]["line"]
+    finally:
+        register_redacted_fields([])
+    assert "+15551234" not in line, line
 
 
 def test_the_per_line_ceiling_is_a_ceiling() -> None:

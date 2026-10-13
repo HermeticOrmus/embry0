@@ -36,6 +36,16 @@ SCOPES_FOR_ROLE: dict[str, set[str]] = {
     "deploy": {"host"},
 }
 
+
+class _Keep:
+    """Type of ``KEEP``: an update argument that leaves the stored value alone."""
+
+    def __repr__(self) -> str:
+        return "KEEP"
+
+
+KEEP = _Keep()
+
 _PUBLIC_COLUMNS = (
     "id, kind, provider, host, label, git_author_name, git_author_email, public_material, "
     "masked_preview, verified_login, status, status_reason, quarantined_until, created_by, "
@@ -159,23 +169,32 @@ class CredentialsRepository:
         credential_id: str,
         *,
         label: str | None = None,
-        git_author_name: str | None = None,
-        git_author_email: str | None = None,
+        git_author_name: str | None | _Keep = KEEP,
+        git_author_email: str | None | _Keep = KEEP,
     ) -> dict[str, Any] | None:
+        """Change a credential's label and git author identity.
+
+        ``label=None`` keeps the label. An author field left at ``KEEP``
+        keeps its value, and ``None`` clears it back to "use branding" (#440).
+        """
+        set_name = not isinstance(git_author_name, _Keep)
+        set_email = not isinstance(git_author_email, _Keep)
         row = await self._db.fetchrow(
             f"""
             UPDATE credentials
                SET label = COALESCE($2, label),
-                   git_author_name = COALESCE($3, git_author_name),
-                   git_author_email = COALESCE($4, git_author_email),
+                   git_author_name = CASE WHEN $5 THEN $3 ELSE git_author_name END,
+                   git_author_email = CASE WHEN $6 THEN $4 ELSE git_author_email END,
                    updated_at = NOW()
              WHERE id = $1
             RETURNING {_PUBLIC_COLUMNS}
             """,
             credential_id,
             label,
-            git_author_name,
-            git_author_email,
+            git_author_name if set_name else None,
+            git_author_email if set_email else None,
+            set_name,
+            set_email,
         )
         return dict(row) if row else None
 

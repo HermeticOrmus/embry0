@@ -116,3 +116,38 @@ async def test_reset_builtin_restores_seed(api_client: AsyncClient, builtin_prof
     assert body["name"] == "qa-jvm"
     assert body["dind_enabled"] is True
     assert body["base_image"] == "embry0-sandbox-qa:latest"
+
+
+# ── #544: env_defaults takes the env-var API's reserved-key check ─────────
+
+
+_REFUSED_ENV_DEFAULTS = [
+    {"GITHUB_TOKEN": "x"},
+    {"docker_host": "tcp://h:2375"},  # case-insensitive
+    {"CLAUDE_ANYTHING": "x"},  # reserved prefix
+    {"NODE_OPTIONS": "--require /tmp/hook.js"},  # value-checked key
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("env_defaults", _REFUSED_ENV_DEFAULTS)
+async def test_post_refuses_a_reserved_env_default(api_client: AsyncClient, env_defaults):
+    r = await api_client.post("/api/v1/sandbox-profiles", json={"name": "env-refused", "env_defaults": env_defaults})
+    assert r.status_code == 422, f"POST accepted reserved env_defaults {env_defaults}: {r.status_code}"
+    assert (await api_client.get("/api/v1/sandbox-profiles/env-refused")).status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("env_defaults", _REFUSED_ENV_DEFAULTS)
+async def test_put_refuses_a_reserved_env_default(api_client: AsyncClient, env_defaults):
+    assert (await api_client.post("/api/v1/sandbox-profiles", json={"name": "env-put"})).status_code == 201
+    r = await api_client.put("/api/v1/sandbox-profiles/env-put", json={"name": "env-put", "env_defaults": env_defaults})
+    assert r.status_code == 422, f"PUT accepted reserved env_defaults {env_defaults}: {r.status_code}"
+    assert (await api_client.get("/api/v1/sandbox-profiles/env-put")).json()["env_defaults"] == {}
+
+
+@pytest.mark.asyncio
+async def test_allowed_env_defaults_still_save(api_client: AsyncClient):
+    env = {"LANG": "C.UTF-8", "NODE_OPTIONS": "--max-old-space-size=4096"}
+    r = await api_client.post("/api/v1/sandbox-profiles", json={"name": "env-ok", "env_defaults": env})
+    assert r.status_code == 201, r.text

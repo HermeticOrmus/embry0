@@ -54,7 +54,7 @@ _SHARED_PREFIXES: Final[tuple[str, ...]] = (
 
 # Orchestrator-env switches read straight off os.environ instead of being
 # Embry0Config fields (EMB-46, execution/sandbox_manager.py), plus the CLI's
-# own base-URL vars: EMBRY0_API_URL (cli/__main__.py, embry0_mcp/client.py)
+# own base-URL vars: EMBRY0_API_URL (cli/__main__.py, embry0/mcp_server/client.py)
 # and EMBRY0_URL (the `health` subcommand, services/linear_dispatch.py). The
 # orchestrator image sets EMBRY0_API_URL so the in-container CLI reaches :8000
 # (#334) - without this entry every boot would log an unknown-env warning

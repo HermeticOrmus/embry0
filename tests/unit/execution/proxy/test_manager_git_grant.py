@@ -18,7 +18,7 @@ import structlog
 
 from embry0.execution.proxy.manager import ProxyManager
 
-_GRANT = ("allowed_repos", "git_upstream", "git_push")
+_GRANT = ("allowed_repos", "git_upstream", "git_push", "git_push_branches")
 
 
 def _manager(monkeypatch, *, echo=lambda body: {k: body[k] for k in _GRANT if k in body}):
@@ -167,3 +167,62 @@ async def test_no_ca_means_no_ca_env_on_the_git_proxy():
     await pm.start(github_token="ghp_x")
     assert "GITLAB_CA_PEM" not in _git_env(pm._docker)
     await pm.stop()
+
+
+async def test_a_push_grant_names_its_branches_and_the_job(monkeypatch):
+    """#559: the git-proxy refuses every ref update outside ``git_push_branches``."""
+    pm, captured = _manager(monkeypatch)
+    await _enroll(
+        pm,
+        "sb-1",
+        forge="github",
+        repo="acme/widgets",
+        git_upstream="https://github.com",
+        git_push=True,
+        git_push_branches=["embry0/iss-1-x", "embry0/iss-1-x", "refs/heads/main", "a..b"],
+        job_id="job-1",
+    )
+    body = _git_body(captured)
+    assert body["git_push_branches"] == ["embry0/iss-1-x"], "a name the proxy would refuse is dropped, not sent"
+    assert body["job_id"] == "job-1"
+
+
+async def test_a_read_only_grant_sends_no_branches(monkeypatch):
+    pm, captured = _manager(monkeypatch)
+    await _enroll(pm, "sb-1", forge="github", repo="acme/widgets", git_upstream="https://github.com")
+    assert "git_push_branches" not in _git_body(captured)
+
+
+async def test_a_git_proxy_that_does_not_echo_the_push_branches_is_refused(monkeypatch):
+    """The image before #559 ignores the branches and lets a push touch any ref: fail closed."""
+    old_image = ("allowed_repos", "git_upstream", "git_push")
+    pm, captured = _manager(monkeypatch, echo=lambda body: {k: body[k] for k in old_image if k in body})
+    with pytest.raises(RuntimeError, match="did not confirm"):
+        await _enroll(
+            pm,
+            "sb-1",
+            forge="github",
+            repo="acme/widgets",
+            git_upstream="https://github.com",
+            git_push=True,
+            git_push_branches=["embry0/iss-1-x"],
+        )
+    assert [c["container"] for c in captured if c["method"] == "DELETE"] == ["git-proxy"]
+    # A read-only sandbox does not depend on the new field, so it still works against that image.
+    pm, _ = _manager(monkeypatch, echo=lambda body: {k: body[k] for k in old_image if k in body})
+    await _enroll(pm, "sb-2", forge="github", repo="acme/widgets", git_upstream="https://github.com")
+
+
+async def test_set_git_push_branches_replaces_the_branches_and_checks_the_echo(monkeypatch):
+    pm, captured = _manager(monkeypatch)
+    await pm.set_git_push_branches("sb-1", ["embry0/iss-1-x"])
+    put = [c for c in captured if c["method"] == "PUT"]
+    assert [(c["container"], c["path"], c["body"]) for c in put] == [
+        ("git-proxy", "/admin/git-push-branches/sb-1", {"git_push_branches": ["embry0/iss-1-x"]})
+    ]
+
+    pm, _ = _manager(monkeypatch, echo=lambda body: {})
+    with pytest.raises(RuntimeError, match="did not confirm"):
+        await pm.set_git_push_branches("sb-1", ["embry0/iss-1-x"])
+    with pytest.raises(RuntimeError, match="not branches"):
+        await pm.set_git_push_branches("sb-1", ["refs/heads/main"])

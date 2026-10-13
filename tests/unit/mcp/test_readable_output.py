@@ -1,10 +1,10 @@
-"""Unit tests for embry0_mcp.server readable-job-output helpers.
+"""Unit tests for embry0.mcp_server.server readable-job-output helpers.
 
 Regression cover for the MCP returning raw API payloads: a job read echoed its
 whole `task` prompt back (thousands of tokens) and buried status/stage/spend/PR.
 """
 
-from embry0_mcp import server
+from embry0.mcp_server import server
 
 JOB = {
     "job_id": "job-abc123",

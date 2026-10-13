@@ -175,3 +175,133 @@ def test_revoke_ownership_enforced():
     # owner revokes own
     app.state.api_keys_repo.get = AsyncMock(return_value=_key_row(user_id="usr-op"))
     assert client.delete("/api/v1/apikeys/key-abc123def456", headers=XRW).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Repository allowlist
+# ---------------------------------------------------------------------------
+
+
+def test_mint_passes_the_cleaned_allowlist():
+    app = _app()
+    client = TestClient(app)
+    client.cookies.set(SESSION_COOKIE, _cookie(["embry0-operator"], "operator"))
+    resp = client.post(
+        "/api/v1/apikeys",
+        json={"name": "bot", "scope": "operate", "allowed_repos": [" acme/widgets", "Acme/Widgets", "acme/docs"]},
+        headers=XRW,
+    )
+    assert resp.status_code == 201, resp.text
+    assert app.state.api_keys_repo.create.await_args.kwargs["allowed_repos"] == ["acme/widgets", "acme/docs"], (
+        "the list must be trimmed and de-duplicated case-insensitively"
+    )
+
+
+@pytest.mark.parametrize("allowed", [None, []])
+def test_mint_without_a_list_is_unrestricted(allowed):
+    app = _app()
+    client = TestClient(app)
+    client.cookies.set(SESSION_COOKIE, _cookie(["embry0-operator"], "operator"))
+    body = {"name": "cli", "scope": "operate"} | ({} if allowed is None else {"allowed_repos": allowed})
+    assert client.post("/api/v1/apikeys", json=body, headers=XRW).status_code == 201
+    assert app.state.api_keys_repo.create.await_args.kwargs["allowed_repos"] is None, "empty must mean unrestricted"
+
+
+@pytest.mark.parametrize("bad", ["widgets", "acme/", "acme/wid gets", "../etc"])
+def test_mint_refuses_a_malformed_repository(bad):
+    app = _app()
+    client = TestClient(app)
+    client.cookies.set(SESSION_COOKIE, _cookie(["embry0-operator"], "operator"))
+    resp = client.post("/api/v1/apikeys", json={"name": "bot", "scope": "operate", "allowed_repos": [bad]}, headers=XRW)
+    assert resp.status_code == 422, f"{bad!r} was accepted as a repository"
+    assert not app.state.api_keys_repo.create.await_count
+
+
+def test_list_shows_the_allowlist():
+    app = _app()
+    app.state.api_keys_repo.list_for_user = AsyncMock(return_value=[_key_row(allowed_repos=("acme/widgets",))])
+    client = TestClient(app)
+    client.cookies.set(SESSION_COOKIE, _cookie(["embry0-operator"], "operator"))
+    keys = client.get("/api/v1/apikeys").json()["keys"]
+    assert keys[0]["allowed_repos"] == ["acme/widgets"]
+
+
+def test_owner_changes_the_allowlist_and_the_cache_is_busted():
+    from embry0.api import deps
+
+    app = _app()
+    app.state.api_keys_repo.set_allowed_repos = AsyncMock(return_value=_key_row(allowed_repos=("acme/widgets",)))
+    client = TestClient(app)
+    client.cookies.set(SESSION_COOKIE, _cookie(["embry0-operator"], "operator"))
+    deps._api_key_cache["stale"] = (1e18, "key-abc123def456", "mine", "operate", "usr-op", False, False, None)
+    resp = client.put(
+        "/api/v1/apikeys/key-abc123def456/allowed-repos", json={"allowed_repos": ["acme/widgets"]}, headers=XRW
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["allowed_repos"] == ["acme/widgets"]
+    app.state.api_keys_repo.set_allowed_repos.assert_awaited_once_with("key-abc123def456", ["acme/widgets"])
+    assert "stale" not in deps._api_key_cache, "a changed allowlist must apply at once, not after the cache TTL"
+
+
+def test_an_empty_list_lifts_the_restriction():
+    app = _app()
+    app.state.api_keys_repo.set_allowed_repos = AsyncMock(return_value=_key_row())
+    client = TestClient(app)
+    client.cookies.set(SESSION_COOKIE, _cookie(["embry0-operator"], "operator"))
+    resp = client.put("/api/v1/apikeys/key-abc123def456/allowed-repos", json={"allowed_repos": []}, headers=XRW)
+    assert resp.status_code == 200
+    assert resp.json()["allowed_repos"] is None
+    app.state.api_keys_repo.set_allowed_repos.assert_awaited_once_with("key-abc123def456", None)
+
+
+def test_an_operator_cannot_change_another_users_key():
+    app = _app()
+    app.state.api_keys_repo.get = AsyncMock(return_value=_key_row(user_id="usr-x"))
+    app.state.api_keys_repo.set_allowed_repos = AsyncMock()
+    client = TestClient(app)
+    client.cookies.set(SESSION_COOKIE, _cookie(["embry0-operator"], "operator"))
+    resp = client.put("/api/v1/apikeys/key-abc123def456/allowed-repos", json={"allowed_repos": []}, headers=XRW)
+    assert resp.status_code == 403
+    assert not app.state.api_keys_repo.set_allowed_repos.await_count
+
+
+def test_an_admin_changes_a_service_key():
+    app = _app()
+    app.state.api_keys_repo.get = AsyncMock(return_value=_key_row(user_id=None))
+    app.state.api_keys_repo.set_allowed_repos = AsyncMock(return_value=_key_row(user_id=None))
+    client = TestClient(app)
+    client.cookies.set(SESSION_COOKIE, _cookie(["embry0-admin"], "admin"))
+    resp = client.put(
+        "/api/v1/apikeys/key-abc123def456/allowed-repos", json={"allowed_repos": ["acme/widgets"]}, headers=XRW
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def _restricted_key_app() -> tuple[FastAPI, dict[str, str]]:
+    from embry0.storage.repositories.api_keys import hash_token
+
+    token = "emb_" + "r" * 43
+    app = _app()
+    restricted = _key_row(id="key-restricted01", user_id=None, scope="admin", name="bot", allowed_repos=("acme/a",))
+    app.state.api_keys_repo.get_by_hash = AsyncMock(
+        side_effect=lambda h: restricted if h == hash_token(token) else None
+    )
+    app.state.api_keys_repo.set_allowed_repos = AsyncMock()
+    return app, {"Authorization": f"Bearer {token}", **XRW}
+
+
+def test_a_restricted_key_cannot_mint_a_key():
+    """Even an admin-scope key: an unrestricted key it minted would undo its own list."""
+    app, headers = _restricted_key_app()
+    resp = TestClient(app).post("/api/v1/apikeys", json={"name": "x", "scope": "read"}, headers=headers)
+    assert resp.status_code == 403, f"a restricted key minted a key: {resp.status_code}"
+    assert not app.state.api_keys_repo.create.await_count
+
+
+def test_a_restricted_key_cannot_lift_its_own_list():
+    app, headers = _restricted_key_app()
+    resp = TestClient(app).put(
+        "/api/v1/apikeys/key-restricted01/allowed-repos", json={"allowed_repos": []}, headers=headers
+    )
+    assert resp.status_code == 403, f"a restricted key changed an allowlist: {resp.status_code}"
+    assert not app.state.api_keys_repo.set_allowed_repos.await_count

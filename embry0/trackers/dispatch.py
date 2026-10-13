@@ -13,6 +13,7 @@ from typing import Any
 import structlog
 
 from embry0.storage.repositories.jobs import StatusTransitionConflict
+from embry0.storage.repositories.repos import UnregisteredRepoError
 from embry0.storage.schemas import IssueStatus
 from embry0.trackers.models import TrackerIssue
 
@@ -118,8 +119,14 @@ async def dispatch_open_issue(
 
     try:
         job_id = await issue_executor.execute(issue_id, dispatched_by=actor or None)
-    except Exception:
-        logger.warning("webhook_auto_triage_failed", issue_id=issue_id, tracker=tracker, exc_info=True)
+    except Exception as exc:
+        if isinstance(exc, UnregisteredRepoError):
+            # #360: refused, not broken — the repo has no `repos` row.
+            logger.warning(
+                "webhook_dispatch_refused_unregistered_repo", issue_id=issue_id, tracker=tracker, detail=str(exc)
+            )
+        else:
+            logger.warning("webhook_auto_triage_failed", issue_id=issue_id, tracker=tracker, exc_info=True)
         # Never strand the issue in `triaging`: only `open` dispatches, so a
         # stuck row would silently swallow every future label trigger.
         try:

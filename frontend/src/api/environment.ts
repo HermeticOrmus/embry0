@@ -7,7 +7,8 @@ export async function fetchGlobalEnv(): Promise<EnvVar[]> {
 }
 
 export async function setGlobalEnv(variables: EnvVar[]): Promise<void> {
-  await api.put("/environment/global", { variables });
+  // A 422 (a reserved key, #543) is shown by the caller, not the global toast.
+  await api.put("/environment/global", { variables }, { suppressValidationToast: true });
 }
 
 export async function fetchRepoEnv(fullRepo: string): Promise<EnvVar[]> {
@@ -16,7 +17,7 @@ export async function fetchRepoEnv(fullRepo: string): Promise<EnvVar[]> {
 }
 
 export async function setRepoEnv(fullRepo: string, variables: EnvVar[]): Promise<void> {
-  await api.put(`/repos/${fullRepo}/environment`, { variables });
+  await api.put(`/repos/${fullRepo}/environment`, { variables }, { suppressValidationToast: true });
 }
 
 export async function deleteRepoEnvVar(fullRepo: string, key: string): Promise<void> {

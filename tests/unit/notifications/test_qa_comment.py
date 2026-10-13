@@ -32,7 +32,6 @@ def _r(app: str, status: SubTaskStatus, **kw) -> SubTaskResult:
         status=status,
         duration_ms=kw.get("duration_ms", 1000),
         cache_hits=CacheHits(),
-        trace_url=kw.get("trace_url"),
         failure_summary=kw.get("failure_summary"),
     )
 
@@ -88,21 +87,18 @@ def test_comment_skipped_run():
     assert "no affected apps" in out
 
 
-def test_comment_includes_trace_links_when_available():
+def test_comment_has_no_trace_column():
+    """#644: no QA node ever set a trace URL, so the table's Trace column was always "—"."""
     out = render_qa_comment(
         run_number=45,
         overall_status="failed",
         apps_to_qa=["hub"],
-        results=[
-            _r(
-                "hub",
-                SubTaskStatus.QA_FAILURE,
-                trace_url="https://embry0.example/traces/run-45/hub.zip",
-                failure_summary="loads page did not render",
-            ),
-        ],
+        results=[_r("hub", SubTaskStatus.QA_FAILURE, failure_summary="loads page did not render")],
     )
-    assert "https://embry0.example/traces/run-45/hub.zip" in out
+    assert "| App | Result | Duration | Cache |\n" in out, f"the summary table header changed: {out}"
+    assert "Trace" not in out, f"the comment still names a trace: {out}"
+    row = next(line for line in out.splitlines() if line.startswith("| apps/hub"))
+    assert row.count("|") == 5, f"a summary row must have four cells, like its header: {row}"
 
 
 def test_comment_summary_table_orders_apps_alphabetically():
@@ -170,7 +166,6 @@ def test_comment_shows_cache_hit_indicators_per_app():
             turbo_remote_hits=["apps/hub#build", "apps/hub#lint"],
             turbo_remote_misses=[],
         ),
-        trace_url=None,
         failure_summary=None,
     )
     out = render_qa_comment(

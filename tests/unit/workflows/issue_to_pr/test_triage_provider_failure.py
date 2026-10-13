@@ -176,7 +176,8 @@ async def test_malformed_triage_json_is_still_triage_malformed() -> None:
         "total_cost_usd": 0.01,
         "current_stage": "triage_complete",
     }
-    command = await _triage(malformed)
+    # #455: the malformed answer gets one repair turn, which is malformed too.
+    command = await _triage(malformed, malformed)
     job, repo = await _job_outcome(command.update)
     assert job["error_code"] == MALFORMED, f"unparseable triage output must stay {MALFORMED}, got {job['error_code']}"
     assert repo.status_calls == [], "a malformed answer is not the account's fault"

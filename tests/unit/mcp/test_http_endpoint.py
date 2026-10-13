@@ -1,12 +1,12 @@
-"""Hosted MCP endpoint (embry0_mcp.http) — bearer gate + per-request forwarding."""
+"""Hosted MCP endpoint (embry0.mcp_server.http) — bearer gate + per-request forwarding."""
 
 from __future__ import annotations
 
 import httpx
 import pytest
 
-from embry0_mcp.client import Embry0Client, caller_bearer
-from embry0_mcp.http import BearerForwardMiddleware, build_app, transport_security
+from embry0.mcp_server.client import Embry0Client, caller_bearer
+from embry0.mcp_server.http import BearerForwardMiddleware, build_app, transport_security
 
 
 async def _call(app, headers: list[tuple[bytes, bytes]]) -> tuple[int, bytes]:

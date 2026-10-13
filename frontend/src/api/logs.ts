@@ -2,9 +2,25 @@ import { api } from "./client";
 import type { LogEvent } from "@/lib/types/events";
 import type { LogsContainersResponse, LogsQueryParams, LogsQueryResponse } from "@/lib/types";
 
+interface LogEventsPage {
+  events: LogEvent[];
+  next_since_seq?: number;
+  has_more?: boolean;
+}
+
+/** The whole persisted event log; the API pages it, so follow the cursor to the tail (#203). */
 export async function fetchJobLogEvents(jobId: string): Promise<LogEvent[]> {
-  const { data } = await api.get(`/jobs/${jobId}/logs/events`);
-  return data.events;
+  const events: LogEvent[] = [];
+  let sinceSeq = 0;
+  for (;;) {
+    const { data } = await api.get<LogEventsPage>(`/jobs/${jobId}/logs/events`, {
+      params: { since_seq: sinceSeq, limit: 1000 },
+    });
+    events.push(...data.events);
+    const next = data.next_since_seq;
+    if (!data.has_more || typeof next !== "number" || next <= sinceSeq) return events;
+    sinceSeq = next;
+  }
 }
 
 /** RAV-1295: the set of containers Loki is collecting (for the dropdown). */

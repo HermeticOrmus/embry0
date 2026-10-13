@@ -82,7 +82,25 @@ class DockerRuntime:
             raise RuntimeError(f"no {_INTERNET_NETWORK} IP on container")
         await enforcer.ensure_helper_image()
         reachable = await self._internet_addresses(enforcer, reachable_containers)
-        await enforcer.apply(source_ip, [*allowed_destinations, *reachable])
+        await enforcer.apply(source_ip, list(allowed_destinations), proxy_ips=reachable)
+
+    async def refresh_egress(self, proxies: Sequence[str]) -> list[str]:
+        # The proxies' addresses and the bridge's subnets come from one
+        # network inspect; a proxy that is not on the network contributes
+        # nothing, so its old address is allowed no longer.
+        network = await self._client.inspect_network(_INTERNET_NETWORK)
+        addresses = _isolation.proxy_addresses(network, proxies)
+        subnets = [
+            str(cfg["Subnet"])
+            for cfg in ((network.get("IPAM") or {}).get("Config") or [])
+            if ":" not in str(cfg.get("Subnet") or ":")
+        ]
+        if not subnets:
+            raise RuntimeError(f"network {_INTERNET_NETWORK!r} reports no IPv4 subnet")
+        enforcer = _egress.EgressEnforcer(self._client)
+        await enforcer.ensure_helper_image()
+        await enforcer.refresh(addresses, subnets)
+        return addresses
 
     async def _internet_addresses(self, enforcer: _egress.EgressEnforcer, containers: Sequence[str]) -> list[str]:
         """``sandbox-internet`` addresses of ``containers``, skipping (with a warning) any it cannot read.

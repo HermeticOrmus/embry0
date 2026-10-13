@@ -67,6 +67,19 @@ describe("RepoPreferencesSection base branch", () => {
     expect(mockMutate.mock.calls[0][0].update.base_branch).toBe("release/2026.09");
   });
 
+  it("leaves out the fields it does not edit, so a save cannot overwrite them (#350)", async () => {
+    const user = userEvent.setup();
+    renderSection();
+    await user.clear(screen.getByLabelText("Base branch"));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockMutate).toHaveBeenCalled());
+    const update = mockMutate.mock.calls[0][0].update;
+    expect(Object.keys(update)).not.toContain("execution_mode");
+    expect(Object.keys(update)).not.toContain("auth_mode");
+    expect(Object.keys(update)).not.toContain("verification");
+  });
+
   it("sends null when the field is cleared", async () => {
     const user = userEvent.setup();
     renderSection();

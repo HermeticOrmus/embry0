@@ -20,8 +20,22 @@ in the same job keep their normal Anthropic auth.
 
 A model has to be in this catalogue to be offered by `GET /config/models`
 (so by the dashboard's model pickers), to be accepted as the default model,
-and to be priced. An unlisted `grok-*` id still routes to xAI by prefix, but
-the direct executor records its cost as $0.
+and to be priced. An unlisted `grok-*` id would still route to xAI by prefix,
+but xAI reports no cost, so the price table is the only accounting for it. An
+id that routes to a provider without a price entry is therefore refused:
+
+- with a 422 wherever a model is configured: a job's `agent_models`, an agent
+  definition's `model`, a pipeline template's `agent_models` or step
+  `config.model`, and the default and tier models in `PUT /config/provider`;
+- with `ERR_INVALID_CONFIG` when an agent's model resolves to one anyway (a
+  `MODEL_HEAVY`-style env value, triage's pick, a row saved before the check),
+  before the sandbox runs it;
+- and, if a run on one still happens, the direct executor records the run as
+  an `ERR_INVALID_CONFIG` error naming the model instead of a $0 cost.
+
+To bring a new grok model into service, add it to `models` and
+`pricing_usd_per_mtok` together. What the flat rates leave out (long-context
+and cached-input pricing) is listed under the limits below.
 
 The account is a row in the credential registry (`docs/credentials.md`): an xAI `llm_api_key` is injected as `XAI_API_KEY`, and an xAI `llm_oauth` is served by the xai-proxy for that credential id. `XAI_API_KEY` in the orchestrator `.env` is the resolver's last step, and an import source, not the only place a grok job can authenticate.
 
@@ -49,7 +63,8 @@ A model is resolved per agent run. Later wins:
 
 1. the agent definition's `model`
 2. `default_model`, when set
-3. the pipeline template step's model
+3. the pipeline template step's model (`config.model` on the step's node;
+   templates have no separate model map)
 4. the job's explicit `agent_models` (`POST /jobs`, the MCP `job_create`
    tool, a model label on the ticket)
 
@@ -59,6 +74,13 @@ choose models and anything it names anyway is ignored
 (`triage_model_ignored_default_model_set` in the log). Without one, triage
 picks among the configured tiers: `model_heavy` for the developer,
 `model_medium` for review, `model_light` for routine review.
+
+Every step a template routes to applies its model, the QA step included. The
+template's `triage` root is different: triage picks the template, so it runs
+before one is chosen. A model on the triage node applies only when the job
+names its template (`pipeline_template` on `POST /jobs`); a template that
+triage picks, or a job kind's default, cannot change the model of the triage
+that picked it.
 
 After that order has produced a model, the enablement check still applies: a
 disabled model falls back to the agent's tier model.

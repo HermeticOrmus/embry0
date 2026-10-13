@@ -6,10 +6,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 const mockFetch = vi.fn();
 const mockCreate = vi.fn();
 const mockRevoke = vi.fn();
+const mockSetRepos = vi.fn();
 vi.mock("@/api/apiKeys", () => ({
   fetchApiKeys: (...a: unknown[]) => mockFetch(...a),
   createApiKey: (...a: unknown[]) => mockCreate(...a),
   revokeApiKey: (...a: unknown[]) => mockRevoke(...a),
+  setApiKeyAllowedRepos: (...a: unknown[]) => mockSetRepos(...a),
 }));
 
 import ApiKeysTab from "../ApiKeysTab";
@@ -27,6 +29,7 @@ const KEY = {
   expires_at: null,
   last_used_at: null,
   revoked_at: null,
+  allowed_repos: null as string[] | null,
 };
 
 function renderTab() {
@@ -42,6 +45,7 @@ beforeEach(() => {
   mockFetch.mockReset();
   mockCreate.mockReset();
   mockRevoke.mockReset();
+  mockSetRepos.mockReset();
   useAuthStore.setState({
     status: "authenticated",
     sessionExpired: false,
@@ -109,5 +113,44 @@ describe("ApiKeysTab", () => {
     const user = userEvent.setup();
     await user.click(await screen.findByTitle(/revoke this key/i));
     expect(mockRevoke).toHaveBeenCalledWith("key-1");
+  });
+
+  it("shows each key's repositories, or all when unrestricted", async () => {
+    mockFetch.mockResolvedValue([KEY, { ...KEY, id: "key-2", name: "bot", allowed_repos: ["acme/widgets", "acme/docs"] }]);
+    renderTab();
+    expect(await screen.findByTestId("key-repos-key-1")).toHaveTextContent("all");
+    expect(screen.getByTestId("key-repos-key-2")).toHaveTextContent("acme/widgets, acme/docs");
+  });
+
+  it("mints a key limited to the repositories typed", async () => {
+    mockFetch.mockResolvedValue([]);
+    mockCreate.mockResolvedValue({ ...KEY, allowed_repos: ["acme/widgets", "acme/docs"], key: "emb_T" });
+    renderTab();
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("Name"), "bot");
+    await user.type(screen.getByLabelText("Repositories (optional)"), "acme/widgets, acme/docs");
+    await user.click(screen.getByRole("button", { name: /create key/i }));
+    expect(mockCreate.mock.calls[0][0]).toMatchObject({ allowed_repos: ["acme/widgets", "acme/docs"] });
+  });
+
+  it("mints an unrestricted key when no repository is typed", async () => {
+    mockFetch.mockResolvedValue([]);
+    mockCreate.mockResolvedValue({ ...KEY, key: "emb_T" });
+    renderTab();
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("Name"), "cli");
+    await user.click(screen.getByRole("button", { name: /create key/i }));
+    expect(mockCreate.mock.calls[0][0].allowed_repos).toBeUndefined();
+  });
+
+  it("changes a key's repositories, and an empty answer lifts the limit", async () => {
+    mockFetch.mockResolvedValue([{ ...KEY, allowed_repos: ["acme/widgets"] }]);
+    mockSetRepos.mockResolvedValue({ ...KEY, allowed_repos: null });
+    const prompt = vi.spyOn(window, "prompt").mockReturnValue("");
+    renderTab();
+    const user = userEvent.setup();
+    await user.click(await screen.findByTitle(/change the repositories/i));
+    expect(prompt.mock.calls[0][1]).toBe("acme/widgets");
+    expect(mockSetRepos).toHaveBeenCalledWith("key-1", []);
   });
 });

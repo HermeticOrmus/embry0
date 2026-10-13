@@ -96,11 +96,17 @@ async def test_duplicate_ticket_skips_graph_and_links_pr():
 
     # The graph never ran…
     assert "initial_state" not in captured
-    # …and the job completed linking the existing PR.
-    final = next(c for c in executor._jobs.update.call_args_list if c.kwargs.get("status") == "completed")
-    assert final.kwargs["pr_url"] == "https://github.com/o/r/pull/366"
-    assert "open PR #366" in final.kwargs["result_summary"]
-    executor._issues.update.assert_any_call("iss-00000000ffff", status="closed")
+    # …and the job ended skipped (#474), naming the existing PR in its summary
+    # without claiming it: no pr_url, the issue stays open.
+    final = next(c for c in executor._jobs.update.call_args_list if c.kwargs.get("status") == "skipped")
+    assert "pr_url" not in final.kwargs, "the skipped job recorded someone else's PR as its own"
+    assert "already exists: #366" in final.kwargs["result_summary"]
+    assert "https://github.com/o/r/pull/366" in final.kwargs["result_summary"]
+    assert not [c for c in executor._jobs.update.call_args_list if c.kwargs.get("status") == "completed"]
+    executor._issues.update.assert_any_call("iss-00000000ffff", status="open")
+    assert ("iss-00000000ffff",) not in [
+        c.args for c in executor._issues.update.call_args_list if c.kwargs.get("status") == "closed"
+    ], "a skip closed the issue although the fix is not merged"
 
 
 @pytest.mark.asyncio
@@ -128,7 +134,36 @@ async def test_followup_jobs_with_existing_pr_are_exempt():
 
 
 @pytest.mark.asyncio
-async def test_fetch_failure_is_fail_open():
+async def test_a_failed_listing_fails_the_job_closed_before_the_graph():
+    """#305: a listing error used to read as "no open PRs", and the job ran
+    on and could open a duplicate. It now stops the job before the graph,
+    with its own code, and hands the issue back."""
+    import httpx
+
+    from embry0.safety.error_codes import ErrorCode
+
+    executor, captured = _executor({"trace_id": None, "pipeline_config": None})
+    executor._post_tracker_outcome = AsyncMock()  # type: ignore[method-assign]
+    executor._finish_credential_uses = AsyncMock()  # type: ignore[method-assign]
+    executor._emit_audit = AsyncMock()  # type: ignore[method-assign]
+    executor._traces = None
+    issue = {"title": "t", "body": "", "repo": "o/r", "tracker": "linear", "tracker_key": "ENG-2000"}
+    with (
+        patch("embry0.services.github_prs.GitHubClient.get", new=AsyncMock(side_effect=httpx.ConnectError("down"))),
+        patch("embry0.orchestration.checkpoint.purge_thread", new=AsyncMock()),
+    ):
+        await executor._run_workflow("iss-00000000ffff", "job-7", issue)
+
+    assert "initial_state" not in captured, "the graph ran although the open PRs could not be listed"
+    failed = [c for c in executor._jobs.update.call_args_list if c.kwargs.get("status") == "failed"]
+    assert failed, "a failed listing did not fail the job"
+    assert failed[-1].kwargs["error_code"] == ErrorCode.PR_LISTING_FAILED.value
+    assert "duplicate-PR check cannot run" in failed[-1].kwargs["error_message"]
+    executor._issues.update.assert_any_call("iss-00000000ffff", status="open")
+
+
+@pytest.mark.asyncio
+async def test_no_open_prs_runs_the_graph_without_a_list():
     executor, captured = _executor({"trace_id": None, "pipeline_config": None})
     issue = {"title": "t", "body": "", "repo": "o/r", "tracker": "linear", "tracker_key": "ENG-1066"}
     with _patch_open_prs([]):

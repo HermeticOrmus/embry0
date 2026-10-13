@@ -338,6 +338,11 @@ class JobState(TypedDict, total=False):
     max_budget_usd: Annotated[float | None, FoldingLastValue]
     budget_overrun_mode_override: Annotated[str | None, FoldingLastValue]
     pipeline_template_request: Annotated[str | None, FoldingLastValue]
+    # #306: True when the job works a healing case the watcher opened. Set
+    # once by the executor; plan_route_node then refuses triage's lighter
+    # template pick so the job always runs review and verification. MUST stay
+    # declared here for the same reason as the keys above.
+    pin_full_pipeline: Annotated[bool | None, FoldingLastValue]
     execution_mode_override: Annotated[str | None, FoldingLastValue]
     auth_mode_override: Annotated[str | None, FoldingLastValue]
     # RAV-1254: per-repo pre-PR self-checks from repo_preferences.dev_checks
@@ -504,8 +509,8 @@ class JobState(TypedDict, total=False):
     # developer_prompt_addendum / developer_focus_files: consumed by developer_node
     # to inject the failure-summary guidance into its prompt (consumer wiring is a
     # follow-up — the routing currently sets these on state regardless).
-    # qa_rerun_reason: consumed by init_qa_node when triage opts to rerun the QA
-    # subpath unchanged (e.g. flaky/environmental failure).
+    # qa_rerun_reason: recorded when triage opts to rerun the QA subpath
+    # unchanged (e.g. flaky/environmental failure). No node reads it today.
     # (The ask_user action puts its question on pending_agent_questions in the
     # standard shape — the bespoke pending_user_question key that nothing read
     # was removed in RAV-1271.)
@@ -550,10 +555,10 @@ class QAStateBlock(TypedDict, total=False):
     attempts: list[QAAttempt]
     failure_rounds: int  # PR-flow triage↔QA cycles consumed; bumped when qa.report routes back to triage on failure (Phase 5), capped at max_qa_failure_rounds (default 2) — on exhaustion the job ends with ERR_QA_FAILURES_UNRESOLVED.
     final_status: Literal["pending", "passed", "failed", "exhausted", "skipped"]
-    sandbox_token: str  # Set by init_qa, consumed by report
-    # Backend-owned boot phase (Plan: qa-boot-as-backend-node).
-    # boot_qa_node populates these; the agent (qa_node) reads them but does
-    # NOT mutate them.
+    sandbox_token: str  # The QA sandbox's bearer for the presign proxy
+    # Backend-owned boot phase (Plan: qa-boot-as-backend-node). Nothing
+    # writes these on this state since the single-app boot node was removed
+    # (#641); the sub-task graph's boot_app_node records boot in SubTaskState.
     boot_outcome: Literal["passed", "timeout", "startup_failed"] | None
     boot_duration_ms: int | None
     boot_attempts: int | None
@@ -581,6 +586,12 @@ class QAStateBlock(TypedDict, total=False):
     # browser_backend for this one run. Absent/None = yaml/deployment
     # resolution stands.
     browser_backend: str | None
+    # Per-job sandbox profile override via QAJobOverrides.sandbox_profile
+    # (#537), applied by qa_orchestrator_node like browser_backend.
+    sandbox_profile: str | None
+    # The profile every sub-task sandbox resolved to, written by
+    # qa_orchestrator_node for the jobs row; None when apps differ (#537).
+    sandbox_profile_used: str | None
     # Structured failure reason for early orchestrator aborts (validation
     # errors, unknown forced conditional group, app-config resolution
     # failure). Surfaced verbatim on the jobs row by issue_executor when the

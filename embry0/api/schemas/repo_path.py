@@ -9,8 +9,9 @@ has always been able to address these; only the request schemas refused.
 
 Anchored with ``\\Z``, not ``$``: ``$`` also matches before a trailing
 newline, so ``"owner/name\\n"`` would pass and then flow into clone URLs and
-sanitised container/volume names. ``embry0_mcp`` restates this rule verbatim
-(it cannot import from ``embry0``), so the copied rule is the strict one.
+sanitised container/volume names. ``embry0.mcp_server`` restates this rule
+verbatim (it imports nothing else from ``embry0``), so the copied rule is the
+strict one.
 """
 
 from __future__ import annotations

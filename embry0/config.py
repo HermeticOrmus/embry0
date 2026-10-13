@@ -165,7 +165,8 @@ class Embry0Config(BaseSettings):
     # "github" keeps every pre-#162 deployment behaving exactly as before.
     # Set to "" on a tenant that must never fall back to github.com — an
     # unregistered repo then fails the job with ERR_REPO_UNREGISTERED at
-    # dispatch instead of cloning from the wrong host.
+    # dispatch instead of cloning from the wrong host. (A tracker or issue
+    # dispatch refuses an unregistered repo whatever this says, #360.)
     default_forge: str = "github"
 
     # Watcher/proposer (RAV-657, W1d): scheduled log-scan → analysis job →
@@ -323,6 +324,12 @@ class Embry0Config(BaseSettings):
     # (the evidence PROMPTS do not depend on this flag). It additionally needs
     # context_proxy_enabled and a non-empty allowlist.
     developer_log_tool_enabled: bool = False
+    # #294: payload field names whose VALUES are personal data in the watched
+    # stack's logs ("phone,customer_name"), comma-separated. Redacted, with
+    # secrets and e-mail addresses, from every log line sent to a model
+    # provider or filed in a tracker — the watcher's briefing, context-proxy
+    # results, the evidence prompts, the watcher's draft tickets.
+    log_redaction_fields: str = ""
 
     # RAV-1079: open-PR dedup on the developer/reviewer path. Before a fresh
     # pipeline job starts, the executor lists the target repo's open PRs:
@@ -398,6 +405,17 @@ class Embry0Config(BaseSettings):
     # `pending` and start as slots free. 0 = no cap, the behavior before it
     # existed. Size it against DIND_MEMORY (docs/ops/provisioning.md).
     max_running_jobs: int = Field(default=0, ge=0)
+    # #307: on SIGTERM the orchestrator stops starting jobs and gives the
+    # running ones this long to reach their next node boundary before it
+    # stops them; boot then resumes them from their checkpoint. Keep it below
+    # the orchestrator's compose stop_grace_period minus uvicorn's own
+    # --timeout-graceful-shutdown (docs/ops/deploy.md, "Deploying while jobs run").
+    shutdown_drain_seconds: int = Field(default=90, ge=0)
+    # #307: how many times boot recovers one job after an unclean stop (crash
+    # or kill, no drain) before it fails it with ERR_RESUME_LIMIT instead.
+    # A clean drain does not count. 0 = no recovery: every in-flight job
+    # fails at boot, as before #307.
+    max_resume_attempts: int = Field(default=3, ge=0)
 
     # Workspace init contexts (RAV-600). `local` contexts stage orchestrator-
     # visible paths into sandboxes — a real exfiltration surface, so the

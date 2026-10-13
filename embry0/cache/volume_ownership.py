@@ -50,6 +50,7 @@ _RELEASED_STATUSES: frozenset[str] = frozenset(
         JobStatus.FAILED,
         JobStatus.CANCELLED,
         JobStatus.EXPIRED,
+        JobStatus.SKIPPED,
         JobStatus.PR_MERGED,
         JobStatus.PR_CLOSED,
     }

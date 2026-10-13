@@ -5,6 +5,10 @@ or by the system (``user_id IS NULL`` — service keys such as the
 context-proxy's boot-rotated credential and a chat relay's key). Only the
 sha256 of the token is stored; the plaintext exists exactly once, in the
 mint response.
+
+``allowed_repos`` narrows a key to the repositories it may start work on;
+``None`` is unrestricted. The check itself lives in
+``embry0.api.repo_allowlist``.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ class ApiKeyRow:
     expires_at: datetime | None
     last_used_at: datetime | None
     revoked_at: datetime | None
+    allowed_repos: tuple[str, ...] | None = None
 
 
 def _row(r: Any) -> ApiKeyRow:
@@ -56,7 +61,13 @@ def _row(r: Any) -> ApiKeyRow:
         expires_at=r["expires_at"],
         last_used_at=r["last_used_at"],
         revoked_at=r["revoked_at"],
+        allowed_repos=_allowed(r.get("allowed_repos")),
     )
+
+
+def _allowed(value: Any) -> tuple[str, ...] | None:
+    # The column refuses an empty array, so only NULL means unrestricted.
+    return tuple(value) if value else None
 
 
 class ApiKeysRepository:
@@ -71,16 +82,17 @@ class ApiKeysRepository:
         user_id: str | None,
         created_by: str,
         expires_at: datetime | None = None,
+        allowed_repos: list[str] | None = None,
     ) -> tuple[ApiKeyRow, str]:
         """Mint a key; returns (row, plaintext). The plaintext is never
-        retrievable again."""
+        retrievable again. ``allowed_repos`` empty or None: unrestricted."""
         if scope not in VALID_SCOPES:
             raise ValueError(f"invalid scope {scope!r}")
         token = TOKEN_PREFIX + secrets.token_urlsafe(32)
         row = await self._db.fetchrow(
             """
-            INSERT INTO api_keys (id, user_id, name, key_hash, prefix, scope, created_by, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO api_keys (id, user_id, name, key_hash, prefix, scope, created_by, expires_at, allowed_repos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING *
             """,
             f"key-{uuid.uuid4().hex[:12]}",
@@ -91,6 +103,7 @@ class ApiKeysRepository:
             scope,
             created_by,
             expires_at,
+            allowed_repos or None,
         )
         assert row is not None
         return _row(row), token
@@ -113,6 +126,15 @@ class ApiKeysRepository:
             user_id,
         )
         return [_row(r) for r in rows]
+
+    async def set_allowed_repos(self, key_id: str, allowed_repos: list[str] | None) -> ApiKeyRow | None:
+        """Replace the key's repository allowlist; empty or None lifts it."""
+        row = await self._db.fetchrow(
+            "UPDATE api_keys SET allowed_repos = $2 WHERE id = $1 RETURNING *",
+            key_id,
+            allowed_repos or None,
+        )
+        return _row(row) if row else None
 
     async def revoke(self, key_id: str) -> ApiKeyRow | None:
         row = await self._db.fetchrow(

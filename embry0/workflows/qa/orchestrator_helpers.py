@@ -14,6 +14,7 @@ Exports:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -108,8 +109,14 @@ async def fan_out_subtasks(
     turbo_remote_enabled: bool = False,
     max_concurrent: int,
     config: dict[str, Any],
+    budget_spent: Callable[[], Awaitable[bool]] | None = None,
 ) -> list[SubTaskResult]:
     """Run sub-tasks in parallel under a concurrency cap.
+
+    ``budget_spent`` — #264. Asked before each sub-task starts; True means
+    the job crossed a hard per-job cap, and the sub-task is reported as an
+    INFRA_FAILURE without acquiring a sandbox. Sub-tasks already running
+    finish their current agent turn, as everywhere else layer 1 applies.
 
     Returns results in input order. Sub-task crashes are caught and
     surfaced as INFRA_FAILURE rather than propagating — sibling sub-tasks
@@ -135,6 +142,14 @@ async def fan_out_subtasks(
 
     async def _one(resolved: ResolvedAppConfig) -> SubTaskResult:
         async with sem:
+            if budget_spent is not None and await _budget_spent_safely(budget_spent, parent_run_id):
+                return SubTaskResult(
+                    app_name=resolved.app_name,
+                    status=SubTaskStatus.INFRA_FAILURE,
+                    duration_ms=0,
+                    cache_hits=CacheHits(),
+                    failure_summary="not started: the job's budget cap was reached (overrun_mode=hard)",
+                )
             writer(
                 {
                     "type": "qa_subtask_started",
@@ -179,7 +194,6 @@ async def fan_out_subtasks(
                     status=SubTaskStatus.INFRA_FAILURE,
                     duration_ms=0,
                     cache_hits=CacheHits(),
-                    trace_url=None,
                     failure_summary=f"sub-task crashed: {exc}",
                 )
             writer(
@@ -195,6 +209,15 @@ async def fan_out_subtasks(
 
     tasks = [asyncio.create_task(_one(r)) for r in resolved_configs]
     return await asyncio.gather(*tasks)
+
+
+async def _budget_spent_safely(budget_spent: Callable[[], Awaitable[bool]], parent_run_id: str) -> bool:
+    # A failed lookup must not stop QA: the agent turn's own check still runs.
+    try:
+        return await budget_spent()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("qa_budget_check_failed", parent_run_id=parent_run_id, error=str(exc))
+        return False
 
 
 def _outcome_to_dict(outcome: OrchestratorOutcome) -> dict[str, Any]:

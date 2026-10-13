@@ -1,5 +1,9 @@
 """WebSocket streaming — live job events to clients."""
 
+import asyncio
+from collections.abc import AsyncIterator
+from typing import Any
+
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
@@ -18,6 +22,40 @@ def _passes_filter(event: dict[str, object], wanted: set[str]) -> bool:
         return True
     event_type = event.get("type") if isinstance(event, dict) else None
     return event_type in wanted
+
+
+REPLAY_PAGE = 500
+
+
+async def _replay_rows(jobs_repo: Any, job_id: str, since_seq: int) -> AsyncIterator[dict[str, Any]]:
+    """Every persisted event row newer than ``since_seq``, page by page.
+
+    One ``get_log_events`` call stops at its limit, which left a long job's
+    newer events out of the replay (#203).
+    """
+    cursor = since_seq
+    while True:
+        rows = await jobs_repo.get_log_events(job_id, since_seq=cursor, limit=REPLAY_PAGE)
+        for row in rows:
+            yield row
+        last = rows[-1].get("id") if rows else None
+        if len(rows) < REPLAY_PAGE or not isinstance(last, int) or last <= cursor:
+            return
+        cursor = last
+
+
+async def _wait_for_disconnect(websocket: WebSocket) -> None:
+    """Return once the client has gone. Anything it sends is ignored.
+
+    A receive that fails means the socket is unusable, which counts as gone.
+    """
+    try:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+    except Exception:
+        return
 
 
 @router.websocket("/ws/jobs/{job_id}/events")
@@ -92,8 +130,7 @@ async def job_events(websocket: WebSocket, job_id: str) -> None:
     watermark = since_seq
     try:
         jobs_repo = websocket.app.state.jobs_repo
-        events = await jobs_repo.get_log_events(job_id, since_seq=since_seq)
-        for event in events:
+        async for event in _replay_rows(jobs_repo, job_id, since_seq):
             payload = event.get("payload", event)
             if isinstance(payload, dict):
                 # Ensure replayed events carry their seq for the client's next
@@ -110,9 +147,18 @@ async def job_events(websocket: WebSocket, job_id: str) -> None:
         logger.warning("event_replay_failed", job_id=job_id, exc_info=True)
 
     # Live loop — skip any event whose seq is <= watermark (already replayed).
+    # Watch the socket alongside the queue: a client that leaves while the
+    # job is quiet must not stay subscribed until the next event (#505).
+    client_gone = asyncio.create_task(_wait_for_disconnect(websocket))
+    next_event: asyncio.Task[Any] | None = None
     try:
         while True:
-            event = await queue.get()
+            next_event = asyncio.create_task(queue.get())
+            done, _ = await asyncio.wait({next_event, client_gone}, return_when=asyncio.FIRST_COMPLETED)
+            if client_gone in done:
+                logger.info("ws_disconnected", job_id=job_id)
+                break
+            event = next_event.result()
             event_seq = event.get("event_seq")
             if isinstance(event_seq, int) and event_seq <= watermark:
                 continue  # already delivered via replay
@@ -124,4 +170,7 @@ async def job_events(websocket: WebSocket, job_id: str) -> None:
     except Exception:
         logger.exception("ws_error", job_id=job_id)
     finally:
+        client_gone.cancel()
+        if next_event is not None:
+            next_event.cancel()
         await event_bus.unsubscribe(job_id, queue)

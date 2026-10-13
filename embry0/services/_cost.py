@@ -8,6 +8,9 @@ agent under the parent ``job_id`` on every path — and they are the same source
 ``GET /jobs/{id}`` derives ``cost_breakdown`` from, so using them keeps the job
 row and the breakdown on the same page telling the same story.
 
+The per-job budget cap (layer 1) reads the same sum for the same reason, so
+the QA fan-out counts toward it (#264).
+
 This lives in one place because it has already drifted once: the standalone-job
 path resolved cost from traces while the issue-backed path kept writing the raw
 state value, and 46 jobs under-reported by $37.57 before anyone compared the two

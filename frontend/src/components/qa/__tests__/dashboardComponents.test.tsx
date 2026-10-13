@@ -136,7 +136,6 @@ describe("QaAppResultCard", () => {
     status: "passed",
     duration_ms: 1500,
     cache_hits: ZERO_HITS,
-    trace_url: null,
     failure_summary: null,
   };
 
@@ -164,21 +163,6 @@ describe("QaAppResultCard", () => {
     );
     const alert = screen.getByRole("alert");
     expect(alert.textContent).toBe("loads page did not render");
-  });
-
-  it("renders the trace link when trace_url is set", () => {
-    const traced: AppResult = {
-      ...passingApp,
-      trace_url: "https://x/trace.zip",
-    };
-    render(
-      <MemoryRouter>
-        <QaAppResultCard app={traced} repo="org/r1" />
-      </MemoryRouter>,
-    );
-    const link = screen.getByText("trace") as HTMLAnchorElement;
-    expect(link.href).toBe("https://x/trace.zip");
-    expect(link.target).toBe("_blank");
   });
 
   it("hides the artifacts section when no runId is supplied (back-compat)", () => {

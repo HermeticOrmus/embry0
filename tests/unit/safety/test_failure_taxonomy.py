@@ -48,6 +48,9 @@ _PIPELINE_PACKAGES = (
 # raised by a proxy's enroll-body extension and caught by the shared admin
 # handler that turns it into an HTTP 400. Nothing in the orchestrator process
 # raises it, so it can never reach a job row and has no meaningful job code.
+# MalformedCommandList (#559) likewise lives in the git-proxy: raised while it
+# reads a push's command list and caught by its own handler, which refuses
+# the push with HTTP 403.
 # XaiDeviceLoginError (#457) is raised by the operator's xAI device login,
 # which only the credentials API runs (api/v1/credentials.py turns it into an
 # HTTP error). No job starts a device login; the check below keeps it so.
@@ -58,6 +61,7 @@ _PIPELINE_PACKAGES = (
 _NEVER_ESCAPES = {
     "_TerminalRefreshFailure",
     "EnrollRejected",
+    "MalformedCommandList",
     "XaiDeviceLoginError",
     "ImagePinError",
     "RegistryAuthError",

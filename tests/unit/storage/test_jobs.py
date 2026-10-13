@@ -252,6 +252,88 @@ async def test_cas_transition_to_terminal_stamps_finished_at(jobs_repo: JobsRepo
 
 
 @pytest.mark.asyncio
+async def test_fail_orphaned_stamps_finished_at_on_every_row_it_fails(jobs_repo: JobsRepository):
+    """#345: the boot-time sweep is raw SQL and must keep the invariant
+    itself. Without finished_at an orphaned job has no duration, so the
+    job-duration histogram never observed it."""
+    queued = await jobs_repo.create(repo="a/b", task="queued")
+    running = await jobs_repo.create(repo="a/b", task="running")
+    await jobs_repo.update(running, status=JobStatus.RUNNING)
+
+    await jobs_repo.fail_orphaned("ERR_ORPHANED", "restarted", never_started_message="never started")
+
+    for job_id in (queued, running):
+        job = await jobs_repo.get(job_id)
+        assert job is not None and job["status"] == "failed"
+        assert job["finished_at"] is not None, f"fail_orphaned left finished_at NULL on a {job['task']} job"
+
+
+@pytest.mark.asyncio
+async def test_paused_job_expiry_without_a_jobs_repo_stamps_finished_at(jobs_repo: JobsRepository):
+    """#345: the reaper's raw-SQL expiry fallback is the other write path
+    that sets a terminal status outside update()."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from embry0.execution.image_manager import ContainerReaper
+
+    db = jobs_repo._db
+    job_id = await jobs_repo.create(repo="a/b", task="paused")
+    await jobs_repo.update(job_id, status=JobStatus.RUNNING)
+    await jobs_repo.update(job_id, status=JobStatus.PAUSED)
+    # Age it past the TTL; the trigger would overwrite a plain updated_at write.
+    await db.execute("ALTER TABLE jobs DISABLE TRIGGER trg_jobs_updated_at")
+    await db.execute("UPDATE jobs SET updated_at = NOW() - INTERVAL '3 hours' WHERE job_id = $1", job_id)
+    await db.execute("ALTER TABLE jobs ENABLE TRIGGER trg_jobs_updated_at")
+    runtime = MagicMock()
+    runtime.client.run_cmd = AsyncMock()
+    reaper = ContainerReaper(runtime, db=db, paused_ttl_hours=1, jobs_repo=None)
+
+    await reaper._expire_paused_jobs()
+
+    job = await jobs_repo.get(job_id)
+    assert job is not None and job["status"] == "expired"
+    assert job["finished_at"] is not None, "the expiry fallback left finished_at NULL on an expired job"
+
+
+def test_every_raw_terminal_job_write_stamps_finished_at():
+    """#345: a terminal status must always carry finished_at, whichever
+    path writes it. update() and cas_transition_on_conn() add it
+    structurally; any SQL that writes a terminal job status literally has to
+    name finished_at in the same statement. A new raw writer that forgets it
+    fails here, not in a dashboard weeks later."""
+    import re
+    from pathlib import Path
+
+    import embry0
+
+    terminal = "|".join(
+        sorted(
+            s.value
+            for s in (JobStatus.COMPLETED, JobStatus.PARTIAL, JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.EXPIRED)
+        )
+    )
+    # UPDATE jobs ... SET ... status = '<terminal>' ... up to the WHERE.
+    statement = re.compile(
+        r"UPDATE\s+jobs\b(?P<body>(?:(?!WHERE).)*?\bstatus\s*=\s*'(?:" + terminal + r")'(?:(?!WHERE).)*)WHERE",
+        re.IGNORECASE | re.DOTALL,
+    )
+    root = Path(embry0.__file__).parent
+    offenders: list[str] = []
+    seen = 0
+    for path in root.rglob("*.py"):
+        if "migrations" in path.parts:
+            continue  # history: what a migration wrote is fixed, and 88 backfills it
+        # Join adjacent string literals so a statement split across lines reads whole.
+        text = re.sub(r"\"\s*\n\s*\"", "", path.read_text())
+        for match in statement.finditer(text):
+            seen += 1
+            if "finished_at" not in match.group("body"):
+                offenders.append(f"{path.relative_to(root)}: {' '.join(match.group(0).split())[:160]}")
+    assert seen >= 2, f"the scan found only {seen} raw terminal writes; it is no longer measuring anything"
+    assert not offenders, "raw SQL sets a terminal job status without finished_at:\n" + "\n".join(offenders)
+
+
+@pytest.mark.asyncio
 async def test_fetch_statuses_returns_only_known_jobs(jobs_repo: JobsRepository):
     """#274: the volume reaper maps owning job ids to statuses; an id with no
     row must be absent (not defaulted) so it reads as an unknown owner."""
@@ -289,3 +371,68 @@ async def test_fail_orphaned_says_a_queued_job_never_started(jobs_repo: JobsRepo
     )
     assert running_row["error_message"] == "Orchestrator restarted"
     assert {queued_row["error_code"], running_row["error_code"]} == {"ERR_ORPHANED"}
+
+
+# ---- #348: the gate refusal is the one pending -> failed transition ----------
+
+
+@pytest.mark.asyncio
+async def test_a_budget_refusal_may_fail_a_pending_job(jobs_repo: JobsRepository):
+    job_id = await jobs_repo.create(repo="a/b", task="t")
+
+    await jobs_repo.update(job_id, status=JobStatus.FAILED, error_code="ERR_BUDGET_REFUSED", error_message="refused")
+
+    job = await jobs_repo.get(job_id)
+    assert job is not None
+    assert (job["status"], job["started_at"]) == ("failed", None)
+    assert job["finished_at"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", [None, "ERR_BUDGET_OVERRUN", "ERR_UNKNOWN"])
+async def test_no_other_failure_may_skip_running(jobs_repo: JobsRepository, error_code: str | None):
+    """The exception is keyed on the refusal code; every other failure of a
+    pending job is still an invalid transition."""
+    job_id = await jobs_repo.create(repo="a/b", task="t")
+    fields = {"error_code": error_code} if error_code else {}
+
+    with pytest.raises(ValueError, match="pending -> failed"):
+        await jobs_repo.update(job_id, status=JobStatus.FAILED, **fields)
+
+    assert (await jobs_repo.get(job_id))["status"] == "pending"
+
+
+def test_the_transition_table_itself_still_forbids_pending_to_failed():
+    """The refusal is an exception beside the table, not an entry in it:
+    readers of VALID_JOB_TRANSITIONS (cas_transition_on_conn, delivery
+    writes) must keep seeing pending -> failed as illegal."""
+    from embry0.storage.repositories.jobs import VALID_JOB_TRANSITIONS
+
+    assert JobStatus.FAILED not in VALID_JOB_TRANSITIONS[JobStatus.PENDING]
+
+
+# ---- #474: skipped is a terminal status of a job that ran ------------------
+
+
+@pytest.mark.asyncio
+async def test_a_running_job_can_end_skipped_and_gets_a_finish_time(jobs_repo: JobsRepository):
+    job_id = await jobs_repo.create(repo="a/b", task="t")
+    await jobs_repo.update(job_id, status=JobStatus.RUNNING)
+
+    await jobs_repo.update(job_id, status=JobStatus.SKIPPED, result_summary="Skipped: …")
+
+    job = await jobs_repo.get(job_id)
+    assert job is not None and job["status"] == "skipped"
+    assert job["finished_at"] is not None, "skipped is terminal and must stamp finished_at"
+    assert job["delivery_state"] == "none"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("then", [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.RUNNING, JobStatus.PR_MERGED])
+async def test_skipped_is_terminal(jobs_repo: JobsRepository, then: JobStatus):
+    job_id = await jobs_repo.create(repo="a/b", task="t")
+    await jobs_repo.update(job_id, status=JobStatus.RUNNING)
+    await jobs_repo.update(job_id, status=JobStatus.SKIPPED)
+
+    with pytest.raises(ValueError, match="skipped ->"):
+        await jobs_repo.update(job_id, status=then)

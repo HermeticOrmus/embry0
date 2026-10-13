@@ -14,6 +14,7 @@ import { RepoPicker } from "@/components/RepoPicker";
 import { useRegisteredRepos } from "@/hooks/useRepos";
 import { EnvVarTable } from "@/components/environments/EnvVarTable";
 import { EnvVarModal } from "@/components/environments/EnvVarModal";
+import { envErrorText } from "@/components/environments/envErrorText";
 import { DetectBanner } from "@/components/environments/DetectBanner";
 import { RepoPreferencesSection } from "@/components/environments/RepoPreferencesSection";
 import { TableSkeleton } from "@/components/TableSkeleton";
@@ -148,22 +149,19 @@ export function EnvironmentsPage() {
     setEditVar(v);
   };
 
-  const handleGlobalSave = (v: EnvVar) => {
+  // A refused save rejects into the modal, which shows the API's reason (#543).
+  const handleGlobalSave = async (v: EnvVar) => {
     const merged = mergeForSave(globalVars, v, null);
-    setGlobalEnv.mutate(merged, {
-      onSuccess: () => {
-        toast.success(editVar ? `Updated "${v.key}"` : `Added "${v.key}"`);
-        setEditVar(undefined);
-      },
-      onError: (e) => toast.error(`Failed: ${e.message}`),
-    });
+    await setGlobalEnv.mutateAsync(merged);
+    toast.success(editVar ? `Updated "${v.key}"` : `Added "${v.key}"`);
+    setEditVar(undefined);
   };
 
   const handleGlobalDelete = (key: string) => {
     const merged = mergeForSave(globalVars, null, key);
     setGlobalEnv.mutate(merged, {
       onSuccess: () => toast.success(`Deleted "${key}"`),
-      onError: (e) => toast.error(`Failed: ${e.message}`),
+      onError: (e) => toast.error(`Failed: ${envErrorText(e)}`),
     });
   };
 
@@ -179,18 +177,11 @@ export function EnvironmentsPage() {
     setEditVar(v);
   };
 
-  const handleRepoSave = (v: EnvVar) => {
+  const handleRepoSave = async (v: EnvVar) => {
     const merged = mergeForSave(repoVars, v, null);
-    setRepoEnv.mutate(
-      { fullRepo: selectedRepo, variables: merged },
-      {
-        onSuccess: () => {
-          toast.success(editVar ? `Updated "${v.key}"` : `Added "${v.key}"`);
-          setEditVar(undefined);
-        },
-        onError: (e) => toast.error(`Failed: ${e.message}`),
-      },
-    );
+    await setRepoEnv.mutateAsync({ fullRepo: selectedRepo, variables: merged });
+    toast.success(editVar ? `Updated "${v.key}"` : `Added "${v.key}"`);
+    setEditVar(undefined);
   };
 
   const handleRepoDelete = (key: string) => {
@@ -199,7 +190,7 @@ export function EnvironmentsPage() {
       { fullRepo: selectedRepo, variables: merged },
       {
         onSuccess: () => toast.success(`Deleted "${key}"`),
-        onError: (e) => toast.error(`Failed: ${e.message}`),
+        onError: (e) => toast.error(`Failed: ${envErrorText(e)}`),
       },
     );
   };
@@ -232,7 +223,7 @@ export function EnvironmentsPage() {
       {
         onSuccess: () =>
           toast.success(`Imported ${toAdd.length} variable${toAdd.length !== 1 ? "s" : ""}`),
-        onError: (e) => toast.error(`Failed: ${e.message}`),
+        onError: (e) => toast.error(`Failed: ${envErrorText(e)}`),
       },
     );
   };

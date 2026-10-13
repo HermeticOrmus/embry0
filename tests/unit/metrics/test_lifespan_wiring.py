@@ -263,3 +263,39 @@ async def test_the_cap_gauges_are_each_stacks_own_numbers(
             window = service._config.watcher_proposal_window_days  # noqa: SLF001
             assert gauge("embry0_watcher_open_proposals", repo) == await service._open_draft_count(window)  # noqa: SLF001
             assert gauge("embry0_watcher_open_proposals_cap", repo) == service._config.watcher_max_open_proposals  # noqa: SLF001
+
+
+async def test_the_lifespan_starts_the_volume_reaper_with_its_state_repo(
+    db_with_migrations: DatabasePool, stub_container_runtime: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reaper starts before ``_init_app_state`` fills app.state, so it
+    must not read its state repository from there: with the reaper on (the
+    production default) the lifespan raised AttributeError and the
+    orchestrator crash-looped on boot."""
+    from embry0.storage.repositories.qa_volume_state import QAVolumeStateRepository
+
+    volume_reaper = MagicMock()
+    volume_reaper.return_value.stop = AsyncMock()
+    monkeypatch.setattr("embry0.cache.volume_reaper.VolumeReaper", volume_reaper)
+    config = Embry0Config(
+        _env_file=None,
+        database_url=db_with_migrations._url,  # noqa: SLF001
+        auth_dev_mode=True,
+        webhook_dev_mode=True,
+        api_key="",
+        watcher_enabled=False,
+        volume_reaper_enabled=True,
+        linear_reconcile_mode="off",
+        telegram_bot_token="",
+        xai_proxy_enabled=False,
+        auth_proxy_enabled=False,
+        context_proxy_enabled=False,
+    )
+    channels.set_fold_observer(None)
+    app = create_app(config)
+    async with lifespan(app):
+        assert app.state.volume_reaper is volume_reaper.return_value
+    channels.set_fold_observer(None)
+
+    state_repo = volume_reaper.call_args.kwargs["state_repo"]
+    assert isinstance(state_repo, QAVolumeStateRepository), f"reaper got state_repo={state_repo!r}"

@@ -25,6 +25,7 @@ import httpx
 import structlog
 
 from embry0.orchestration import dispatch_actors
+from embry0.services.healing.recorder import record_case_event
 from embry0.trackers.author_association import check_comment_author, parse_author_roles
 
 logger = structlog.get_logger(__name__)
@@ -45,8 +46,12 @@ class CommentDispatchService:
         http_client: httpx.AsyncClient | None = None,
         # Spec 2026-09-29 §3.1: None keeps the pre-registry env lookup.
         credential_resolver: Any = None,
+        # #344: CaseRecorder — links the follow-up job to the PR's healing
+        # case. None (tests, no ledger) records nothing.
+        case_recorder: Any = None,
     ) -> None:
         self._config = config
+        self._case_recorder = case_recorder
         self._credential_resolver = credential_resolver
         self._jobs = jobs_repo
         self._sessions = agent_sessions_repo
@@ -196,6 +201,12 @@ class CommentDispatchService:
             dispatched_by=author if author != "unknown" else dispatch_actors.PR_COMMENT,
         )
         await self._jobs.update(job_id, pr_url=pr_url)
+        # #344: an issue-less follow-up never reaches job_dispatched; link it
+        # to the case owning this PR. Fail-open: the dispatch never waits on
+        # or fails for its own bookkeeping.
+        await record_case_event(
+            self, "pr_followup_dispatched", pr_url=pr_url, job_id=job_id, log_ids={"job_id": job_id, "pr_url": pr_url}
+        )
         self._executor.submit_job(
             job_id,
             repo=repo,

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from embry0.api.deps import get_jobs_repo, request_actor
+from embry0.api.repo_allowlist import enforce_repo_allowlist
 from embry0.api.schemas import JobCreateRequest, JobListResponse, JobResponse, QAJobOverrides
 from embry0.api.schemas.jobs import JobResumeRequest
 from embry0.audit.helpers import emit_audit
@@ -24,9 +25,22 @@ class AnswerJobInputRequest(BaseModel):
 async def create_job(
     req: JobCreateRequest, request: Request, jobs: JobsRepository = Depends(get_jobs_repo)
 ) -> dict[str, Any]:
+    # The schema has folded `repo` into `context` for git jobs; a non-git job
+    # names no repository, which a repository-restricted key may not start.
+    await enforce_repo_allowlist(
+        request, req.repo or (req.context.repo if req.context else None), action="create a job"
+    )
+
     # RAV-1297: explicit per-agent model overrides must name enabled models —
     # a clear 422 at submit beats the runtime tier-fallback substituting one.
     # Fail-open when the repo isn't wired (minimal test apps).
+    if req.agent_models:
+        from embry0.services.model_enablement import UnpricedModelError, ensure_models_priced
+
+        try:
+            ensure_models_priced(req.agent_models.values())
+        except UnpricedModelError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     provider_repo = getattr(request.app.state, "provider_repo", None)
     if req.agent_models and provider_repo is not None:
         from embry0.services.model_enablement import DisabledModelError, ensure_models_enabled
@@ -205,17 +219,38 @@ async def get_job_inputs(job_id: str, request: Request) -> list[Any]:
     return result
 
 
+LOG_EVENTS_PAGE_DEFAULT = 500
+LOG_EVENTS_PAGE_MAX = 1000
+
+
 @router.get("/jobs/{job_id}/logs/events")
-async def get_job_log_events(job_id: str, jobs: JobsRepository = Depends(get_jobs_repo)) -> dict[str, Any]:
-    """Get persisted pipeline events for a job."""
-    events = await jobs.get_log_events(job_id)
-    # Extract the parsed payload from each row
+async def get_job_log_events(
+    job_id: str,
+    since_seq: int = Query(0, ge=0, description="Return only events with a seq greater than this."),
+    limit: int = Query(LOG_EVENTS_PAGE_DEFAULT, ge=1, le=LOG_EVENTS_PAGE_MAX),
+    jobs: JobsRepository = Depends(get_jobs_repo),
+) -> dict[str, Any]:
+    """Get one page of persisted pipeline events for a job, oldest first.
+
+    Each event carries its ``event_seq`` (the same cursor the WS replay
+    uses). To read the whole log, call again with
+    ``since_seq=next_since_seq`` while ``has_more`` is true (#203).
+    """
+    # One row past the page tells "exactly limit rows" from "more to come".
+    rows = await jobs.get_log_events(job_id, since_seq=since_seq, limit=limit + 1)
+    has_more = len(rows) > limit
     result = []
-    for e in events:
+    next_since_seq = since_seq
+    for e in rows[:limit]:
+        row_id = e.get("id")
+        if isinstance(row_id, int):
+            next_since_seq = max(next_since_seq, row_id)
         payload = e.get("payload", {})
         if isinstance(payload, dict):
+            if isinstance(row_id, int):
+                payload = {**payload, "event_seq": row_id}
             result.append(payload)
-    return {"events": result}
+    return {"events": result, "next_since_seq": next_since_seq, "has_more": has_more}
 
 
 @router.post("/jobs/{job_id}/events-token")
@@ -255,6 +290,8 @@ async def answer_job_input(
     job = await jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # An answer resumes the job once no blocking question is left.
+    await enforce_repo_allowlist(request, job.get("repo"), action="answer a question on a job")
 
     inputs_repo = request.app.state.inputs_repo
     inp = await inputs_repo.get(input_id)
@@ -313,6 +350,7 @@ async def resume_job(
     job = await jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    await enforce_repo_allowlist(request, job.get("repo"), action="resume a job")
     if job["status"] != "paused":
         raise HTTPException(status_code=409, detail=f"Job is {job['status']}, not paused")
 

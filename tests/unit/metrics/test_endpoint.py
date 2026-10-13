@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from prometheus_client import ProcessCollector
 from structlog.testing import capture_logs
 
 from embry0.api.app import create_app
@@ -48,8 +49,17 @@ async def test_metrics_serves_loop_http_and_process_metrics_from_one_endpoint() 
     assert status == 200
     assert 'embry0_watcher_ticks_total{action="no_issue",stack=""} 1.0' in body
     assert "http_requests_total" in body  # the instrumentator's metrics kept their names
-    assert "process_cpu_seconds_total" in body  # and the process collector moved with them
     assert "python_info" in body
+    # The process collector moved with them. It is registered on every platform,
+    # but it emits nothing without Linux /proc (it reads /proc/stat for the boot
+    # time), so the series itself is asserted only where /proc exists (#436).
+    registry = app.state.loop_metrics.registry
+    collectors = list(registry._collector_to_names)  # noqa: SLF001 — no public listing
+    assert any(isinstance(c, ProcessCollector) for c in collectors), (
+        f"no ProcessCollector on the app's registry: {[type(c).__name__ for c in collectors]}"
+    )
+    if Path("/proc/stat").exists():
+        assert "process_cpu_seconds_total" in body, "the process collector is registered but its series is missing"
 
 
 async def test_each_app_has_its_own_registry() -> None:

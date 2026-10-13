@@ -70,6 +70,12 @@ class CredentialUpdate(BaseModel):
     git_author_email: str | None = None
     status: Literal["ok", "disabled"] | None = None
 
+    @field_validator("git_author_name")
+    @classmethod
+    def _name(cls, v: str | None) -> str | None:
+        # Blank clears, as null does (#440); the email validator does the same.
+        return (v.strip() or None) if v is not None else None
+
     @field_validator("git_author_email")
     @classmethod
     def _email(cls, v: str | None) -> str | None:

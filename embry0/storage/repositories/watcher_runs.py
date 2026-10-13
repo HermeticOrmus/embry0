@@ -119,7 +119,15 @@ class WatcherRunsRepository:
         repo: str = "",
     ) -> str:
         if action not in WATCHER_ACTIONS:
-            raise ValueError(f"unknown watcher action {action!r} (expected one of {sorted(WATCHER_ACTIONS)})")
+            # #347: this is the tick's LAST write, after the logs were fetched
+            # and the analysis paid for. Raising here lost the whole row, so an
+            # action added in one place and not here made the watcher look as
+            # if it had stopped recording. Keep the row as an error that names
+            # the unknown action; the window then stays where it was.
+            logger.error("watcher_run_unknown_action", action=action)
+            unknown = f"unknown watcher action {action!r}"
+            detail = f"{unknown}: {detail}" if detail else unknown
+            action = "error"
         run_id = f"wr-{uuid.uuid4().hex[:12]}"
         await self._db.execute(
             """

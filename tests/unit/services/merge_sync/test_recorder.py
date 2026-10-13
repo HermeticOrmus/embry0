@@ -484,3 +484,26 @@ async def test_an_undated_fact_is_not_given_a_constant_event_key(seed, recorder,
     assert second.case_outcome != "duplicate"
     assert (await healing.get(case_id))["merge_sha"] == "m" * 40
     del job
+
+
+async def test_a_pr_a_skipped_job_found_is_the_cases_and_its_merge_is_out_of_band(seed, recorder, healing):
+    """#474: a job that ended skipped because a person's open PR already
+    covered its ticket links that PR to the case with no owning job. When it
+    merges, the case resolves out_of_band — not as embry0's fix."""
+    from embry0.services.healing.recorder import CaseRecorder
+
+    issue = await seed.issue()
+    skipped = await seed.job(status="skipped", issue_id=issue)
+    case = await healing.open_case(repo=REPO, origin="watcher", title="Fix the thing")
+    await healing.attach_issue(case["id"], issue_id=issue)
+    await healing.attach_job(case["id"], job_id=skipped)
+
+    assert await CaseRecorder(healing).existing_pr_found(issue_id=issue, job_id=skipped, pr_url=URL) == case["id"]
+    detail = await healing.get(case["id"])
+    assert detail["stage"] == "pr_open"
+    assert [(p["url"], p["job_id"]) for p in detail["prs"]] == [(URL, None)], "the skipped job was made the PR's owner"
+
+    await recorder.record(fact(ref="human/fix", merged=MERGED_AT), source="webhook", event_key="d-474")
+
+    got = await healing.get(case["id"])
+    assert (got["stage"], got["resolution_path"]) == ("merged", "out_of_band"), got["resolution_path"]

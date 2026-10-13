@@ -347,10 +347,12 @@ initialisers (`registry-auth-init`, `init-sandbox-networks`, `init-push-images`)
 missing — go back to pass 1.
 
 **Startup errors that resolve themselves.** In the first seconds the
-orchestrator logs `sandbox_image_unavailable_no_build_context`,
-`proxy_image_missing_in_dind` and `docker_cmd_failed` for
+orchestrator logs `proxy_image_missing_in_dind` and `docker_cmd_failed` for
 `embry0-egress-helper`. It is checking for images before Docker-in-Docker has
-pulled them from the in-stack registry and built the egress helper. Judge health
+pulled them from the in-stack registry and built the egress helper. (The
+sandbox image it pulls itself when DinD lacks it, so
+`sandbox_image_unavailable_no_build_context` means the registry lacks it too,
+and is a real error, #622.) Judge health
 from a *recent* window rather than the whole log:
 
 ```bash
@@ -538,7 +540,7 @@ its socket is root over all of them. The orchestrator refuses to start under
 enforce memory, CPU and process limits.
 
 Both runtimes keep every isolation control: the restricted network with no NAT,
-the `EMBRY0-SANDBOX-ISOLATION` chain, the per-sandbox private-range egress drop,
+the `EMBRY0-SANDBOX-ISOLATION` chain, the private-range egress drop,
 the credential proxies and their per-sandbox enrollment, the profile isolation
 checks and the per-sandbox limits.
 

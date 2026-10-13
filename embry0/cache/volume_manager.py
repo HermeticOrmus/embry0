@@ -97,6 +97,15 @@ class SharedVolumeManager:
             await self.runtime.remove_volumes([volume_name], force=True, timeout=10)
         except Exception as exc:
             logger.warning("qa_shared_volume_destroy_failed", name=volume_name, error=str(exc))
+            return
+        await self._forget(volume_name)
+
+    async def _forget(self, volume_name: str) -> None:
+        """Drop the state row of a removed volume (#328). Best-effort."""
+        try:
+            await self.state_repo.delete_by_volume_name(volume_name)
+        except Exception as exc:
+            logger.warning("qa_volume_state_delete_failed", name=volume_name, error=str(exc))
 
     async def destroy_for_job(self, job_id: str) -> list[str]:
         """Remove every volume owned by ``job_id``; return the names removed.
@@ -136,6 +145,7 @@ class SharedVolumeManager:
                 )
             if await _run(f"remove {name}", self._removed(name)) is not None:
                 removed.append(name)
+                await self._forget(name)
         if removed:
             logger.info("qa_job_volumes_removed", job_id=job_id, volumes=removed)
         return removed

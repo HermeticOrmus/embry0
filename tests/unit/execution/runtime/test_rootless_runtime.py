@@ -14,6 +14,7 @@ from embry0.config import Embry0Config
 from embry0.execution.docker_client import DockerClient
 from embry0.execution.runtime import AgentRuntime, DockerRuntime, RootlessDockerRuntime, build_runtime
 from embry0.execution.runtime.rootless import RootlessDaemonError, rootless_daemon_problems
+from tests.fixtures.postgres import postgres_unavailable
 
 SOCKET = "unix:///run/embry0-sandbox/docker.sock"
 
@@ -161,7 +162,7 @@ async def test_startup_refuses_a_rootless_runtime_on_the_wrong_daemon_before_usi
         conn = await asyncpg.connect(database_url)
         await conn.close()
     except (OSError, asyncpg.PostgresError) as exc:
-        pytest.skip(f"PostgreSQL unavailable: {exc}")
+        postgres_unavailable(exc)
 
     used: list[str] = []
     rootful = {**ROOTLESS_INFO, "SecurityOptions": ["name=seccomp,profile=builtin"]}

@@ -17,7 +17,7 @@ import structlog
 from embry0.execution.proxy.manager import ProxyManager
 
 _SCOPED = ("github-proxy", "gitlab-proxy")
-_GIT_GRANT = ("allowed_repos", "git_upstream", "git_push")
+_GIT_GRANT = ("allowed_repos", "git_upstream", "git_push", "git_push_branches")
 
 
 def _git_proxy_echo(body: dict) -> dict:

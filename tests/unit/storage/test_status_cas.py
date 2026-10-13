@@ -97,12 +97,13 @@ async def test_fail_orphaned_binds_message_and_code_and_returns_ids():
     repo = JobsRepository(db)
     ids = await repo.fail_orphaned("ERR_ORPHANED", "Orchestrator restarted", never_started_message="Never started")
     assert ids == ["job-a", "job-b"]
-    query, message, code, never_started = db.fetch.await_args.args
+    query, message, code, never_started, keep, interrupted_code, _ = db.fetch.await_args.args
     assert "WHERE status IN ('running', 'pending')" in query
     assert "RETURNING job_id" in query
     assert message == "Orchestrator restarted"
     assert code == "ERR_ORPHANED"
     assert never_started == "Never started"
+    assert keep == [] and interrupted_code is None, "with no keep / interrupted code the sweep fails every orphan alike"
 
 
 async def test_reopen_stuck_for_jobs_binds_ids_and_counts():

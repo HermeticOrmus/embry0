@@ -75,3 +75,13 @@ async def test_upsert_preserves_last_warmed_sha_when_none_passed(repo: QAVolumeS
     state = await repo.get(scope="per-repo", scope_key="org/r1")
     assert state is not None
     assert state.last_warmed_sha == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_delete_by_volume_name_removes_only_that_row(repo: QAVolumeStateRepository):
+    """#328: the row of a removed volume is deleted; others stay."""
+    await repo.upsert(scope="per-job", scope_key="job-1", volume_name="embry0-qa-vol-job-1", last_warmed_sha=None)
+    await repo.upsert(scope="per-job", scope_key="job-10", volume_name="embry0-qa-vol-job-10", last_warmed_sha=None)
+    await repo.delete_by_volume_name("embry0-qa-vol-job-1")
+    assert await repo.get(scope="per-job", scope_key="job-1") is None
+    assert await repo.get(scope="per-job", scope_key="job-10") is not None

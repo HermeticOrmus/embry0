@@ -447,9 +447,10 @@ async def poll_xai_device_login(login_id: str, request: Request) -> XaiDeviceLog
 async def update_credential(credential_id: str, req: CredentialUpdate, request: Request) -> CredentialOut:
     repo = _state(request).credentials_repo
     try:
-        row = await repo.update_meta(
-            credential_id, label=req.label, git_author_name=req.git_author_name, git_author_email=req.git_author_email
-        )
+        # #440: an author field present in the body is written, null included
+        # (null clears it back to branding); an omitted one is kept.
+        author = req.model_dump(include={"git_author_name", "git_author_email"}, exclude_unset=True)
+        row = await repo.update_meta(credential_id, label=req.label, **author)
     except asyncpg.UniqueViolationError:
         raise HTTPException(status_code=409, detail=f"a credential labelled {req.label!r} already exists") from None
     if row is None:
@@ -457,7 +458,7 @@ async def update_credential(credential_id: str, req: CredentialUpdate, request: 
     if req.status is not None:
         row = await repo.set_status(credential_id, req.status)
         await _audit(request, "credential.status_changed", {"credential_id": credential_id, "status": req.status})
-    meta_fields = sorted(req.model_dump(exclude_none=True, exclude={"status"}))
+    meta_fields = sorted([*author, *(["label"] if req.label is not None else [])])
     if meta_fields:
         await _audit(request, "credential.updated", {"credential_id": credential_id, "fields": meta_fields})
     await _refresh_scrub_set(request)

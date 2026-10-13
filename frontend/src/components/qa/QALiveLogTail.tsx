@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
-import { logStreamUrl } from "@/api/qa-artifacts";
+import { logStreamUrl, mintLogStreamToken } from "@/api/qa-artifacts";
 
 interface Props {
   jobId: string;
@@ -21,23 +21,35 @@ export function QALiveLogTail({ jobId, service, active }: Props): JSX.Element {
       return;
     }
     setStreamState("connecting");
-    const es = new EventSource(logStreamUrl(jobId, service));
-    es.onopen = () => setStreamState("open");
-    es.onmessage = (e) => {
-      setLines((prev) => {
-        const next = [...prev, e.data];
-        // Cap to 1000 lines to avoid unbounded memory.
-        // TODO(perf): .slice(-1000) allocates a new array per line; switch to
-        // a ring buffer if log throughput becomes a problem.
-        return next.length > 1000 ? next.slice(-1000) : next;
+    let es: EventSource | null = null;
+    let cancelled = false;
+    // EventSource cannot send the API key, so mint a job-scoped token first
+    // (#634). If that fails the panel shows the stream closed.
+    mintLogStreamToken(jobId)
+      .then((token) => {
+        if (cancelled) return;
+        es = new EventSource(logStreamUrl(jobId, service, token));
+        es.onopen = () => setStreamState("open");
+        es.onmessage = (e) => {
+          setLines((prev) => {
+            const next = [...prev, e.data];
+            // Cap to 1000 lines to avoid unbounded memory.
+            // TODO(perf): .slice(-1000) allocates a new array per line; switch to
+            // a ring buffer if log throughput becomes a problem.
+            return next.length > 1000 ? next.slice(-1000) : next;
+          });
+        };
+        es.onerror = () => {
+          es?.close();
+          setStreamState("closed");
+        };
+      })
+      .catch(() => {
+        if (!cancelled) setStreamState("closed");
       });
-    };
-    es.onerror = () => {
-      es.close();
-      setStreamState("closed");
-    };
     return () => {
-      es.close();
+      cancelled = true;
+      es?.close();
       setStreamState("closed");
     };
   }, [jobId, service, active]);

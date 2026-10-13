@@ -10,11 +10,16 @@ from typing import Any
 
 import structlog
 
-from embry0.execution.image_registry import qualify_image
+from embry0.execution.image_registry import is_registry_qualified, qualify_image
 from embry0.execution.runtime import AgentRuntime
+from embry0.execution.sandbox_listing import list_sandbox_containers, parse_ps_created
 from embry0.storage.repositories.jobs import StatusTransitionConflict
 
 logger = structlog.get_logger(__name__)
+
+# The sandbox image is pulled at startup only when the daemon lacks it; the
+# in-stack registry is local, so this bounds a hung registry, not a slow one.
+_REGISTRY_PULL_TIMEOUT_SECONDS = 300
 
 
 class SandboxImageManager:
@@ -107,15 +112,21 @@ class SandboxImageManager:
             # self-build. Defer to the image init-push-images pushed to the
             # registry; only error if it's genuinely absent everywhere.
             if not self._build_context_available():
+                qualified = self._qualify(image)
                 if await self._image_exists(image):
-                    logger.info(
-                        "sandbox_image_provided_by_registry",
-                        image=self._qualify(image),
-                    )
+                    logger.info("sandbox_image_provided_by_registry", image=qualified)
+                    return False
+                # #622: right after init-push-images pushes a new digest the
+                # daemon has not pulled it yet (it pulls on the first sandbox
+                # run), so its local store alone is no evidence of absence.
+                pull_error = await self._pull_from_registry(qualified)
+                if pull_error is None:
+                    logger.info("sandbox_image_pulled_from_registry", image=qualified)
                     return False
                 logger.error(
                     "sandbox_image_unavailable_no_build_context",
-                    image=self._qualify(image),
+                    image=qualified,
+                    pull_error=pull_error,
                     hint="run the init-push-images bootstrap to push embry0-sandbox to the in-stack registry",
                 )
                 return False
@@ -138,6 +149,20 @@ class SandboxImageManager:
                         logger.info("sandbox_image_missing", image=image)
 
             return await self._build_image(image, current_hash)
+
+    async def _pull_from_registry(self, qualified: str) -> str | None:
+        """Pull ``qualified`` into the daemon. Returns None on success, else why it failed.
+
+        An unqualified name has no registry to pull from (it would resolve to
+        Docker Hub), so it is not tried.
+        """
+        if not is_registry_qualified(qualified):
+            return "image name is not registry-qualified"
+        try:
+            await self._runtime.pull_image(qualified, timeout=_REGISTRY_PULL_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001 — any pull failure means "absent from the registry too"
+            return str(exc)[:500]
+        return None
 
     async def _build_image(self, image: str, build_hash: str) -> bool:
         """Build the sandbox Docker image."""
@@ -354,7 +379,7 @@ class ContainerReaper:
     async def _reap(self) -> None:
         """Find and destroy stale sandbox containers, skipping live jobs."""
         try:
-            containers = await self._runtime.list_containers(name="sandbox-", timeout=15)
+            containers = await list_sandbox_containers(self._runtime, timeout=15)
         except RuntimeError:
             logger.warning("reaper_list_failed")
             return
@@ -375,15 +400,8 @@ class ContainerReaper:
                 logger.info("reaper_skip_active_job", name=name)
                 continue
 
-            try:
-                # Docker emits "<timestamp> <offset> <tz_abbrev>", e.g.
-                #   "2026-04-28 07:05:11 +0000 UTC" (when CLI runs with TZ=UTC)
-                #   "2026-04-27 15:32:08 -0400 EDT" (when CLI runs with TZ=America/New_York)
-                # Strip any trailing alphabetic timezone abbreviation; %z parses the offset.
-                parts = created_at.rsplit(" ", 1)
-                cleaned = parts[0] if len(parts) == 2 and parts[1].isalpha() else created_at
-                created = datetime.strptime(cleaned, "%Y-%m-%d %H:%M:%S %z")
-            except ValueError:
+            created = parse_ps_created(created_at)
+            if created is None:
                 logger.warning("reaper_unparseable_timestamp", name=name, created_at=created_at)
                 continue
 
@@ -425,7 +443,9 @@ class ContainerReaper:
                         # Fallback for environments where jobs_repo was not
                         # injected — same from-state guard inline.
                         claimed = await self._db.fetchrow(
-                            "UPDATE jobs SET status = 'expired' WHERE job_id = $1 AND status = 'paused' RETURNING job_id",
+                            # RAV-1271 / #345: a terminal status carries finished_at.
+                            "UPDATE jobs SET status = 'expired', finished_at = COALESCE(finished_at, NOW()) "
+                            "WHERE job_id = $1 AND status = 'paused' RETURNING job_id",
                             job_id,
                         )
                         if claimed is None:

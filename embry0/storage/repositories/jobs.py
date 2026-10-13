@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Collection
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from embry0.safety.error_codes import ErrorCode
 from embry0.storage.database import DatabasePool
 from embry0.storage.repositories.gate_refusal import gate_refusal_sql
 from embry0.storage.schemas import JobStatus
@@ -31,6 +33,7 @@ VALID_JOB_TRANSITIONS: dict[str, set[str]] = {
     JobStatus.PENDING: {JobStatus.RUNNING, JobStatus.CANCELLED},
     JobStatus.RUNNING: {
         JobStatus.COMPLETED,
+        JobStatus.SKIPPED,
         JobStatus.FAILED,
         JobStatus.PARTIAL,
         JobStatus.CANCELLED,
@@ -56,12 +59,30 @@ VALID_JOB_TRANSITIONS: dict[str, set[str]] = {
     JobStatus.FAILED: set(),  # Terminal
     JobStatus.CANCELLED: set(),  # Terminal
     JobStatus.EXPIRED: set(),  # Terminal
+    JobStatus.SKIPPED: set(),  # Terminal (#474)
     JobStatus.PR_MERGED: set(),  # Terminal
     # A closed PR can be reopened, and then merged (#279): merge sync walks
     # the status back to COMPLETED or on to PR_MERGED so it keeps saying what
     # the forge says. A merge is final.
     JobStatus.PR_CLOSED: {JobStatus.PR_MERGED, JobStatus.COMPLETED},
 }
+
+# #348: the one runtime path from PENDING straight to FAILED. The dispatch
+# budget gate is asked before a job is marked running, so a job it refuses
+# never ran and must not carry a started_at it did not earn. Narrow on
+# purpose: only a write carrying ERR_BUDGET_REFUSED may take it, so every
+# other failure still has to pass through RUNNING. Kept out of the table
+# above because the table cannot express the condition.
+_GATE_REFUSAL_CODE = ErrorCode.BUDGET_REFUSED.value
+
+
+def _is_gate_refusal(current_status: str, new_status: str, fields: dict[str, Any]) -> bool:
+    return (
+        current_status == JobStatus.PENDING
+        and new_status == JobStatus.FAILED
+        and fields.get("error_code") == _GATE_REFUSAL_CODE
+    )
+
 
 # RAV-1271: statuses a live job terminates into. Entering any of these must
 # always stamp finished_at (structural invariant — see update()). PR_MERGED /
@@ -74,6 +95,7 @@ _TERMINAL_STATUSES: frozenset[str] = frozenset(
         JobStatus.FAILED,
         JobStatus.CANCELLED,
         JobStatus.EXPIRED,
+        JobStatus.SKIPPED,
     }
 )
 
@@ -302,7 +324,7 @@ class JobsRepository:
 
             else:
                 allowed = VALID_JOB_TRANSITIONS.get(current_status, set())
-                if new_status not in allowed:
+                if new_status not in allowed and not _is_gate_refusal(current_status, new_status, valid):
                     logger.warning(
                         "invalid_job_status_transition",
                         job_id=job_id,
@@ -415,35 +437,142 @@ class JobsRepository:
             return False
         return True
 
-    async def fail_orphaned(self, error_code: str, error_message: str, *, never_started_message: str) -> list[str]:
+    async def fail_orphaned(
+        self,
+        error_code: str,
+        error_message: str,
+        *,
+        never_started_message: str,
+        keep: Collection[str] = (),
+        interrupted_code: str | None = None,
+        interrupted_message: str | None = None,
+    ) -> list[str]:
         """Boot-time reconciliation: fail every job left running/pending by a
-        previous orchestrator lifecycle. Returns the affected job ids.
+        previous orchestrator lifecycle, except the ``keep`` ids boot is
+        recovering (#307). Returns the affected job ids.
 
         A ``pending`` job never started: it may have waited for a run slot
         (MAX_RUNNING_JOBS, #583) for a long time. It gets
         ``never_started_message`` so its row does not claim it was running.
+        A ``running`` job a drain stopped (``interrupted_at`` set) gets
+        ``interrupted_code`` / ``interrupted_message`` when given, so a
+        deploy-killed job reads as one.
 
         Deliberately set-based and outside per-row transition validation
         (pending -> failed is not a runtime transition): at startup nothing
         races, and the WHERE clause is its own from-state guard. Lives here so
         the lifecycle knowledge stays in the repository layer (RAV-1063).
+
+        Being raw SQL, it carries the terminal-status invariant itself
+        (RAV-1271): a failed row gets ``finished_at`` (#345). Without it an orphaned job
+        had no duration, so the job-duration histogram never saw it.
         """
         rows = await self._db.fetch(
             """
             UPDATE jobs
             SET status = 'failed',
-                error_message = CASE WHEN status = 'pending' THEN $3 ELSE $1 END,
-                error_code = $2
+                error_message = CASE
+                    WHEN status = 'pending' THEN $3
+                    WHEN interrupted_at IS NOT NULL AND $5::text IS NOT NULL THEN $6
+                    ELSE $1 END,
+                error_code = CASE
+                    WHEN status = 'running' AND interrupted_at IS NOT NULL AND $5::text IS NOT NULL THEN $5
+                    ELSE $2 END,
+                finished_at = COALESCE(finished_at, NOW())
             WHERE status IN ('running', 'pending')
+              AND NOT (job_id = ANY($4::text[]))
             RETURNING job_id, status, pipeline_template, error_code, created_at, started_at, finished_at
             """,
             error_message,
             error_code,
             never_started_message,
+            list(keep),
+            interrupted_code,
+            interrupted_message or error_message,
         )
         for row in rows:
             self._count_finished(row)
         return [r["job_id"] for r in rows]
+
+    async def fail_jobs(self, job_ids: Collection[str], error_code: str, error_message: str) -> list[str]:
+        """Boot-time: fail these in-flight jobs with one code and message.
+
+        Set-based like :meth:`fail_orphaned`, for the jobs boot will not
+        recover for a reason of its own (``ERR_RESUME_LIMIT``, #307).
+        """
+        if not job_ids:
+            return []
+        rows = await self._db.fetch(
+            f"""
+            UPDATE jobs
+            SET status = 'failed', error_code = $2, error_message = $3,
+                finished_at = COALESCE(finished_at, NOW())
+            WHERE job_id = ANY($1::text[]) AND status IN ('running', 'pending')
+            RETURNING {_FINISHED_COLUMNS}
+            """,
+            list(job_ids),
+            error_code,
+            error_message,
+        )
+        for row in rows:
+            self._count_finished(row)
+        return [r["job_id"] for r in rows]
+
+    async def inflight_for_recovery(self) -> list[dict[str, Any]]:
+        """The jobs a previous orchestrator left ``running`` or ``pending``,
+        with what boot recovery decides on (#307)."""
+        rows = await self._db.fetch(
+            """
+            SELECT job_id, status, pipeline_template, issue_id, launch, interrupted_at, resume_attempts
+            FROM jobs
+            WHERE status IN ('running', 'pending')
+            ORDER BY created_at
+            """
+        )
+        return [dict(r) for r in rows]
+
+    async def begin_recovery(self, job_ids: Collection[str], *, counted: Collection[str]) -> list[str]:
+        """Take these in-flight jobs back at boot (#307).
+
+        Clears the drain stamp, so the next stop is judged on its own, and
+        spends one ``resume_attempts`` on each ``counted`` job (its last stop
+        was unclean). Returns the ids still in flight.
+        """
+        if not job_ids:
+            return []
+        rows = await self._db.fetch(
+            """
+            UPDATE jobs
+            SET interrupted_at = NULL,
+                resume_attempts = resume_attempts + CASE WHEN job_id = ANY($2::text[]) THEN 1 ELSE 0 END
+            WHERE job_id = ANY($1::text[]) AND status IN ('running', 'pending')
+            RETURNING job_id
+            """,
+            list(job_ids),
+            list(counted),
+        )
+        return [r["job_id"] for r in rows]
+
+    async def mark_interrupted(self, job_ids: Collection[str]) -> list[str]:
+        """Stamp ``interrupted_at`` on the jobs a drain stopped or deferred
+        (#307). Only jobs still in flight; returns their ids."""
+        if not job_ids:
+            return []
+        rows = await self._db.fetch(
+            """
+            UPDATE jobs SET interrupted_at = NOW()
+            WHERE job_id = ANY($1::text[]) AND status IN ('running', 'pending')
+            RETURNING job_id
+            """,
+            list(job_ids),
+        )
+        return [r["job_id"] for r in rows]
+
+    async def record_launch(self, job_id: str, launch: dict[str, Any]) -> None:
+        """Store what starting this job again takes (#307): the runner kind
+        and its arguments, JSON-shaped. Boot launches a ``pending`` job, or a
+        ``running`` one whose graph never began, from it."""
+        await self._db.execute("UPDATE jobs SET launch = $2 WHERE job_id = $1", job_id, launch)
 
     async def increment_cost(self, job_id: str, cost_delta: float) -> None:
         """Atomically add cost_delta to total_cost_usd."""

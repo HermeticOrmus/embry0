@@ -214,7 +214,6 @@ def test_get_run_detail_returns_apps_inlined():
                 status=SubTaskStatus.PASSED,
                 duration_ms=1000,
                 cache_hits=CacheHits(),
-                trace_url=None,
                 failure_summary=None,
                 raw_result={},
             ),
@@ -224,7 +223,6 @@ def test_get_run_detail_returns_apps_inlined():
                 status=SubTaskStatus.QA_FAILURE,
                 duration_ms=2000,
                 cache_hits=CacheHits(prebaked_image=True),
-                trace_url="https://x/trace.zip",
                 failure_summary="loads page did not render",
                 raw_result={},
             ),
@@ -249,7 +247,7 @@ def test_get_run_detail_returns_apps_inlined():
     assert len(body["apps"]) == 2
     by_app = {a["app_name"]: a for a in body["apps"]}
     assert by_app["companion"]["status"] == "qa_failure"
-    assert by_app["companion"]["trace_url"] == "https://x/trace.zip"
+    assert "trace_url" not in by_app["companion"], "#644: the API no longer returns trace_url"
     assert by_app["hub"]["cache_hits"]["prebaked_image"] is False
     assert by_app["companion"]["cache_hits"]["prebaked_image"] is True
 
@@ -282,7 +280,6 @@ def test_get_run_detail_overall_status_passed_when_all_pass():
                 status=SubTaskStatus.PASSED,
                 duration_ms=1,
                 cache_hits=CacheHits(),
-                trace_url=None,
                 failure_summary=None,
                 raw_result={},
             ),
@@ -306,7 +303,6 @@ def test_get_run_detail_overall_status_infra_error_when_any_infra_failure():
                 status=SubTaskStatus.PASSED,
                 duration_ms=1,
                 cache_hits=CacheHits(),
-                trace_url=None,
                 failure_summary=None,
                 raw_result={},
             ),
@@ -316,7 +312,6 @@ def test_get_run_detail_overall_status_infra_error_when_any_infra_failure():
                 status=SubTaskStatus.INFRA_FAILURE,
                 duration_ms=500,
                 cache_hits=CacheHits(),
-                trace_url=None,
                 failure_summary="docker pull failed",
                 raw_result={},
             ),
@@ -341,7 +336,6 @@ def test_get_run_detail_overall_status_skipped_is_pass():
                 status=SubTaskStatus.PASSED,
                 duration_ms=1,
                 cache_hits=CacheHits(),
-                trace_url=None,
                 failure_summary=None,
                 raw_result={},
             ),
@@ -351,7 +345,6 @@ def test_get_run_detail_overall_status_skipped_is_pass():
                 status=SubTaskStatus.SKIPPED,
                 duration_ms=0,
                 cache_hits=CacheHits(),
-                trace_url=None,
                 failure_summary=None,
                 raw_result={},
             ),
@@ -378,7 +371,6 @@ def test_get_run_app_returns_app_result():
                 status=SubTaskStatus.QA_FAILURE,
                 duration_ms=2000,
                 cache_hits=CacheHits(),
-                trace_url="https://x/trace.zip",
                 failure_summary="loads page did not render",
                 raw_result={"phase_reached": "exploratory"},
             ),
@@ -390,7 +382,7 @@ def test_get_run_app_returns_app_result():
     body = resp.json()
     assert body["app_name"] == "companion"
     assert body["status"] == "qa_failure"
-    assert body["trace_url"] == "https://x/trace.zip"
+    assert "trace_url" not in body, "#644: the API no longer returns trace_url"
 
 
 def test_get_run_app_404_on_unknown_app():
@@ -403,7 +395,6 @@ def test_get_run_app_404_on_unknown_app():
                 status=SubTaskStatus.PASSED,
                 duration_ms=1,
                 cache_hits=CacheHits(),
-                trace_url=None,
                 failure_summary=None,
                 raw_result={},
             ),

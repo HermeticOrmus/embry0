@@ -28,10 +28,10 @@ from typing import Any
 
 from embry0.api.app import create_app
 from embry0.config import Embry0Config
-from embry0_mcp import server
+from embry0.mcp_server import server
 
 ROOT = Path(__file__).resolve().parents[2]
-PACKAGES = (ROOT / "embry0", ROOT / "embry0_mcp")
+PACKAGES = (ROOT / "embry0",)
 MIGRATIONS = ROOT / "embry0" / "storage" / "migrations"
 
 TICKET_REF = re.compile(r"\b([A-Z]{2,}[A-Z0-9]*)-\d+\b")

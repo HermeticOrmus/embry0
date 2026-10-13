@@ -296,3 +296,21 @@ async def test_qa_node_wires_agent_definition_to_resolved_backend(backend_key, w
     if want_server == "playwright":
         # Byte-identical regression: default dispatch == the stored seed.
         assert definition == dict(QA_AGENT_SEED)
+
+
+@pytest.mark.parametrize(
+    ("message", "transient"),
+    [
+        ("executor crashed: connection refused", True),
+        ("API Error: 529 overloaded_error", True),
+        ("MCP disconnect: transport closed", True),
+        # The agent's own wall-clock limit is not an environmental blip:
+        # retrying it would run the whole budget again (#643).
+        ("Agent timed out after 1800s", False),
+        ("tool misuse: wrote outside /workspace", False),
+    ],
+)
+def test_transient_classification(message, transient):
+    from embry0.workflows.qa.nodes import _is_transient_agent_error
+
+    assert _is_transient_agent_error(message) is transient, f"{message!r} should be transient={transient}"

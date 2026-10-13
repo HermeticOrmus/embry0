@@ -96,29 +96,6 @@ async def test_prep_clone_configures_the_credential_author():
     assert "user.name Alice" in setup, setup
 
 
-async def test_init_qa_node_passes_the_bound_credential(captured_clone):
-    from embry0.workflows.qa.nodes import init_qa_node
-
-    cred = _cred()
-    mgr = _sandbox_mgr(cred)
-    config = {
-        "configurable": {
-            "docker": _docker(),
-            "runtime": DockerRuntime(_docker()),
-            "sandbox_manager": mgr,
-            "profiles_repo": _profiles({"name": "qa-jvm", "dind_enabled": False}),
-            "qa_minio_sandbox": AsyncMock(),
-            "qa_token_registry": MagicMock(),
-            "proxy_manager": MagicMock(git_proxy_url="", xai_proxy_url=""),
-        }
-    }
-    state = {"job_id": "job-qa", "repo": "acme/widgets", "qa": {"sandbox_profile_name": "qa-jvm"}}
-    with pytest.raises(_Stop):
-        await init_qa_node(state, config)
-    assert captured_clone.get("forge_credential") is cred, captured_clone.get("forge_credential")
-    mgr.last_forge_credential.assert_called_with(_CID)
-
-
 async def test_init_orchestrator_node_passes_the_bound_credential(captured_clone):
     from embry0.workflows.qa.orchestrator import init_orchestrator_node
 

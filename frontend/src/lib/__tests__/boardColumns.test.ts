@@ -12,6 +12,7 @@ const EXPECTED_LANES: Record<JobStatus, BoardColumnId> = {
   running: "running",
   completed: "done",
   pr_merged: "done",
+  skipped: "done",
   failed: "failed",
   partial: "failed",
   cancelled: "failed",

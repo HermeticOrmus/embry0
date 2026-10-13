@@ -78,6 +78,8 @@ class SubTaskState(TypedDict, total=False):
 
     # Set by exploratory_qa_node (forwarded from legacy qa_node return)
     agent_outputs: list[dict[str, Any]]
+    # #643: extra QA agent runs granted after an environmental failure (0 or 1).
+    agent_transient_retries: int
 
     # Set by any failing node
     status: SubTaskStatus | None
@@ -85,7 +87,6 @@ class SubTaskState(TypedDict, total=False):
     completed_at: float | None
 
     # Set by collect_artifacts_node on success path
-    trace_url: str | None
     raw_result: dict[str, Any]
 
     # Set by emit_result_node
@@ -119,7 +120,6 @@ def initial_state_for_app(
         "status": None,
         "started_at": time.monotonic(),
         "completed_at": None,
-        "trace_url": None,
         "failure_summary": None,
         "raw_result": {},
         "sandbox_id": None,
@@ -182,9 +182,7 @@ def _build_job_json_payload(
 ) -> dict[str, Any]:
     """Construct the job.json content the in-sandbox agent reads.
 
-    Mirrors the field set the legacy init_qa_node assembles, but parameterized
-    so sub-tasks can produce equivalent job.json content without sharing
-    init_qa_node's local variables.
+    Parameterized so each sub-task builds its own job.json content.
     """
     return {
         "schema_version": 1,

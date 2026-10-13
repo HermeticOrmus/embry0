@@ -117,7 +117,7 @@ graph TB
 | `backend` | Orchestrator, PostgreSQL, DinD | Backend services only |
 | `sandbox-restricted` | Proxy services, Sandbox containers | No internet (masquerade off), proxy-only access. A sandbox can open a connection to a proxy here and to no other sandbox: the `EMBRY0-SANDBOX-ISOLATION` chain (#554), described below. |
 | `sandbox-internet` | Default `slim` profile and the other non-qa profiles, plus deployed-target QA, attached for the whole job. No per-step switch. | NAT egress so the Claude CLI can reach its API: `sandbox-restricted` has masquerade off and auth-proxy is not wired. Public egress stays open. The private-range drop (RFC1918, carrier-grade NAT, and link-local, except declared targets) is installed for every container on this network. |
-| `qa-net-{job_id}` | One QA sandbox + the target app's compose stack | Per-QA-job DinD network created at `init_qa` and torn down by `cleanup_qa_resources`. Lets the target app's services reach each other and the agent's browser backend (Playwright or Vibium) reach the frontend by short DNS names (`gateway`, `redis`, `frontend`). |
+| `qa-net-{job_id}__{app}` | One QA sub-task's sandbox + the target app's compose stack | Per-sub-task DinD network (DinD-mode apps only) created by `acquire_sandbox` and torn down by `cleanup_qa_resources` in `release_sandbox`. Lets the target app's services reach each other and the agent's browser backend (Playwright or Vibium) reach the frontend by short DNS names (`gateway`, `redis`, `frontend`). |
 
 > **Networks are asserted at orchestrator startup, not auto-created.** The
 > orchestrator inspects each network and refuses to start if `sandbox-restricted`
@@ -158,7 +158,7 @@ in DinD's `DOCKER-USER` for the whole bridge, not rules per sandbox:
   nothing to remove when a sandbox ends and nothing for a crash to leak.
 - **Untouched.** Traffic to the bridge gateway (DinD itself, how a
   `dind_enabled` sandbox reaches the daemon) is INPUT, not FORWARD.
-  `sandbox-internet` keeps its per-sandbox private-range drop, and traffic
+  `sandbox-internet` keeps its own private-range drop (below), and traffic
   between bridges (`qa-net-{job_id}` to anything else) is dropped by Docker's
   own isolation chains.
 - **Blocked attempts** are counted on the chain's DROP rule:
@@ -166,6 +166,39 @@ in DinD's `DOCKER-USER` for the whole bridge, not rules per sandbox:
   rate-limited `LOG` rule (prefix `embry0-isolation-block:`) reaches the kernel
   log only when the host sets `net.netfilter.nf_log_all_netns=1`, because DinD
   has its own network namespace.
+
+#### The private-range drop on `sandbox-internet`
+
+`embry0/execution/runtime/egress.py` gives every sandbox on `sandbox-internet`
+a short block in `DOCKER-USER`, keyed on its address there, and one chain
+shared by every sandbox holds the drop and the proxy exceptions:
+
+```
+-A DOCKER-USER -s <sandbox>/32 -d <declared target>/32 -j RETURN   (each, from the profile)
+-A DOCKER-USER -s <sandbox>/32 -j EMBRY0-SANDBOX-EGRESS
+-A EMBRY0-SANDBOX-EGRESS -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+-A EMBRY0-SANDBOX-EGRESS -d <each proxy's sandbox-internet address>/32 -j RETURN
+-A EMBRY0-SANDBOX-EGRESS -d <private range> -m limit --limit 6/min -j LOG --log-prefix "embry0-egress-block: "
+-A EMBRY0-SANDBOX-EGRESS -d <private range> -j DROP   (each of RFC1918, CGN, link-local)
+```
+
+- **Why the proxies are in the shared chain (#568).** The proxies are recreated
+  at every start, and Docker may give them new addresses and give their old
+  ones to new sandboxes. Per-sandbox proxy exceptions would follow neither for a
+  sandbox that outlives the restart. The chain is rewritten from the running
+  proxies, in one `iptables-restore` transaction, at startup, at every
+  `SandboxManager.create` for a sandbox on the network, and when a paused
+  sandbox is re-enrolled. The same refresh converts the rules of a sandbox
+  created before the chain existed: its RETURNs outside the network's subnet
+  (its declared targets) are kept, the rest is replaced by the jump.
+- **Fail-closed.** An empty chain would allow everything, so a jump to it is
+  written only after the chain is checked to end in its last DROP. A sandbox
+  whose create cannot write its rules is destroyed; a resume that cannot leaves
+  the job paused.
+- **Blocked attempts** are counted on the chain's DROP rules:
+  `docker exec <dind> iptables -L EMBRY0-SANDBOX-EGRESS -v -n`. The `LOG` line
+  reaches the kernel log only with `net.netfilter.nf_log_all_netns=1` on the
+  host (#567).
 
 #### The same networks on the rootless runtime
 
@@ -370,12 +403,12 @@ stateDiagram-v2
     }
 
     state QAFlow {
-        InitQA: init_qa<br/>start sandbox + qa-net + load qa.yaml
-        QA: qa<br/>agent runs 5 phases via its browser backend's MCP
-        QAReport: qa_report<br/>parse result.json + cleanup
+        InitOrch: init_orchestrator<br/>bootstrap sandbox: clone, diff, load stored QA config
+        Orchestrate: orchestrate_qa<br/>one parallel sub-task per affected app
+        QAReport: qa_report<br/>sticky PR comment
         Bookkeep: qa_failure_bookkeeping<br/>bump failure_rounds on failed
-        InitQA --> QA
-        QA --> QAReport
+        InitOrch --> Orchestrate
+        Orchestrate --> QAReport
         QAReport --> Bookkeep
         Bookkeep --> Pass: passed → END
         Bookkeep --> Fail: failed → triage (retry_developer / rerun_qa / ask_user)
@@ -392,7 +425,7 @@ stateDiagram-v2
 
 > **Note on verification tiers (#298/#299):** `needs_qa` is triage's request, not the last word. After an approved review the `verify` node runs the deterministic test gate and prunes the QA step for backend-only diffs and for repos whose QA config has no branch-booted (`target: managed`) app; a branch job never QAs a `target: deployed` app. Details: `docs/verification.md`.
 
-> **Note on QA gate:** Triage emits `set_qa_decision` (initial pass) and `qa_failure_action` (after a failed QA run) inline in its JSON output. The QA subpath reuses the standalone QA workflow's nodes verbatim — see the QA Pipeline section below for the inner workings.
+> **Note on QA gate:** Triage emits `set_qa_decision` (initial pass) and `qa_failure_action` (after a failed QA run) inline in its JSON output. The QA subpath reuses the standalone QA workflow's nodes (`orchestrate_qa` in its branch variant, which never QAs a `target: deployed` app) — see the QA Pipeline section below for the inner workings.
 
 ### Graph Nodes
 
@@ -405,9 +438,9 @@ stateDiagram-v2
 | `verify` | No | — | After an approved review (#298/#299): classify the diff into a verification tier, run the repo's configured test commands on base and head in the dev sandbox, store the result (`job_verifications`). New test failures end the job (`ERR_VERIFY_NEW_TEST_FAILURES`); otherwise the route plan continues, with the QA step pruned unless the change is frontend-touching and the repo's QA config can boot the app from the branch. See `docs/verification.md`. |
 | `retry` | No | — | Inject review feedback into state, increment counter |
 | `max_retries` | No | — | `interrupt()` — ask user: continue, merge as-is, or abandon |
-| `init_qa` | No | — | (QA gate, when `needs_qa=true`) Create QA sandbox + per-job network, read the stored `repo_qa_configs` document, mint MinIO presigned PUT URLs, write `/workspace/.qa/job.json` |
-| `qa` | Yes | Read, Glob, Grep, Bash, Edit, plus the selected browser backend's MCP tools (Playwright: 22, Vibium: 49 — see `workflows/qa/browser_backends.py`) | Run the 5 QA phases (boot, seed, e2e, exploratory, report) and write `result.json` |
-| `qa_report` | No | — | Read + Pydantic-validate `result.json`, set `qa.final_status`, upload artifacts, destroy sandbox, cleanup network |
+| `init_orchestrator` | No | — | (QA gate, when `needs_qa=true`) In a short-lived `slim` bootstrap sandbox: clone, compute the diff, load the stored `repo_qa_configs` document into `state["qa"]` |
+| `orchestrate_qa` | Yes (per app) | The QA agent: Read, Glob, Grep, Bash, Edit, plus the selected browser backend's MCP tools (Playwright: 22, Vibium: 49 — see `workflows/qa/browser_backends.py`) | Fan out one sub-task per affected app (the sub-task graph, see QA Pipeline), aggregate the results, set `qa.final_status` |
+| `qa_report` | No | — | Write the sticky QA PR comment with the aggregate verdict and per-app breakdown |
 | `qa_failure_bookkeeping` | No | — | Increment `qa.failure_rounds` when `final_status=failed` |
 | `qa_exhausted` | No | — | Terminal node when `failure_rounds` hits the cap; sets `error_code=ERR_QA_FAILURES_UNRESOLVED` |
 
@@ -450,56 +483,84 @@ The LLM triage node outputs a pipeline configuration.
 
 The QA agent boots a target full-stack application inside DinD, drives a headless browser via the repo's selected browser backend (Playwright MCP by default; Vibium MCP via `browser_backend: vibium` — see docs/qa-yaml-reference.md), and validates each acceptance criterion with screenshots, browser console, network activity, and per-service container logs as evidence. Two modes:
 
-- **Standalone** (`POST /api/v1/jobs` with `pipeline=qa`) — run QA against any branch on demand. Used for ad-hoc validation and CI smoke.
-- **PR-gated** (issue→PR with `needs_qa=true`) — triage decides whether the resulting PR should be QA-validated; the issue→PR graph routes through `init_qa → qa → qa_report` after `review` and re-invokes triage on failure with the failure summary so it can pick `retry_developer` / `rerun_qa` / `ask_user`.
+- **Standalone** (`POST /api/v1/jobs` with `pipeline=qa`) — run QA against any branch on demand. Used for ad-hoc validation and CI smoke. Graph: `embry0/workflows/qa/graph.py`.
+- **PR-gated** (issue→PR with `needs_qa=true`) — triage decides whether the resulting PR should be QA-validated; the issue→PR graph routes through `init_orchestrator → orchestrate_qa → qa_report → qa_failure_bookkeeping` after `review`/`verify` and re-invokes triage on failure with the failure summary so it can pick `retry_developer` / `rerun_qa` / `ask_user`.
 
-Both modes share the same nodes (`init_qa`, `qa`, `qa_report`) and the same `qa-net-{job_id}` per-job network.
+Both modes run the same three top-level nodes:
+
+| Node | Module | Does |
+|------|--------|------|
+| `init_orchestrator` | `workflows/qa/orchestrator.py` | Allocates a short-lived `slim` bootstrap sandbox, clones the repo for the diff and workspace staging, loads the repo's stored QA config (qa.yaml v2) from the DB, destroys the sandbox |
+| `orchestrate_qa` | `workflows/qa/orchestrator.py` | Resolves which apps the change affects and runs one **sub-task** per app in parallel; aggregates the `SubTaskResult`s into `qa.per_app_results` and `qa.final_status`, persists them (`qa_app_results`) and publishes the `done` event the dashboard's SSE stream closes on |
+| `qa_report` | `workflows/qa/orchestrator_report.py` | Upserts the sticky PR comment (the only QA reporting surface) |
+
+Each sub-task is a linear subgraph (`workflows/qa/subtask_graph.py`). Every node short-circuits once an earlier one has set the sub-task's `status`, so `release_sandbox` and `emit_result` always run. The sub-task's job id is `<run_id>__<app>`.
+
+```mermaid
+graph LR
+    A[acquire_sandbox] --> B[boot_app] --> S[seed] --> AU[auth_setup] --> E[e2e] --> X[exploratory_qa] --> C[collect_artifacts] --> R[release_sandbox] --> M[emit_result]
+```
+
+| Sub-task node | Does |
+|---------------|------|
+| `acquire_sandbox` | Picks the sandbox image (a pre-baked QA image or warm volume when available), creates `qa-net-<run_id>__<app>` for DinD-mode apps, creates the sandbox, clones via git-proxy (`prep_qa_sandbox_clone`), registers the sandbox token and writes `/workspace/.qa/job.json` with presigned PUT URLs (`prep_qa_sandbox_jobjson`) |
+| `boot_app` | Runs the app's `boot_command` and `ready_checks` (`run_boot_phase`); on failure uploads a diagnostic screenshot and sets `BOOT_FAILURE` / `READY_CHECK_FAILED` |
+| `seed` | Optional data seeding |
+| `auth_setup` | Optional: writes `/workspace/.qa/storage-state.json` for pre-authenticated QA from a secret or a login command |
+| `e2e` | Optional repo e2e suite, before exploratory QA |
+| `exploratory_qa` | Runs the QA agent (`qa_node` in `workflows/qa/nodes.py`) through its browser backend's MCP tools; it validates each acceptance criterion and writes `result.json` |
+| `collect_artifacts` | Reads and Pydantic-validates `/workspace/.qa/result.json`, adds the boot section, maps the verdict to a `SubTaskStatus` |
+| `release_sandbox` | Destroys the sandbox, unregisters its token, runs `cleanup_qa_resources` (containers, volumes and network by label) |
+| `emit_result` | Builds the `SubTaskResult` and publishes a `subtask_status` event for the dashboard's SSE stream |
+
+Sub-task statuses: `passed`, `qa_failure`, `e2e_failure`, `boot_failure`, `ready_check_failed`, `infra_failure`, `inconclusive`, `skipped`. There are no automatic QA retries: a failed run in the PR-gated mode goes back to triage (below).
 
 ```mermaid
 graph LR
     subgraph DinD
-        QS["QA Sandbox<br/>embry0-sandbox-qa<br/>(JDK 21, Docker CLI, Chromium +<br/>Playwright MCP, Chrome for Testing +<br/>Vibium MCP)"]
-        QN["qa-net-jobC"]
-        APP["Target app stack<br/>compose -p qa_jobC<br/>(gateway, frontend, db, ...)"]
+        QS["QA Sandbox (one per app)<br/>embry0-sandbox-qa<br/>(JDK 21, Docker CLI, Chromium +<br/>Playwright MCP, Chrome for Testing +<br/>Vibium MCP)"]
+        QN["qa-net-run__app"]
+        APP["Target app stack<br/>compose -p qa_run__app<br/>(gateway, frontend, db, ...)"]
         MP["minio-proxy"]
         PP["presign-proxy"]
     end
 
-    subgraph Orch["Orchestrator"]
-        IQ["init_qa node"]
-        QR["qa_report node"]
+    subgraph Orch["Orchestrator (sub-task nodes)"]
+        AQ["acquire_sandbox"]
+        CA["collect_artifacts"]
+        RS["release_sandbox"]
         AR["agent_runner.py"]
     end
 
     MIN["MinIO<br/>qa-artifacts"]
 
-    IQ -->|"docker network create"| QN
-    IQ -->|"sandbox_mgr.create + attach"| QS
-    IQ -->|"presign PUT URLs<br/>(internal endpoint)"| MIN
-    IQ -->|"write /workspace/.qa/job.json"| QS
+    AQ -->|"docker network create"| QN
+    AQ -->|"sandbox_mgr.create + attach"| QS
+    AQ -->|"presign PUT URLs"| MIN
+    AQ -->|"write /workspace/.qa/job.json"| QS
     AR -->|"docker exec runner"| QS
-    QS -->|"docker compose up<br/>-p qa_jobC"| APP
+    QS -->|"docker compose up"| APP
     QS -.->|"headless browser (backend MCP)<br/>http://frontend:3000"| APP
     QS -->|"PUT screenshots/result.json<br/>(presigned URL via DNS)"| MP
     QS -->|"refresh URLs"| PP
     PP -->|"POST /internal/qa/presign"| Orch
     MP -.-> MIN
-    QR -->|"cat result.json + validate"| QS
-    QR -->|"sandbox.destroy → network rm"| QN
+    CA -->|"cat result.json + validate"| QS
+    RS -->|"sandbox.destroy → network rm"| QN
 ```
 
-### Per-job lifecycle
+### Per-sub-task lifecycle
 
 | Step | Owner | Action |
 |------|-------|--------|
-| 1. network | `init_qa` | `docker network create qa-net-{job_id}` (DinD) |
-| 2. sandbox | `init_qa` | Create QA sandbox container, attach to qa-net + sandbox-restricted, write OAuth token |
-| 3. presign | `init_qa` | Generate two MinIO presigned PUT URLs (`result.json`, `logs/full.log`) signed against the **sandbox-facing** endpoint (`minio-proxy:9100`) so the URL host resolves over qa-net |
-| 4. job.json | `init_qa` | Write `/workspace/.qa/job.json` with the URLs, `presign_refresh_url`, `sandbox_token`, parsed `qa.yaml`, and acceptance criteria |
-| 5. clone | `init_qa` | `git clone --branch <branch>` from inside sandbox via git-proxy |
-| 6. agent | `qa` | `python -m embry0.sandbox.runner` invokes the QA agent — runs the 5 phases, uploads artifacts via curl |
-| 7. parse | `qa_report` | `cat /workspace/.qa/result.json` → `QAResult.model_validate_json` → set `qa.final_status` |
-| 8. teardown | `qa_report` | sandbox destroy → `cleanup_qa_resources` (containers/volumes/network by dual-label filter). Order matters — sandbox must die before `network rm` or it stays attached. |
+| 1. network | `acquire_sandbox` | `docker network create qa-net-<run_id>__<app>` (DinD-mode apps) |
+| 2. sandbox | `acquire_sandbox` | Create the QA sandbox container, attach to qa-net + sandbox-restricted |
+| 3. clone | `acquire_sandbox` | Clone the branch from inside the sandbox via git-proxy (skipped when a warm volume is mounted) |
+| 4. presign + job.json | `acquire_sandbox` | Register the sandbox token, mint presigned PUT URLs (`result.json`, `logs/full.log`) against the **sandbox-facing** endpoint (`minio-proxy:9100`), write `/workspace/.qa/job.json` |
+| 5. boot | `boot_app` | Start the app and wait for its ready checks |
+| 6. agent | `exploratory_qa` | `python -m embry0.sandbox.runner` invokes the QA agent, which uploads artifacts via curl |
+| 7. parse | `collect_artifacts` | `cat /workspace/.qa/result.json` → `QAResult` validation → `SubTaskStatus` |
+| 8. teardown | `release_sandbox` | sandbox destroy → token unregister → `cleanup_qa_resources`. Order matters — the sandbox must die before `network rm` or it stays attached. |
 
 ### Two MinIO clients
 
@@ -508,7 +569,7 @@ Phase 1.5 architecture decision: presigned URLs are signed against whichever end
 | Client | Endpoint | Used by |
 |--------|----------|---------|
 | `qa_minio` | `minio:9000` (host backend network) | Orchestrator-side reads (`/jobs/{id}/qa/attempts/{n}/result` GET) |
-| `qa_minio_sandbox` | `minio-proxy:9100` (DinD sandbox-restricted) | `init_qa_node` mints PUT URLs the sandbox will follow |
+| `qa_minio_sandbox` | `minio-proxy:9100` (DinD sandbox-restricted) | `acquire_sandbox_node` mints PUT URLs the sandbox will follow |
 
 `minio-proxy` and `presign-proxy` are containers running inside DinD on `sandbox-restricted` (paired with the `git-proxy` family). `minio-proxy` is a thin reverse proxy onto the host MinIO; `presign-proxy` forwards `POST /api/v1/internal/qa/presign` calls to the orchestrator so the agent can mint additional URLs at runtime (screenshots, traces).
 
@@ -530,7 +591,7 @@ class QAResult:
     anomalies: list[QAAnomaly]                           # console_error | network_error | unexpected_state | crash
 ```
 
-Validation failures land an `inconclusive` attempt with `result_json_invalid` in the exit reason; the runtime prompt sent to the agent includes the schema verbatim to keep field shapes correct.
+When the agent ran but `result.json` is missing, malformed or fails validation, `collect_artifacts` synthesizes an `inconclusive` result for every criterion (an `infra_failure` when the agent never ran); the runtime prompt sent to the agent includes the schema verbatim to keep field shapes correct.
 
 ### Triage QA decision (PR-gated mode)
 
@@ -613,30 +674,31 @@ The `SandboxImageManager` handles image lifecycle inside DinD:
 
 - **Auto-build on startup** — computes SHA256 hash of `Dockerfile.sandbox` + sandbox source files, compares with image label `embry0.build-hash`, rebuilds if stale
 - **Profile-specific images** — `embry0-sandbox:{profile_name}` extends the base image with additional packages/commands
-- **QA sandbox variant** — `embry0-sandbox-qa:latest` is a separate image (built from `infra/Dockerfile.sandbox.qa`) with the superset needed by the QA agent: JDK 21 (Adoptium Temurin), Docker CLI + compose plugin (talks to DinD daemon over TCP+TLS), Chromium + headless-shell pre-installed at `/opt/playwright`, the `playwright-mcp` global binary, the `vibium` CLI pinned at 26.8.21 with Chrome for Testing pre-baked at `/opt/vibium` (the second browser backend — agent-owned cache dir because the vibium daemon chmods its socket dir), and the qa-compose / qa-ready-check helpers in `/usr/local/bin`. Selected by sandbox profile `qa-jvm` (or `qa-node` / `qa-python`) — whose `dind_enabled` only asks for the shared Docker daemon: `SandboxManager` mounts the DinD client certs and sets `DOCKER_HOST` only when the repo also holds an admin's Docker access grant (`repos.docker_access`, #522), and refuses the sandbox otherwise, because code holding those certs controls the daemon that runs the credential proxies and every other sandbox — and by `qa-external` — the deployed-target variant that pairs the same browser image with `sandbox-internet` egress and `dind_enabled: false`, for driving an app that runs *outside* the sandbox. DinD NAT egress is by-IP only, so deployments clone `qa-external` and set the profile's `extra_hosts` (hostname → IP, emitted as `--add-host`) to reach Host-header-routed vhosts by name; the `dind` alias stays orchestrator-owned. The Chromium revision is pinned to whatever `@playwright/mcp`'s bundled `playwright-core` expects — installing via the standalone `playwright` package's CLI gives a different revision and breaks MCP launches.
-- **Container reaper** — background task destroys containers older than 24 hours, **unless the matching job is still active in the DB**. Active-status lookup failures fail closed (the reaper does nothing rather than risk killing live work). The reaper also sweeps DinD-side QA orphans — containers with `com.docker.compose.project=qa_*` OR `embry0.qa_job_id=*` whose owning job is no longer active.
-- **Start-up sweep** — on start, after orphan recovery has failed the jobs the restart killed, the orchestrator destroys the `sandbox-*` containers the previous process left behind, **except those of jobs still active in the DB** (the reaper's set: pending, running, awaiting input, paused). A paused or awaiting-input job's checkpoint names its container and the resume reuses it (#484). Without the active set it destroys nothing; the reaper removes true orphans later.
+- **QA sandbox variant** — `embry0-sandbox-qa:latest` is a separate image (built from `infra/Dockerfile.sandbox.qa`) with the superset needed by the QA agent: JDK 21 (Adoptium Temurin), Docker CLI + compose plugin (talks to DinD daemon over TCP+TLS), Chromium + headless-shell pre-installed at `/opt/playwright`, the `playwright-mcp` global binary, the `vibium` CLI pinned at 26.8.21 with Chrome for Testing pre-baked at `/opt/vibium` (the second browser backend — agent-owned cache dir because the vibium daemon chmods its socket dir), and the qa-compose / qa-ready-check helpers in `/usr/local/bin`. Selected by sandbox profile `qa-jvm` — whose `dind_enabled` only asks for the shared Docker daemon: `SandboxManager` mounts the DinD client certs and sets `DOCKER_HOST` only when the repo also holds an admin's Docker access grant (`repos.docker_access`, #522), and refuses the sandbox otherwise, because code holding those certs controls the daemon that runs the credential proxies and every other sandbox — and by `qa-external` — the deployed-target variant that pairs the same browser image with `sandbox-internet` egress and `dind_enabled: false`, for driving an app that runs *outside* the sandbox. DinD NAT egress is by-IP only, so deployments clone `qa-external` and set the profile's `extra_hosts` (hostname → IP, emitted as `--add-host`) to reach Host-header-routed vhosts by name; the `dind` alias stays orchestrator-owned. The Chromium revision is pinned to whatever `@playwright/mcp`'s bundled `playwright-core` expects — installing via the standalone `playwright` package's CLI gives a different revision and breaks MCP launches.
+- **Which containers are sandboxes** — both the reaper and the start-up sweep select the `embry0.role=sandbox` label (#620), so a container on the daemon that embry0 did not create is never touched, whatever its name. A sandbox created before the label existed (#616) has none; it is still found when its name starts with `sandbox-` and it was created before 2026-10-10 (`embry0/execution/sandbox_listing.py`).
+- **Container reaper** — background task destroys sandbox containers older than 24 hours, **unless the matching job is still active in the DB**. Active-status lookup failures fail closed (the reaper does nothing rather than risk killing live work). The reaper also sweeps DinD-side QA orphans — containers with `com.docker.compose.project=qa_*` OR `embry0.qa_job_id=*` whose owning job is no longer active.
+- **Start-up sweep** — on start, after boot recovery has failed the jobs it could not take back (and left the ones it resumes `running`, #307), the orchestrator destroys the sandbox containers the previous process left behind, **except those of jobs still active in the DB** (the reaper's set: pending, running, awaiting input, paused). A paused or awaiting-input job's checkpoint names its container and the resume reuses it (#484). Without the active set it destroys nothing; the reaper removes true orphans later.
 
 ---
 
 ## Proxy Services
 
-Six credential-injecting proxies (`git-proxy`, `github-proxy`, `gitlab-proxy`, `auth-proxy`, `xai-proxy`, `context-proxy`) run as **containers inside DinD** on the `sandbox-restricted` network, alongside the two network-plumbing proxies (`minio-proxy`, `presign-proxy`). They are launched by `ProxyManager` at orchestrator startup using the `embry0-proxy:latest` image. Sandboxes resolve them by Docker DNS (`http://git-proxy:9101`, etc.) — not via `host.docker.internal`. The `auth-proxy` only launches in API-key mode (`AUTH_PROXY_ENABLED`, off by default — the SDK normally reads the Claude OAuth token from env); the `xai-proxy` injects the rotating SuperGrok bearer for grok jobs (EMB-45); the `context-proxy` gives watcher analysis agents a mediated, quota'd read-only log-query path (RAV-1140, per-job opt-in enrollment). Since SH-P4.4 a developer job whose ticket or linked healing case carries log evidence can be enrolled too, but **scoped**: `allowed_containers` on the enroll body narrows the sandbox to the allowlisted services the evidence names (never wider than the allowlist; an empty scope refuses the enrollment; a proxy that does not echo the scope is treated as a stale image and the sandbox is unenrolled), and results for a scoped sandbox are capped per line and redacted before they are returned. The developer grant is **off by default** (`DEVELOPER_LOG_TOOL_ENABLED`, an operator opt-in — it lets a code-writing agent read production logs unattended) and the watcher's grant is independent of it. Even when enabled it needs evidence that both names an allowlisted service AND describes a failure (a signature or sample lines): a case's `deploy_services` alone records which services a deploy touched and is not grounds for log access. A job that resolves no scope logs `developer_log_scope_empty` so an operator can tell "no evidence" from "evidence names a service that has since been renamed". The evidence in the developer and reviewer prompts does not depend on the flag.
+Six credential-injecting proxies (`git-proxy`, `github-proxy`, `gitlab-proxy`, `auth-proxy`, `xai-proxy`, `context-proxy`) run as **containers inside DinD** on the `sandbox-restricted` network, alongside the two network-plumbing proxies (`minio-proxy`, `presign-proxy`). They are launched by `ProxyManager` at orchestrator startup using the `embry0-proxy:latest` image. Sandboxes resolve them by Docker DNS (`http://git-proxy:9101`, etc.) — not via `host.docker.internal`. The `auth-proxy` only launches in API-key mode (`AUTH_PROXY_ENABLED`, off by default — the SDK normally reads the Claude OAuth token from env); the `xai-proxy` injects the rotating SuperGrok bearer for grok jobs (EMB-45); the `context-proxy` gives watcher analysis agents a mediated, quota'd read-only log-query path (RAV-1140, per-job opt-in enrollment). Since SH-P4.4 a developer job whose ticket or linked healing case carries log evidence can be enrolled too, but **scoped**: `allowed_containers` on the enroll body narrows the sandbox to the allowlisted services the evidence names (never wider than the allowlist; an empty scope refuses the enrollment; a proxy that does not echo the scope is treated as a stale image and the sandbox is unenrolled), and results are capped per line and redacted before they are returned — for every enrollment, scoped or not, the watcher's included (#294; `embry0/safety/redaction.py`, with the operator's `LOG_REDACTION_FIELDS`). The developer grant is **off by default** (`DEVELOPER_LOG_TOOL_ENABLED`, an operator opt-in — it lets a code-writing agent read production logs unattended) and the watcher's grant is independent of it. Even when enabled it needs evidence that both names an allowlisted service AND describes a failure (a signature or sample lines): a case's `deploy_services` alone records which services a deploy touched and is not grounds for log access. A job that resolves no scope logs `developer_log_scope_empty` so an operator can tell "no evidence" from "evidence names a service that has since been renamed". The evidence in the developer and reviewer prompts does not depend on the flag.
 
 Proxies that need outbound internet are also attached to `sandbox-internet`. Since #521 that includes `git-proxy`, which forwards git's smart HTTP to the forge itself.
 
 An additional proxy — the **per-job embry0 API proxy** that exposes CreateIssue / RequestInput / UpdateStatus to agents — is **currently deferred**. `start_embry0_proxy_for_job()` raises `NotImplementedError`, and `WorkflowRegistry.register()` rejects any `pipeline_template` that declares `CreateIssue`, `RequestInput`, or `UpdateStatus` tools at registration time. Until this is implemented, those tools are unavailable to all workflows. Tracked as a follow-up.
 
-**Credential injection via proxies** — git reaches the job's repository only through `git-proxy` (port 9101), which is the sandbox's git remote for it (#521, [ADR 0007](adr/0007-git-proxy-forwards-smart-http.md)). The sandbox's git config rewrites `<forge>/<repo>.git` to `http://git-proxy:9101/git/<repo>.git` and sends the per-sandbox bearer to the proxy in an `http.extraHeader`; `origin` keeps its forge URL. The proxy streams `info/refs`, `git-upload-pack` and `git-receive-pack` to the forge with the forge token in `Authorization` (Basic, as the enrolled username), so the token never enters the sandbox. Its enrollment grant is `allowed_repos` (the job's repository), `git_upstream` (the forge base URL the sandbox clones from) and `git_push`, which only the issue-to-pr sandbox gets, because its developer pushes a branch; QA, onboarding, the volume warmer and the QA image builder only read. Everything else (another repository, receive-pack without `git_push`, LFS, dumb HTTP, a dot segment or any percent-encoding in the path) is a 403 whose text git prints as `remote: ...`, with a `git_proxy_policy_denied` warning. Another repository's URL is not rewritten at all, so it reaches its forge without a credential. The credential goes only to the host it was enrolled for (`git_proxy_credential_host_mismatch` otherwise), and forge redirects are not followed (`git_proxy_upstream_redirect`). `/git-credentials`, which used to answer the sandbox's credential helper with the token, answers 410 and logs `git_proxy_credentials_refused`. An enrollment without `allowed_repos` (an older orchestrator) is refused every git request, and a git-proxy that does not echo the grant (an older image, which would hand out the token) is unenrolled by `ProxyManager`, which then fails the sandbox's creation (`git_proxy_grant_unconfirmed`). One proxy serves both forges — a job is tied to one repo, so the sandbox's forge is known at enrollment (#166): each sandbox is enrolled with the token the [credential registry](credentials.md) resolves for its repo (repo > owner > host > global > env, where env is the old `GITHUB_TOKEN__<OWNER>` / `GITHUB_TOKEN` and `GITLAB_TOKEN__<GROUP>` / `GITLAB_TOKEN` routing), and the forge payload goes to git-proxy and that forge's API proxy only. No forge token is ever present in the sandbox env. GitLab REST v4 API calls from the sandbox go through the dedicated `gitlab-proxy` (port 9105), which sends PATs as `PRIVATE-TOKEN` and OAuth2 tokens as `Authorization: Bearer` (a PAT presented as Bearer is rejected outright). At startup `git-proxy` launches when any forge credential exists, `github-proxy` when a GitHub one does and `gitlab-proxy` when a GitLab one does — in the registry or the environment; a proxy launched for a registry-only forge has no baked token and serves every request from the enrolled payload. **The forge API proxies are scoped per enrollment (#520):** the enroll body carries `allowed_repos`, the job's repository for the proxy of its forge and `[]` for the other one (and for both when a job has no repository). The proxy forwards only `GET`/`HEAD` on an allowlist of that repository's resources (issues, pull or merge requests with their comments, reviews and files, commits with their checks and statuses, contents, branches, compare, pipelines, labels; the table is in `embry0/execution/proxy/forge_scope.py`). It checks the raw path segment by segment, refuses dot segments, empty segments, backslashes, double encoding and misplaced encoded slashes, and forwards the path it rebuilt from the checked segments. Everything else is a 403 `policy_denied` with a `reason` (`repo_out_of_scope`, `path_not_allowed`, `method_not_allowed`, `malformed_path`, `project_id_not_a_path`, `unscoped_enrollment`) and a `<proxy>_policy_denied` warning. An enrollment without `allowed_repos` is refused everything. The proxy echoes the scope it stored; a proxy that does not (an image older than scoping) is unenrolled again by `ProxyManager` and logs `forge_api_proxy_scope_unconfirmed`. No sandbox-side code calls these proxies today: pull requests, comments and QA reports go through the orchestrator's own forge clients, so the allowlist is read-only by design and a write needs a deliberate rule together with its caller. The auth proxy (port 9100) for Anthropic API keys launches only with `AUTH_PROXY_ENABLED`, and no sandbox consumes it. **The LLM credential is not proxied:** `SandboxManager._inject_llm_env` puts `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`, and `XAI_API_KEY`, into the sandbox env, because the Claude CLI reads its credential from its environment and subscription OAuth stays supported ([ADR 0008](adr/0008-llm-credential-in-sandbox-env.md)). Any code in the sandbox can read it. Only the xAI subscription token is held by a proxy (`xai-proxy`).
+**Credential injection via proxies** — git reaches the job's repository only through `git-proxy` (port 9101), which is the sandbox's git remote for it (#521, [ADR 0007](adr/0007-git-proxy-forwards-smart-http.md)). The sandbox's git config rewrites `<forge>/<repo>.git` to `http://git-proxy:9101/git/<repo>.git` and sends the per-sandbox bearer to the proxy in an `http.extraHeader`; `origin` keeps its forge URL. The proxy streams `info/refs`, `git-upload-pack` and `git-receive-pack` to the forge with the forge token in `Authorization` (Basic, as the enrolled username), so the token never enters the sandbox. Its enrollment grant is `allowed_repos` (the job's repository), `git_upstream` (the forge base URL the sandbox clones from) and `git_push`, which only the issue-to-pr sandbox gets, because its developer pushes a branch; QA, onboarding, the volume warmer and the QA image builder only read. With `git_push` comes `git_push_branches` (#559, [ADR 0009](adr/0009-git-proxy-scopes-push-to-the-jobs-branch.md)): the proxy reads each receive-pack command list before the pack (`embry0/execution/proxy/receive_pack.py`) and refuses the whole push, with a per-ref `ng` report git prints and a `git_proxy_push_refused` warning naming the job, when an update names a ref outside those branches or deletes one. `init_node` enrolls `job_push_branch` (the branch state records, else a follow-up's `context.ref`, else the job's own `<shared>-<job id>` name, never the issue's shared name another job may hold); when the developer finds the shared name free and chooses it, `ProxyManager.set_git_push_branches` swaps it in through `PUT /admin/git-push-branches/{sandbox_id}`, and a resume re-derives the branch from the checkpoint. An enrollment with `git_push` but no branches (an older orchestrator) is refused every push, and a git-proxy that does not echo the branches (an older image) fails the sandbox's creation like a missing grant. Everything else (another repository, receive-pack without `git_push`, LFS, dumb HTTP, a dot segment or any percent-encoding in the path) is a 403 whose text git prints as `remote: ...`, with a `git_proxy_policy_denied` warning. Another repository's URL is not rewritten at all, so it reaches its forge without a credential. The credential goes only to the host it was enrolled for (`git_proxy_credential_host_mismatch` otherwise), and forge redirects are not followed (`git_proxy_upstream_redirect`). `/git-credentials`, which used to answer the sandbox's credential helper with the token, answers 410 and logs `git_proxy_credentials_refused`. An enrollment without `allowed_repos` (an older orchestrator) is refused every git request, and a git-proxy that does not echo the grant (an older image, which would hand out the token) is unenrolled by `ProxyManager`, which then fails the sandbox's creation (`git_proxy_grant_unconfirmed`). One proxy serves both forges — a job is tied to one repo, so the sandbox's forge is known at enrollment (#166): each sandbox is enrolled with the token the [credential registry](credentials.md) resolves for its repo (repo > owner > host > global > env, where env is the old `GITHUB_TOKEN__<OWNER>` / `GITHUB_TOKEN` and `GITLAB_TOKEN__<GROUP>` / `GITLAB_TOKEN` routing), and the forge payload goes to git-proxy and that forge's API proxy only. No forge token is ever present in the sandbox env. GitLab REST v4 API calls from the sandbox go through the dedicated `gitlab-proxy` (port 9105), which sends PATs as `PRIVATE-TOKEN` and OAuth2 tokens as `Authorization: Bearer` (a PAT presented as Bearer is rejected outright). At startup `git-proxy` launches when any forge credential exists, `github-proxy` when a GitHub one does and `gitlab-proxy` when a GitLab one does — in the registry or the environment; a proxy launched for a registry-only forge has no baked token and serves every request from the enrolled payload. **The forge API proxies are scoped per enrollment (#520):** the enroll body carries `allowed_repos`, the job's repository for the proxy of its forge and `[]` for the other one (and for both when a job has no repository). The proxy forwards only `GET`/`HEAD` on an allowlist of that repository's resources (issues, pull or merge requests with their comments, reviews and files, commits with their checks and statuses, contents, branches, compare, pipelines, labels; the table is in `embry0/execution/proxy/forge_scope.py`). It checks the raw path segment by segment, refuses dot segments, empty segments, backslashes, double encoding and misplaced encoded slashes, and forwards the path it rebuilt from the checked segments. Everything else is a 403 `policy_denied` with a `reason` (`repo_out_of_scope`, `path_not_allowed`, `method_not_allowed`, `malformed_path`, `project_id_not_a_path`, `unscoped_enrollment`) and a `<proxy>_policy_denied` warning. An enrollment without `allowed_repos` is refused everything. The proxy echoes the scope it stored; a proxy that does not (an image older than scoping) is unenrolled again by `ProxyManager` and logs `forge_api_proxy_scope_unconfirmed`. No sandbox-side code calls these proxies today: pull requests, comments and QA reports go through the orchestrator's own forge clients, so the allowlist is read-only by design and a write needs a deliberate rule together with its caller. The auth proxy (port 9100) for Anthropic API keys launches only with `AUTH_PROXY_ENABLED`, and no sandbox consumes it. **The LLM credential is not proxied:** `SandboxManager._inject_llm_env` puts `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`, and `XAI_API_KEY`, into the sandbox env, because the Claude CLI reads its credential from its environment and subscription OAuth stays supported ([ADR 0008](adr/0008-llm-credential-in-sandbox-env.md)). Any code in the sandbox can read it. Only the xAI subscription token is held by a proxy (`xai-proxy`).
 
 | Proxy | Port | Purpose | Credential Injected |
 |-------|------|---------|-------------------|
 | auth-proxy | 9100 | Claude API requests (optional API-key mode) | `x-api-key` header |
-| git-proxy | 9101 | git smart HTTP (clone, fetch, push) for the job's repository only; push only with `git_push` | `Authorization: Basic` on the upstream request (per-owner PAT routing) |
+| git-proxy | 9101 | git smart HTTP (clone, fetch, push) for the job's repository only; push only with `git_push`, to `git_push_branches` only | `Authorization: Basic` on the upstream request (per-owner PAT routing) |
 | github-proxy | 9103 | GitHub REST API — read calls on the job's repository only (per-enrollment scope), strict forward-header allowlist | `Authorization: Bearer` header |
 | gitlab-proxy | 9105 | GitLab REST v4 API — read calls on the job's project only (per-enrollment scope), strict forward-header allowlist (#166) | `PRIVATE-TOKEN` (PAT) or `Authorization: Bearer` (OAuth2) |
 | xai-proxy | 9106 | grok models on `api.x.ai` (EMB-45) | Rotating SuperGrok access token (pushed via `/admin/token`) |
-| context-proxy | 9107 | Watcher and developer log drill-down → orchestrator `GET /api/v1/logs/query` (allowlist + per-sandbox scope + clamps + per-job quota; scoped results redacted) | Orchestrator API key (service-scoped) |
+| context-proxy | 9107 | Watcher and developer log drill-down → orchestrator `GET /api/v1/logs/query` (allowlist + per-sandbox scope + clamps + per-job quota; every result redacted, #294) | Orchestrator API key (service-scoped) |
 | embry0 API Proxy | 9102 (deferred) | embry0 internal API (per-job) | Scoped to current issue/job |
 | minio-proxy | 9100 (DinD-side) | QA agent → MinIO PUT/GET via DNS-resolvable name | None — only forwards to host MinIO |
 | presign-proxy | 9104 (DinD-side) | QA agent → orchestrator `POST /api/v1/internal/qa/presign` to mint additional URLs at runtime | Per-sandbox bearer (same scheme as the credential proxies) |
@@ -658,6 +720,15 @@ An additional proxy — the **per-job embry0 API proxy** that exposes CreateIssu
 > clears it when the enrollment is revoked, expires, or is replaced by a new
 > enrollment of the same sandbox id or bearer, so it is bounded by the same cap
 > (#536).
+>
+> **A proxy found stopped is recreated** (#626). Nothing restarts a proxy
+> container that exits (a crash, an OOM kill), so every admin request to it
+> failed until the next orchestrator start. When `docker exec` reports the
+> proxy not running or missing, `ProxyManager` recreates it as startup launched
+> it, replays the enrollments (each with the expiry it had) and xAI tokens it
+> held, refreshes the rules that name proxy addresses
+> (`SandboxManager.refresh_proxy_policy`), and sends the request again. Logged
+> as `proxy_not_running_recreating` and `proxy_recreated`.
 >
 > **A resumed sandbox is enrolled again** (#476). The proxies keep enrollments
 > in memory, so a paused job loses its bearer after the TTL and whenever the
@@ -758,6 +829,9 @@ graph TB
 - `POST /api/v1/jobs` — accepts `agent_models` (per-agent model override), `job_kind`, and an optional `context` object for repo-less jobs.
 - `GET /api/v1/jobs/{id}` — response includes `cost_breakdown` (per-agent aggregated cost/duration/tools) and `current_stage`.
 - `POST /api/v1/jobs/{id}/events-token` — mints the short-lived job-scoped WS token (RAV-1070); the raw API key never rides the WS handshake.
+- `POST /api/v1/jobs/{id}/qa/log-stream-token` — mints the short-lived job-scoped token the dashboard's live QA log tail (an EventSource, which cannot send a header) passes as `?token=` to `GET /api/v1/jobs/{id}/artifacts/logs/{service}?follow=true` (#634).
+- `GET /api/v1/jobs/{id}/logs/events` — one page of the persisted pipeline events, oldest first, each with its `event_seq`; `?since_seq=` and `?limit=` (default 500, at most 1000) page it, and the response's `next_since_seq` and `has_more` say where to continue (#203).
+- `GET /api/v1/qa/runs/{job_id}` — a QA run is addressed by the id of the job that ran it (there is no `?job_id=` filter on `/qa/runs`); `GET /api/v1/qa/runs/{job_id}/apps/{app}` returns one app's result, and `GET /api/v1/qa/repos/{owner}/{repo}/runs` lists a repository's runs, newest first.
 - `GET/PUT/DELETE /api/v1/repos/{owner}/{repo}/preferences` (Plan K) — per-repo preferences override triage (see Triage Decision note below).
 - `CRUD /api/v1/environments` (Plan J) — global + per-repo environment variables with Fernet-encrypted secrets (see Environment Variable Storage below).
 - Auth model: master `API_KEY` or scoped `emb_` keys (Bearer), Auth0 SSO session cookies on the public origin, per-principal rate limiting; see [sso.md](sso.md) and the audit/API-key routers.
@@ -873,7 +947,6 @@ erDiagram
         string name
         string description
         json graph_definition
-        json agent_models
         string sandbox_profile
         timestamp created_at
         timestamp updated_at
@@ -1237,7 +1310,14 @@ Note: LangGraph's checkpoint tables (`checkpoints`, `checkpoint_blobs`, `checkpo
 
 The `IssueExecutor` (`embry0/services/issue_executor.py`) owns the lifecycle of every background coroutine spawned to run a workflow.
 
-**Task lifecycle.** `IssueExecutor._track_task(coro, *, kind, job_id, issue_id)` is the single entry point for creating background coroutines. It registers the task in both `_background_tasks` (set) and `_tasks_by_job` (dict) and attaches a done-callback that logs non-`CancelledError` failures and publishes a `job_failed` WS event. `IssueExecutor.cancel_job(job_id)` is the centralised cancellation flow: cancel the live task (with a 5s grace), destroy the sandbox, update job+issue status, purge LangGraph checkpoints for the thread, and emit a `job.cancelled` audit event.
+**Task lifecycle.** `IssueExecutor._track_task(coro, *, kind, job_id, issue_id)` is the single entry point for creating background coroutines. It registers the task in both `_background_tasks` (set) and `_tasks_by_job` (dict) and attaches a done-callback that logs non-`CancelledError` failures and publishes a `job_failed` WS event. `IssueExecutor.cancel_job(job_id)` is the centralised cancellation flow: cancel the live task (with a 5s grace), destroy the sandbox, release the job's QA resources (fan-out sub-task sandboxes, `qa-net-*` networks, agent-started containers — `cleanup_cancelled_qa_job`) and its per-job volumes along with their `qa_volume_state` rows, update job+issue status, purge LangGraph checkpoints for the thread, and emit a `job.cancelled` audit event.
+
+**Restarts: drain and recovery (#307).** Sandboxes outlive the orchestrator (they run on the agent runtime) and LangGraph checkpoints every node, so a restart stops jobs rather than losing them.
+
+- *Drain.* The lifespan's shutdown first calls `IssueExecutor.drain(SHUTDOWN_DRAIN_SECONDS)`, before any background task is cancelled. From then on `_run_in_slot` starts nothing: a job dispatched during the drain, or one waiting for a run slot (cancelled at once), stays `pending`; `schedule_resume` raises `ExecutorDraining`. A running issue-to-PR job stops at its next node boundary: `_process_stream` raises `ShutdownInterrupt` (a `BaseException`, so no failure path sees it) once a node's update has streamed, and closes the stream so the next node is cancelled and the pending checkpoint writes are flushed. QA and onboard jobs are let run to the deadline. Jobs still running then are cancelled. Each job stopped or held back gets `jobs.interrupted_at`, and `SandboxManager.stop_agent` kills the runner it left in its sandbox: killing the `docker exec` client does not.
+- *Launch records.* Every dispatch entry point (`execute`, `submit_job`, `start_job`, `start_onboard_job`) passes `_track_task` a `launch` dict — the runner kind and its arguments — which `_run_in_slot` stores in `jobs.launch` before the job waits for anything. `relaunch(job)` starts the job again from it.
+- *Recovery.* At boot, `orchestration/restart.py`'s `take_back_jobs` reads every `running`/`pending` row and `plan_recovery` decides: a `running` job with a checkpoint, on a resumable pipeline (not `qa`/`onboard`), is resumed; a `pending` job, or a `running` one whose graph never began, with a launch record, is launched again; anything else is left to `fail_orphaned`, which now stamps `finished_at` and words a drained job as `ERR_INTERRUPTED_BY_SHUTDOWN`. Recovered jobs are started at the end of startup, once the executor and the proxies exist: `resume_after_restart` runs `resume(..., after_restart=True)`, which streams `None` (go on from the checkpoint) after `_reclaim_sandbox_after_restart` kills the stale agent and re-enrolls the sandbox (or, with no sandbox in the checkpoint, removes a half-made `sandbox-<job_id>` so `init` creates it again). LangGraph re-runs only the node that had not finished.
+- *Bound.* A recovery after an unclean stop (no `interrupted_at`) spends one `jobs.resume_attempts`; at `MAX_RESUME_ATTEMPTS` boot fails the job with `ERR_RESUME_LIMIT`. Recovery clears `interrupted_at`, so each stop is judged on its own. Migration 92 adds the three columns.
 
 **Trace ID threading (Plan H).** Every job is assigned a `trace_id` (format `trc-<12hex>`) at creation; the id is bound to structlog contextvars for the duration of `_run_workflow` and persisted onto every `audit_log` row written in that span. Use it as a grep key to reconstruct an issue's full timeline across logs and audit events.
 
@@ -1254,8 +1334,10 @@ Failures populate the `jobs.error_code` column (migration 8) with one of the can
 | `ERR_BUDGET_OVERRUN` | The job ran and its per-job cap stopped it in-run (`overrun_mode=hard`). It spent money, so it counts toward its actor's rate limit and toward dispatch-attempt caps. Rows written before #331 also carry this code for gate refusals; readers tell those apart by evidence (no `traces` row and `budget_overrun_usd = 0`). |
 | `ERR_BUDGET_REFUSED` | The dispatch gate refused the job before any agent ran — a daily/monthly cap or the per-actor rate limit (#331). The only outcome exempt from rate-limit and attempt counts; the one definition is `gate_refusal_sql` (`embry0/storage/repositories/gate_refusal.py`). |
 | `ERR_MAX_RETRIES` | Reviewer rejected past `max_feedback_loops`. |
-| `ERR_TRIAGE_MALFORMED` | Triage LLM output failed schema validation. |
-| `ERR_ORPHANED` | Orchestrator restarted with the job in-flight. |
+| `ERR_TRIAGE_MALFORMED` | Triage LLM output failed to parse or failed schema validation twice: the answer and the one repair retry that fed the error back (#455). Also used when the triage agent run itself errored. |
+| `ERR_ORPHANED` | Orchestrator restarted with the job in-flight, and boot could not resume it. |
+| `ERR_INTERRUPTED_BY_SHUTDOWN` | An orchestrator shutdown drained the job (`jobs.interrupted_at`) and boot could not resume it: a QA or onboard job that had begun its graph, or one without a checkpoint or launch record (#307). |
+| `ERR_RESUME_LIMIT` | Boot already recovered the job `MAX_RESUME_ATTEMPTS` times after unclean stops; it may be what stops the orchestrator, so it is not resumed again (#307). |
 | `ERR_WORKFLOW_UNKNOWN` | Referenced workflow is not registered. |
 | `ERR_SANDBOX_INIT` | Sandbox container creation failed. |
 | `ERR_DOCKER_TIMEOUT` | An underlying Docker command timed out. |
@@ -1271,7 +1353,9 @@ Failures populate the `jobs.error_code` column (migration 8) with one of the can
 | `ERR_AGENT_MAX_TURNS` | An agent hit its `max_turns` cap without finishing (and the decide-now recovery, where one exists, did not rescue it). |
 | `ERR_AGENT_PROCESS_FAILED` | The agent CLI subprocess exited non-zero ("Command failed with exit code N"). The cause is in the run's stored stderr tail — see below. |
 | `ERR_AGENT_IDLE` | The runner's idle watchdog killed an agent that produced no events. |
-| `ERR_AGENT_NO_RESULT` | The runner exited without a final result. |
+| `ERR_AGENT_NO_RESULT` | The runner exited without a final result after the agent had started (it wrote at least one line to stdout, or exited 0). |
+| `ERR_PR_LISTING_FAILED` | The forge could not list the repository's open pull requests before the job started, so the duplicate-PR check could not run. The job fails closed rather than risk a second PR for the same ticket (#305). |
+| `ERR_SANDBOX_AGENT_START_FAILED` | The sandbox could not start the agent: the runner exited non-zero before writing a single stdout line, with a Python traceback or import failure on stderr — typically a sandbox image whose baked modules are missing or out of step with each other (rebuild it). The redacted stderr tail is stored on the run's trace row (#354). |
 | `ERR_AGENT_OUTPUT_OVERFLOW` | One agent stdout line exceeded the stream reader's limit (`LimitOverrunError`; #266 raised the limit to 16 MiB). |
 | `ERR_SANDBOX_ARGV_TOO_LONG` | An exec failed with `E2BIG` — a payload rode argv (#304 moved the agent config to stdin). |
 | `ERR_STATE_CONCURRENT_UPDATE` | LangGraph `InvalidUpdateError`: two nodes wrote one un-annotated state key in a superstep. The structural channel test should make this impossible. |
@@ -1337,21 +1421,20 @@ fall back to the environment variable below when no row has been saved:
 | Rate limit | `RATE_LIMIT_PER_AUTHOR_PER_HOUR` | 5 | Layer 3 — at dispatch, per actor |
 
 **Layer 1 — per-job cap (`embry0/orchestration/budget.py`).** `run_agent_node`
-is the single point where a job's cost accrues, so the cap is evaluated there
-after every agent turn.
+is where every agent turn ends, so the cap is evaluated there after each turn
+(`evaluate_job_cap`). The spend it compares is the sum of the job's trace rows
+(`resolve_job_total_cost`), with the parent state's `total_cost_usd` as a floor.
 
-**What layer 1 covers:** the issue→PR agent turns — triage, developer,
-reviewer and the rest of the parent graph — because each one accumulates into
-the parent state's `total_cost_usd`.
-
-**What it does not cover: the QA fan-out.** `qa_node` calls `run_agent_node`
-and merges only `agent_outputs` back into state, discarding the turn's
-`total_cost_usd` (`embry0/workflows/qa/nodes.py:628`; `embry0/services/_cost.py`
-says the same in its module docstring). QA spend therefore never moves the
-parent total and is never stopped by this cap, in either overrun mode — see
-#264. Layers 2 and 3 are
-unaffected: they roll up from trace rows, which QA does write under the parent
-`job_id`, so the fleet caps and the job's *reported* cost stay correct.
+**What layer 1 covers:** every agent turn of the job, the QA fan-out included.
+QA sub-task agents run in sub-graphs whose cost never reaches the parent
+state, but each of their turns writes a trace under the parent `job_id`, so
+the trace sum counts them (#264). The QA agent's turn is held to the parent
+job's cap and overrun mode, which the orchestrator hands each sub-task; a hard
+crossing inside a sub-task ends that sub-task, and no further sub-task starts.
+After the fan-out, `qa_orchestrator_node` evaluates the cap once more: a soft
+crossing is recorded on `budget_overrun_usd`, a hard one fails the job with
+`ERR_BUDGET_OVERRUN`. A turn already in progress is never interrupted, here or
+anywhere else. Layers 2 and 3 roll up from the same trace rows.
 
 The cap in force is triage's
 `pipeline_config.budget_usd` (or a `POST /jobs` `max_budget_usd` override),
@@ -1368,11 +1451,10 @@ fleet cap is never outvoted by an LLM's pick. On a crossing:
 **An issue→PR-path job can pin itself to `hard`.** `budget_overrun_mode:
 "hard"` on the job row's `pipeline_config` wins over a `soft` fleet mode; any
 other value is ignored, so a job can tighten the policy but never loosen it
-(`effective_overrun_mode`). The pin acts only where this check runs — the
-parent graph started by `_run_workflow`. It has no effect on QA jobs, onboard
-jobs or QA fan-out children: those paths either never surface the key or never
-bring their cost to this check (`embry0/services/_cost.py`;
-#264).
+(`effective_overrun_mode`). The pin is read from the graph started by
+`_run_workflow`, and its QA fan-out inherits it with the cap (#264).
+Standalone QA jobs and onboard jobs never surface the key, so it has no
+effect on them.
 
 Watcher analysis jobs pin themselves on every tick
 (`embry0/services/watcher_budget.py`, #275): they run unattended, so their cap

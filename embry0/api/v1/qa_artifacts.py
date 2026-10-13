@@ -1,4 +1,4 @@
-"""QA artifact serving — presigned GET redirects + SSE log streams.
+"""QA artifact serving — dashboard byte passthrough, presigned GET redirects, SSE log streams.
 
 Path layout (bucket: qa-artifacts):
     <job_id>/<attempt_n>/result.json
@@ -20,12 +20,30 @@ from collections.abc import AsyncGenerator
 from typing import Any, cast
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
 
-from embry0.api.deps import get_qa_minio, get_runtime
+from embry0.api.deps import authenticate_stream, get_qa_minio, get_runtime
+from embry0.api.scoped_tokens import mint_scoped_token, signing_material
 
 router = APIRouter()
+
+
+async def _auth_header_or_log_token(
+    request: Request,
+    job_id: str,
+    token: str | None = Query(default=None, description="Job-scoped token from POST .../qa/log-stream-token"),
+) -> None:
+    # #634: the dashboard tails this route with an EventSource, which cannot
+    # send an Authorization header — so it presents a job-scoped token.
+    await authenticate_stream(request, f"qa-log:{job_id}", token)
+
+
+# The log route carries its own auth (header, session or job-scoped token)
+# instead of the header-only dependency the app puts on ``router``. The app
+# must include it BEFORE ``router``: the ``{path:path}`` catch-all in
+# ``get_artifact`` would otherwise swallow ``/logs/<service>``.
+log_stream_router = APIRouter(dependencies=[Depends(_auth_header_or_log_token)])
 
 _SAFE_ARTIFACT_PATH = re.compile(r"^[A-Za-z0-9._:\-]+(/[A-Za-z0-9._:\-]+)*$")
 _SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9_\-]+$")
@@ -127,9 +145,21 @@ async def get_latest_screenshot(
     job_id: str,
     qa_minio: Any = Depends(get_qa_minio),
 ) -> RedirectResponse:
+    """302 to a presigned GET of the newest screenshot.
+
+    The presigned URL names the storage endpoint the orchestrator reaches,
+    which a browser usually cannot (#541): the dashboard reads the bytes
+    from ``get_latest_screenshot_bytes`` instead.
+    """
     # Validate input BEFORE any storage work.
     _check_safe_job_id(job_id)
+    latest_key = await _latest_screenshot_key(qa_minio, job_id)
+    url = await qa_minio.presign_get("qa-artifacts", latest_key, expires_seconds=300)
+    return RedirectResponse(url=url, status_code=302)
 
+
+async def _latest_screenshot_key(qa_minio: Any, job_id: str) -> str:
+    """Key of the newest screenshot of any attempt of ``job_id``; 404 when none."""
     # Find every .png under any attempt's screenshots/ for this job. The prefix
     # is `{job_id}/` (not scoped to a single attempt) so a job that has rolled
     # over to a new attempt while the dashboard is polling still surfaces the
@@ -170,9 +200,7 @@ async def get_latest_screenshot(
     if not keyed:
         raise HTTPException(status_code=404, detail="no screenshots yet")
     keyed.sort(key=lambda pair: pair[1], reverse=True)
-    latest_key = keyed[0][0]["key"]
-    url = await qa_minio.presign_get("qa-artifacts", latest_key, expires_seconds=300)
-    return RedirectResponse(url=url, status_code=302)
+    return str(keyed[0][0]["key"])
 
 
 async def _redirect_to_artifact(qa_minio: Any, job_id: str, path: str) -> RedirectResponse:
@@ -195,11 +223,12 @@ async def _redirect_to_artifact(qa_minio: Any, job_id: str, path: str) -> Redire
     return RedirectResponse(url=url, status_code=302)
 
 
-# NOTE: Route ordering matters. `get_log` MUST be declared before `get_artifact`
-# for the same reason `get_latest_screenshot` is — the `{path:path}` catch-all
-# in `get_artifact` would otherwise swallow `/logs/<service>` and treat it as
-# a static artifact path even when `?follow=true` is requested.
-@router.get("/jobs/{job_id}/artifacts/logs/{service}", response_model=None)
+# NOTE: Route ordering matters. `get_log` lives on `log_stream_router`, which
+# the app includes before `router` for the same reason `get_latest_screenshot`
+# is declared first — the `{path:path}` catch-all in `get_artifact` would
+# otherwise swallow `/logs/<service>` and treat it as a static artifact path
+# even when `?follow=true` is requested.
+@log_stream_router.get("/jobs/{job_id}/artifacts/logs/{service}", response_model=None)
 async def get_log(
     job_id: str,
     service: str,
@@ -292,6 +321,18 @@ async def get_log(
             "X-Accel-Buffering": "no",  # disable nginx buffering
         },
     )
+
+
+@router.post("/jobs/{job_id}/qa/log-stream-token")
+async def create_log_stream_token(job_id: str, request: Request) -> dict[str, Any]:
+    """Mint a short-lived token that opens this job's live log stream.
+
+    Authenticated like the rest of this router; the returned token is the
+    only credential the browser's EventSource puts in the URL (#634).
+    """
+    _check_safe_job_id(job_id)
+    token, expires_in = mint_scoped_token(signing_material(request.app.state.config), f"qa-log:{job_id}")
+    return {"token": token, "expires_in": expires_in}
 
 
 @router.get("/jobs/{job_id}/qa/services")
@@ -422,6 +463,65 @@ async def get_result(
         return cast(dict[str, Any], json.loads(bytes(buf)))
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=502, detail=f"upstream returned non-JSON body: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Dashboard byte passthrough for job-level artifacts (#541)
+#
+# The redirect routes above hand the client a presigned URL on the storage
+# endpoint the orchestrator uses, which in the shipped topology is
+# compose-internal: no browser resolves it, and the public vhost's CSP
+# (img-src 'self' blob:) would refuse it anyway. The dashboard reads these
+# two instead — the bytes come through /api with the dashboard's own auth.
+# The redirect routes stay for sandbox and agent callers.
+# ---------------------------------------------------------------------------
+
+
+async def _artifact_response(qa_minio: Any, key: str, *, cache_control: str) -> Response:
+    """Body of ``key`` with a media type from its extension; 404 missing, 413 oversized."""
+    try:
+        stat = await qa_minio.stat_object("qa-artifacts", key)
+    except Exception as exc:
+        # The SDK raises S3Error(NoSuchKey) for a missing object; any lookup
+        # failure means there is nothing to serve.
+        raise HTTPException(status_code=404, detail="artifact not found") from exc
+    size = stat.get("size")
+    if isinstance(size, int) and size > _MAX_ARTIFACT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"artifact too large ({size} bytes > {_MAX_ARTIFACT_BYTES} cap)",
+        )
+    body = await qa_minio.get_object_bytes("qa-artifacts", key)
+    return Response(content=body, media_type=_media_type_for(key), headers={"Cache-Control": cache_control})
+
+
+@router.get("/jobs/{job_id}/qa/screenshots/latest")
+async def get_latest_screenshot_bytes(
+    job_id: str,
+    qa_minio: Any = Depends(get_qa_minio),
+) -> Response:
+    """The newest screenshot's bytes — the live view polls this (#541)."""
+    _check_safe_job_id(job_id)
+    key = await _latest_screenshot_key(qa_minio, job_id)
+    return await _artifact_response(qa_minio, key, cache_control="no-store")
+
+
+@router.get("/jobs/{job_id}/qa/attempts/{attempt_n}/artifacts/{path:path}")
+async def get_attempt_artifact_bytes(
+    job_id: str,
+    attempt_n: int,
+    path: str,
+    qa_minio: Any = Depends(get_qa_minio),
+) -> Response:
+    """Bytes of ``<job_id>/<attempt_n>/<path>`` — evidence links (#541).
+
+    ``path`` is the evidence path from that attempt's ``result.json``.
+    """
+    _check_safe_job_id(job_id)
+    if attempt_n <= 0:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_safe(path)
+    return await _artifact_response(qa_minio, f"{job_id}/{attempt_n}/{path}", cache_control="private, max-age=300")
 
 
 @router.get("/jobs/{job_id}/artifacts/{path:path}")

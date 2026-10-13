@@ -73,6 +73,12 @@ class RepoPreferencesResponse(BaseModel):
 
 
 class RepoPreferencesUpdateRequest(BaseModel):
+    """A partial update (#350): only the fields present in the body are
+    written. Omit a field to keep it; send null (``""`` for ``notes``,
+    ``[]`` for ``dev_checks``, null or ``{}`` for ``verification``) to clear
+    it. The route reads ``model_dump(exclude_unset=True)``, so the defaults
+    below never reach storage."""
+
     model_config = ConfigDict(extra="forbid")
 
     sandbox_profile: str | None = None
@@ -84,10 +90,7 @@ class RepoPreferencesUpdateRequest(BaseModel):
     git_author_email: str | None = None
     dev_checks: list[DevCheck] = Field(default_factory=list, max_length=20)
     base_branch: str | None = None
-    # #298/#299: the orchestrator-run test gate + tier path rules. Unlike the
-    # other fields an ABSENT/null value means "leave the stored config alone"
-    # (clients that predate the field PUT the whole object without it); send
-    # {} to clear it.
+    # #298/#299: the orchestrator-run test gate + tier path rules.
     verification: VerificationConfig | None = None
 
     @field_validator("base_branch")

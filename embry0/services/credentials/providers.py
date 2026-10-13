@@ -1,7 +1,9 @@
 """LLM providers the registry can resolve (spec 2026-09-29 §3.4).
 
 The xAI refresh-token file is an importer input, not a runtime fallback.
-Anthropic's runtime fallback is the OAuth token, then the credentials file.
+Anthropic's runtime fallback follows the deployment's ``DEFAULT_AUTH_MODE``:
+``ANTHROPIC_API_KEY`` for ``api_key``; otherwise the OAuth token, then the
+credentials file.
 """
 
 from __future__ import annotations
@@ -45,12 +47,18 @@ def env_fallback(
 ) -> tuple[str, str, str] | None:
     """``(kind, secret, env_key)`` from the process environment, or None.
 
-    ``config`` is accepted so a later fallback can read a path from settings.
+    For Anthropic the kind follows ``config.default_auth_mode`` (#572): an
+    api-key deployment is served ``ANTHROPIC_API_KEY`` and nothing else, so it
+    is never handed an OAuth token that the agent's auth check would refuse;
+    any other mode is served the OAuth token, then the credentials file. A
+    repo, job or agent that overrides the mode needs a registry account.
     xAI's credential file is not read here.
     """
-    del config
     if provider not in LLM_PROVIDERS:
         raise ValueError(f"unknown llm provider {provider!r}")
+    if provider == "anthropic" and getattr(config, "default_auth_mode", None) == "api_key":
+        api_key = (environ.get("ANTHROPIC_API_KEY") or "").strip()
+        return ("llm_api_key", api_key, "ANTHROPIC_API_KEY") if api_key else None
     if provider == "anthropic":
         token = (environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
         if token:

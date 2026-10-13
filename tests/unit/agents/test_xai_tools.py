@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from embry0.agents.xai_tools import BUILTIN_TOOL_NAMES, execute_tool, tool_defs
+from embry0.safety.policy import SafetyPolicy, evaluate_ring2_paths
 
 
 def test_tool_defs_filters_to_allowed():
@@ -99,3 +100,36 @@ def test_grep(tmp_path):
     assert "BETA" not in out  # case-sensitive by default
     out, err = execute_tool("Grep", {"pattern": "beta", "ignore_case": True}, cwd=str(tmp_path))
     assert "a.txt:3: BETA" in out
+
+
+# ---- #542: a search over a parent directory hides Read-denied files -------
+
+
+def _workspace_with_secret(tmp_path):
+    ws = tmp_path / "ws"
+    (ws / "secret").mkdir(parents=True)
+    (ws / "secret" / "key.txt").write_text("token=s3cr3t-value\n")
+    (ws / "open.txt").write_text("token=s3cr3t-open\n")
+    return ws, SafetyPolicy(deny_rules=[f"Read(/{ws}/secret/**)"])
+
+
+def test_grep_over_a_parent_dir_leaves_out_read_denied_files(tmp_path):
+    ws, policy = _workspace_with_secret(tmp_path)
+    ti = {"pattern": "s3cr3t", "path": str(ws)}
+    assert evaluate_ring2_paths(policy, "Grep", ti, cwd=str(ws)).allowed, "precondition: the root itself is allowed"
+
+    out, err = execute_tool("Grep", ti, cwd=str(ws), policy=policy)
+
+    assert not err
+    assert "s3cr3t-value" not in out and "key.txt" not in out, f"Grep returned a Read-denied file: {out!r}"
+    assert "s3cr3t-open" in out, f"Grep must still return the allowed file: {out!r}"
+
+
+def test_glob_over_a_parent_dir_leaves_out_read_denied_files(tmp_path):
+    ws, policy = _workspace_with_secret(tmp_path)
+
+    out, err = execute_tool("Glob", {"pattern": "**/*.txt", "path": str(ws)}, cwd=str(ws), policy=policy)
+
+    assert not err
+    assert "key.txt" not in out, f"Glob listed a Read-denied file: {out!r}"
+    assert "open.txt" in out, f"Glob must still list the allowed file: {out!r}"

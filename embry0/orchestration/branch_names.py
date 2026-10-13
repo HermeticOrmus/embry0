@@ -89,3 +89,29 @@ def job_branch_names(
         return frozenset({str(ref)})
     shared = shared_branch_name(issue_id=issue_id, task=task)
     return frozenset({shared, taken_branch_name(shared, job_id)})
+
+
+def job_push_branch(
+    *,
+    issue_id: str | None,
+    task: str | None,
+    job_id: str | None,
+    context: Mapping[str, Any] | None = None,
+    chosen: str | None = None,
+) -> str:
+    """The one branch a job's sandbox may push, as its git-proxy enrollment names it (#559).
+
+    ``chosen`` is the branch the developer settled on (``state["branch_name"]``),
+    which every later run and every resume reads back, so it wins. Before the
+    developer chooses, a follow-up job has its PR's branch, and every other
+    job its own name: :func:`taken_branch_name`, which no other job derives.
+    The issue's shared name is granted only once the developer has found it
+    free on origin (``ProxyManager.set_git_push_branches``), so a branch an
+    earlier job pushed (#478) is never writable from this sandbox.
+    """
+    if chosen:
+        return str(chosen)
+    ref = (context or {}).get("ref")
+    if ref:
+        return str(ref)
+    return taken_branch_name(shared_branch_name(issue_id=issue_id, task=task), job_id)

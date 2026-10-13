@@ -28,8 +28,10 @@ COPY embry0/execution/__init__.py                 /app/embry0/execution/__init__
 # gitlab_proxy imports embry0.execution.tls for the private-CA context (spec 1A 3.2).
 COPY embry0/execution/tls.py                      /app/embry0/execution/tls.py
 # xai_proxy reads 403 bodies with embry0/safety/xai_denials.py; the package __init__ imports patterns.py.
+# context_proxy redacts log lines with embry0/safety/redaction.py (#294).
 COPY embry0/safety/__init__.py                    /app/embry0/safety/__init__.py
 COPY embry0/safety/patterns.py                    /app/embry0/safety/patterns.py
+COPY embry0/safety/redaction.py                   /app/embry0/safety/redaction.py
 COPY embry0/safety/xai_denials.py                 /app/embry0/safety/xai_denials.py
 COPY embry0/execution/proxy/__init__.py           /app/embry0/execution/proxy/__init__.py
 COPY embry0/execution/proxy/auth_proxy.py         /app/embry0/execution/proxy/auth_proxy.py
@@ -40,17 +42,18 @@ COPY embry0/execution/proxy/git_proxy.py          /app/embry0/execution/proxy/gi
 COPY embry0/execution/proxy/git_scope.py          /app/embry0/execution/proxy/git_scope.py
 COPY embry0/execution/proxy/github_proxy.py       /app/embry0/execution/proxy/github_proxy.py
 COPY embry0/execution/proxy/gitlab_proxy.py       /app/embry0/execution/proxy/gitlab_proxy.py
-COPY embry0/execution/proxy/log_redaction.py      /app/embry0/execution/proxy/log_redaction.py
 COPY embry0/execution/proxy/minio_proxy.py        /app/embry0/execution/proxy/minio_proxy.py
 COPY embry0/execution/proxy/presign_proxy.py      /app/embry0/execution/proxy/presign_proxy.py
+COPY embry0/execution/proxy/receive_pack.py       /app/embry0/execution/proxy/receive_pack.py
 COPY embry0/execution/proxy/xai_proxy.py          /app/embry0/execution/proxy/xai_proxy.py
 COPY embry0/execution/proxy/server.py             /app/embry0/execution/proxy/server.py
 
 # Health check via the proxy's own /health endpoint. Use Python's urllib since
 # wget/curl are not present in python:3.12-slim. PORT defaults to 9100 in
 # absence of PROXY_TYPE; the docker-compose / ProxyManager always sets it.
+# Exec form (hadolint DL3025): sh -c keeps the documented exit 1 on failure.
 HEALTHCHECK --interval=5s --timeout=3s --start-period=2s --retries=3 \
-    CMD python -c "import urllib.request, os; urllib.request.urlopen('http://localhost:' + os.environ.get('LISTEN_PORT','9100') + '/health')" || exit 1
+    CMD ["sh", "-c", "python -c \"import urllib.request, os; urllib.request.urlopen('http://localhost:' + os.environ.get('LISTEN_PORT','9100') + '/health')\" || exit 1"]
 
 # Default command runs whichever proxy was selected via env at container start.
 CMD ["python", "-m", "embry0.execution.proxy.server"]

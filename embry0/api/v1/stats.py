@@ -80,6 +80,7 @@ async def get_stats(request: Request, db: DatabasePool = Depends(get_db)) -> dic
             COUNT(*) FILTER (WHERE status = 'awaiting_input') AS awaiting_input,
             COUNT(*) FILTER (WHERE status = 'paused') AS paused,
             COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled,
+            COUNT(*) FILTER (WHERE status = 'skipped') AS skipped,
             COUNT(*) FILTER (WHERE status IN ('pr_merged', 'pr_closed')) AS completed_with_pr_outcome,
             COUNT(*) FILTER (WHERE delivery_state = 'pr_open') AS delivery_pr_open,
             COUNT(*) FILTER (WHERE delivery_state = 'merged') AS delivery_merged,
@@ -131,8 +132,12 @@ async def get_stats(request: Request, db: DatabasePool = Depends(get_db)) -> dic
     delivery_closed = int(stats.get("delivery_closed", 0))
     delivery_pr_open = int(stats.get("delivery_pr_open", 0))
     with_pr = delivery_merged + delivery_closed + delivery_pr_open
-    job_success_rate = job_succeeded / total_jobs if total_jobs > 0 else 0.0
-    success_rate = int(stats.get("succeeded_or_delivered", 0)) / total_jobs if total_jobs > 0 else 0.0
+    # #474: a job skipped because someone else's open PR already covered its
+    # ticket did no work — neither a success nor a failure — so the rates are
+    # over the jobs that did.
+    attempted = total_jobs - int(stats.get("skipped", 0))
+    job_success_rate = job_succeeded / attempted if attempted > 0 else 0.0
+    success_rate = int(stats.get("succeeded_or_delivered", 0)) / attempted if attempted > 0 else 0.0
     prs_merged = int(stats.get("prs_merged", 0))
     prs_closed = int(stats.get("prs_closed", 0))
     settled_prs = prs_merged + prs_closed
@@ -308,6 +313,7 @@ async def get_stats(request: Request, db: DatabasePool = Depends(get_db)) -> dic
         "awaiting_input": awaiting_input,
         "paused": paused,
         "cancelled": int(stats.get("cancelled", 0)),
+        "skipped": int(stats.get("skipped", 0)),
         "job_succeeded": job_succeeded,
         "success_rate": success_rate,
         "job_success_rate": job_success_rate,

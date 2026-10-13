@@ -26,7 +26,6 @@ def _result(app_name: str, status=SubTaskStatus.PASSED) -> SubTaskResult:
         status=status,
         duration_ms=1234,
         cache_hits=CacheHits(),
-        trace_url=None,
         failure_summary=None,
     )
 

@@ -57,3 +57,10 @@ class QAVolumeStateRepository:
             last_warmed_sha=row["last_warmed_sha"],
             last_warmed_at=row["last_warmed_at"],
         )
+
+    async def delete_by_volume_name(self, volume_name: str) -> None:
+        """Forget a volume that has been removed (#328).
+
+        A row outliving its volume claims a warm tree that no longer exists.
+        """
+        await self.db.execute("DELETE FROM qa_volume_state WHERE volume_name = $1", volume_name)

@@ -148,3 +148,59 @@ def test_passes_filter_rejects_unwanted_types():
     # Missing type is dropped when a filter is active.
     assert _passes_filter({}, wanted) is False
     assert _passes_filter({"type": None}, wanted) is False
+
+
+class _PagedLogRepo:
+    """Fake jobs repo honouring since_seq/limit like JobsRepository.get_log_events.
+
+    On its first call it also queues a live marker event, so a replay that
+    stops early still ends with something the test can read up to.
+    """
+
+    def __init__(self, app, job_id: str, total: int) -> None:
+        self._app = app
+        self._job_id = job_id
+        self._rows = [{"id": i, "payload": {"type": "progress", "n": i}} for i in range(1, total + 1)]
+        self._marked = False
+
+    async def get_log_events(self, job_id, stream="pipeline", limit=500, since_seq=0):
+        if not self._marked:
+            self._marked = True
+            for q in self._app.state.event_bus._subscribers[self._job_id]:
+                q.put_nowait({"type": "marker", "event_seq": 10**9})
+        return [r for r in self._rows if r["id"] > since_seq][:limit]
+
+
+def test_ws_replay_sends_every_persisted_event_past_500():
+    """#203: replay read one 500-row page, so a long job's newer events never replayed."""
+    app = _make_ws_app(auth_dev_mode=True)
+    app.state.jobs_repo = _PagedLogRepo(app, "job-long", 1203)
+    client = TestClient(app)
+    replayed = []
+    with client.websocket_connect("/ws/jobs/job-long/events") as ws:
+        while True:
+            msg = ws.receive_json()
+            if msg["type"] == "marker":
+                break
+            replayed.append(msg["n"])
+    assert replayed == list(range(1, 1204)), f"replayed {len(replayed)} of 1203 events"
+
+
+def test_ws_client_leaving_a_quiet_job_drops_its_subscription():
+    """#505: with no event published after the client leaves, the handler sat on
+    queue.get() forever and its queue stayed registered on the bus."""
+    import time
+
+    app = _make_ws_app(auth_dev_mode=True)
+    client = TestClient(app)
+    subscribers = app.state.event_bus._subscribers
+    with client.websocket_connect("/ws/jobs/job-quiet/events") as ws:
+        assert len(subscribers.get("job-quiet", [])) == 1
+        # The client leaves; the session (and its event loop) stays open, so
+        # only the handler itself can drop the subscription.
+        ws.send({"type": "websocket.disconnect", "code": 1000})
+        deadline = time.monotonic() + 3
+        while subscribers.get("job-quiet") and time.monotonic() < deadline:
+            time.sleep(0.05)
+        left = len(subscribers.get("job-quiet", []))
+        assert left == 0, f"{left} subscriber(s) still registered 3s after the client left"

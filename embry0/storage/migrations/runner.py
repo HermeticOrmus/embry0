@@ -2471,6 +2471,107 @@ MIGRATIONS: list[tuple[int, str, str]] = [
            );
         """,
     ),
+    (
+        88,
+        "api_keys.allowed_repos — a per-key repository allowlist",
+        # NULL means the key may start work on any repository, which is what
+        # every key minted before this column could do, so nothing changes on
+        # upgrade. An empty array would read as "no repository" to one reader
+        # and "unrestricted" to another, so it is refused: the API stores NULL
+        # when an operator clears the list.
+        """
+        ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS allowed_repos TEXT[];
+
+        ALTER TABLE api_keys DROP CONSTRAINT IF EXISTS api_keys_allowed_repos_not_empty;
+        ALTER TABLE api_keys ADD CONSTRAINT api_keys_allowed_repos_not_empty
+            CHECK (allowed_repos IS NULL OR cardinality(allowed_repos) > 0);
+
+        COMMENT ON COLUMN api_keys.allowed_repos IS
+            'Repositories (owner/name) this key may start or continue work on. NULL: unrestricted. Matched case-insensitively and through REPO_RENAMES.';
+        """,
+    ),
+    (
+        89,
+        "jobs.finished_at backfill for terminal rows written without one (#345)",
+        # Until #345, fail_orphaned (boot-time reconciliation) and the
+        # paused-job expiry fallback set a terminal status in raw SQL without
+        # finished_at, bypassing the invariant update() keeps (RAV-1271). Those
+        # rows have no duration, so the job-duration histogram and every "how
+        # long did it take" query silently left them out.
+        #
+        # The backfilled value is updated_at: the trigger stamped it when the
+        # terminal write happened, and it is the latest time the row is known
+        # to have been touched — never earlier than the real end. Idempotent:
+        # a stamped row no longer matches. jobs.updated_at is preserved the
+        # way migration 71 does it, for the same reason (see the comment
+        # there).
+        """
+        ALTER TABLE jobs DISABLE TRIGGER trg_jobs_updated_at;
+        UPDATE jobs
+           SET finished_at = COALESCE(updated_at, created_at)
+         WHERE finished_at IS NULL
+           AND status IN ('completed', 'partial', 'failed', 'cancelled', 'expired', 'pr_merged', 'pr_closed');
+        ALTER TABLE jobs ENABLE TRIGGER trg_jobs_updated_at;
+        """,
+    ),
+    (
+        90,
+        "qa_volume_state — drop the rows of per-job volumes whose job has ended (#328)",
+        # Nothing deleted these rows until #328, so every per-job volume ever
+        # created left one behind. A per-job volume is removed once its job is
+        # terminal (destroy_for_job, or the VolumeReaper backstop), so a row
+        # whose job is terminal — or has no jobs row at all — describes a
+        # volume that is gone or about to be. Losing a row only costs a
+        # re-warm; per-repo rows are shared and left alone.
+        """
+        DELETE FROM qa_volume_state s
+         WHERE s.scope = 'per-job'
+           AND NOT EXISTS (
+               SELECT 1 FROM jobs j
+                WHERE j.job_id = s.scope_key
+                  AND j.status NOT IN (
+                      'completed', 'partial', 'failed', 'cancelled', 'expired', 'skipped', 'pr_merged', 'pr_closed'
+                  )
+           );
+        """,
+    ),
+    (
+        91,
+        "pipeline_templates.agent_models — drop the map nothing read (#468)",
+        # Stored by the template API since the table existed and read by no
+        # execution path: a template names a model on each step's
+        # config.model, which the resolver does read. The API now refuses the
+        # field, so the column goes with it.
+        """
+        ALTER TABLE pipeline_templates DROP COLUMN IF EXISTS agent_models;
+        """,
+    ),
+    (
+        92,
+        "jobs.interrupted_at / resume_attempts / launch — a restart recovers jobs instead of failing them (#307)",
+        """
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS interrupted_at TIMESTAMPTZ;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS resume_attempts INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS launch JSONB;
+
+        COMMENT ON COLUMN jobs.interrupted_at IS
+            '#307: when an orchestrator shutdown (drain) last stopped or deferred this job. Cleared when boot recovers the job; left set on a job boot could not recover.';
+        COMMENT ON COLUMN jobs.resume_attempts IS
+            '#307: boot recoveries after an unclean stop (a crash or kill, no drain). Bounded by MAX_RESUME_ATTEMPTS so a job that takes the orchestrator down cannot loop.';
+        COMMENT ON COLUMN jobs.launch IS
+            '#307: what the executor needs to start this job again from the beginning (runner kind and its arguments). NULL on rows written before it.';
+        """,
+    ),
+    (
+        93,
+        "qa_app_results.trace_url — drop the column nothing ever set (#644)",
+        # No QA node wrote a trace URL, so every row is NULL; the API and the
+        # dashboard dropped the field in #642 and the code in this change.
+        # QA traces are served by the authenticated per-app artifact route.
+        """
+        ALTER TABLE qa_app_results DROP COLUMN IF EXISTS trace_url;
+        """,
+    ),
 ]
 
 

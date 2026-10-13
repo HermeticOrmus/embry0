@@ -127,6 +127,13 @@ services:
         max-size: "50m"
         max-file: "5"
     restart: unless-stopped
+    # #307: SIGTERM starts a drain. uvicorn first closes its connections
+    # (--timeout-graceful-shutdown 30 in Dockerfile.orchestrator), then the
+    # running jobs get SHUTDOWN_DRAIN_SECONDS (default 90) to reach a
+    # checkpoint, then the rest of shutdown runs. Compose's default 10 s would
+    # SIGKILL the orchestrator before any of that. Raise this with
+    # SHUTDOWN_DRAIN_SECONDS (tests/unit/infra/test_shutdown_grace.py).
+    stop_grace_period: 180s
 
   postgres:
     image: postgres:16.6-alpine
@@ -485,7 +492,7 @@ services:
     # script `embry0-mcp-http` resolves the same code; `python -m` is kept
     # because it also works on an older rollback image, where the pip layer
     # held a stub package and only cwd-based imports found the real tree.
-    command: ["python", "-m", "embry0_mcp.http"]
+    command: ["python", "-m", "embry0.mcp_server.http"]
     mem_limit: 512m
     restart: unless-stopped
     environment:

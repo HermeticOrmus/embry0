@@ -1702,3 +1702,31 @@ async def test_line_count_recorded_on_the_row_stays_the_raw_line_count():
     svc = _clustered_service("on", sig_repo=_sig_repo())
     await svc.run_once()
     assert svc._runs.create.await_args.kwargs["log_lines"] == len(_SPIKE)
+
+
+# ---- #360: an unregistered stack repo runs no analysis ----------------------
+
+
+@pytest.mark.asyncio
+async def test_a_stack_whose_repo_is_unregistered_records_an_error_before_any_spend():
+    svc = _service(config=_config(watcher_repo="acme/unregistered"), lines=["[c] e1", "[c] e2", "[c] e3"])
+    asked: list[str] = []
+
+    async def _refusal(repo):
+        asked.append(repo)
+        return f"ERR_REPO_UNREGISTERED: repo {repo!r} is not registered in embry0"
+
+    svc._executor.unregistered_repo_refusal = _refusal
+    out = await svc.run_once()
+    assert out["action"] == "error", f"an unregistered stack repo was analysed anyway: {out}"
+    assert asked == ["acme/unregistered"]
+    assert "ERR_REPO_UNREGISTERED" in svc._runs.create.await_args.kwargs["detail"]
+    svc._fetch_log_entries.assert_not_awaited()
+    svc._jobs.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_registered_stack_repo_is_analysed_as_before():
+    svc = _service(config=_config(watcher_repo="acme/registered"), lines=["[c] one", "[c] two"])
+    svc._executor.unregistered_repo_refusal = AsyncMock(return_value=None)
+    assert (await svc.run_once())["action"] == "skipped_quiet"

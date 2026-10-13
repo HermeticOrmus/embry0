@@ -114,14 +114,17 @@ async def test_triage_prompt_clean_without_open_prs():
 
 
 @pytest.mark.asyncio
-async def test_triage_duplicate_flag_ends_job_linking_pr():
+async def test_triage_duplicate_flag_ends_job_naming_the_existing_pr():
     captured = {}
     cmd = await _run_triage(_triage_state(open_prs=list(_OPEN_PRS)), _PROCEED_DUP, captured)
     assert cmd.goto == END
     assert cmd.update["current_stage"] == "skipped_duplicate"
-    assert cmd.update["pr_url"] == "https://github.com/o/r/pull/366"
+    # #474: the existing PR is not this job's — never its pr_url.
+    assert "pr_url" not in cmd.update, "a PR the job did not open was put on its pr_url"
     assert "#366" in cmd.update["result_summary"]
-    # No error markers — the executor must judge this run completed.
+    assert "already exists" in cmd.update["result_summary"]
+    assert "https://github.com/o/r/pull/366" in cmd.update["result_summary"]
+    # No error markers — the executor ends this run skipped, not failed.
     assert not cmd.update.get("error_code")
 
 

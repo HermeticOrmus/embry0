@@ -462,7 +462,7 @@ async def test_execute_generates_trace_id_and_passes_to_jobs_create(monkeypatch)
     monkeypatch.setattr(exec_mod, "emit_audit", _fake_audit)
 
     # Stub _track_task so we don't actually run the workflow
-    def _fake_track(coro, *, kind, job_id, issue_id=None):
+    def _fake_track(coro, *, kind, job_id, issue_id=None, launch=None):
         coro.close()  # prevent RuntimeWarning about unawaited coroutine
         return None
 

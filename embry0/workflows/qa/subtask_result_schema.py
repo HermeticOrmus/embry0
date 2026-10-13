@@ -63,7 +63,6 @@ class SubTaskResult:
     status: SubTaskStatus
     duration_ms: int
     cache_hits: CacheHits = field(default_factory=CacheHits)
-    trace_url: str | None = None
     failure_summary: str | None = None
     raw_result: dict[str, Any] = field(default_factory=dict)
     # Phase 5A: per-sub-task boot drill-down. None when boot passed (UI hides

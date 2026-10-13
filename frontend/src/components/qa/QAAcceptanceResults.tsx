@@ -1,7 +1,10 @@
-import type { JSX, ReactNode } from "react";
+import { useState, type JSX, type ReactNode } from "react";
 import { CheckCircle2, XCircle, HelpCircle } from "lucide-react";
 import type { QAAcceptanceResult } from "@/api/qa-artifacts";
-import { artifactUrl } from "@/api/qa-artifacts";
+import { attemptArtifactPath, fetchArtifactBlob } from "@/api/qa-artifacts";
+
+// Long enough for the new tab to load the blob; it keeps its own copy once loaded.
+const BLOB_URL_TTL_MS = 60_000;
 
 const STATUS_ICON: Record<QAAcceptanceResult["status"], ReactNode> = {
   passed: <CheckCircle2 className="w-4 h-4 text-green-400" />,
@@ -11,10 +14,55 @@ const STATUS_ICON: Record<QAAcceptanceResult["status"], ReactNode> = {
 
 interface Props {
   jobId: string;
+  attemptN: number;
   results: QAAcceptanceResult[];
 }
 
-export function QAAcceptanceResults({ jobId, results }: Props): JSX.Element {
+/**
+ * One evidence file. The bytes come through the orchestrator passthrough
+ * with the authenticated client and open in a new tab as a blob: URL (#541),
+ * so the browser never follows a redirect to the storage endpoint.
+ */
+function EvidenceLink({ jobId, attemptN, path }: { jobId: string; attemptN: number; path: string }): JSX.Element {
+  const [state, setState] = useState<"idle" | "loading" | "error">("idle");
+
+  const open = async () => {
+    setState("loading");
+    try {
+      const blob = await fetchArtifactBlob(attemptArtifactPath(jobId, attemptN, path));
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), BLOB_URL_TTL_MS);
+      setState("idle");
+    } catch {
+      setState("error");
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={() => void open()}
+      disabled={state === "loading"}
+      data-testid="qa-evidence-link"
+      data-path={path}
+      title={state === "error" ? `${path}: failed to load` : path}
+      className={
+        state === "error"
+          ? "text-xs px-2 py-0.5 rounded bg-white/5 border border-destructive/40 text-destructive"
+          : "text-xs px-2 py-0.5 rounded bg-white/5 border border-white/10 text-white/70 hover:text-white"
+      }
+    >
+      {path.split("/").pop()}
+    </button>
+  );
+}
+
+export function QAAcceptanceResults({ jobId, attemptN, results }: Props): JSX.Element {
   if (results.length === 0) {
     return <p className="text-sm text-white/50 italic">No acceptance criteria recorded.</p>;
   }
@@ -31,15 +79,7 @@ export function QAAcceptanceResults({ jobId, results }: Props): JSX.Element {
           {r.evidence.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-2">
               {r.evidence.map((e) => (
-                <a
-                  key={e}
-                  href={artifactUrl(jobId, e)}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-xs px-2 py-0.5 rounded bg-white/5 border border-white/10 text-white/70 hover:text-white"
-                >
-                  {e.split("/").pop()}
-                </a>
+                <EvidenceLink key={e} jobId={jobId} attemptN={attemptN} path={e} />
               ))}
             </div>
           )}

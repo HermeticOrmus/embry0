@@ -19,7 +19,6 @@ ROOT = Path(__file__).resolve().parents[3]
 SECURITY = ROOT / "SECURITY.md"
 README = ROOT / "README.md"
 ARCHITECTURE = ROOT / "docs" / "architecture.md"
-CODE_OF_CONDUCT = ROOT / "CODE_OF_CONDUCT.md"
 
 HOLDS = "### What holds"
 DOES_NOT_HOLD = "### What does not hold"
@@ -319,10 +318,15 @@ def test_security_md_states_the_sandbox_isolation_chain(tmp_path: Path) -> None:
     # and when a paused sandbox resumes"
     for needle in ("at startup", "before each sandbox is handed to a job", "when a paused sandbox resumes"):
         assert needle in para, f"'Egress drops and sandbox isolation' does not say the chain is written {needle!r}"
-    callers = _callers_of(ROOT / "embry0" / "execution" / "sandbox_manager.py", "ensure_isolation")
-    missing = {"create", "reenroll"} - callers
+    manager = ROOT / "embry0" / "execution" / "sandbox_manager.py"
+    callers = _callers_of(manager, "ensure_isolation")
+    missing = {"create", "refresh_proxy_policy"} - callers
     assert not missing, f"SandboxManager.{sorted(missing)} no longer writes the chain; SECURITY.md says it does"
-    assert _callers_of(ROOT / "embry0" / "api" / "app.py", "ensure_isolation"), (
+    # A resume and startup write it through refresh_proxy_policy, with the egress exceptions (#568).
+    assert "reenroll" in _callers_of(manager, "refresh_proxy_policy"), (
+        "SandboxManager.reenroll no longer writes the chain; SECURITY.md says it does"
+    )
+    assert _callers_of(ROOT / "embry0" / "api" / "app.py", "refresh_proxy_policy"), (
         "startup no longer writes the chain; SECURITY.md says it does"
     )
 
@@ -357,13 +361,10 @@ def test_reporting_channels_are_github_only() -> None:
     """Owner decision (#623): reports go through GitHub, and no address is published."""
     reporting = _security_section("## Reporting a vulnerability")
     assert "security/advisories/new" in reporting, "SECURITY.md has no link to GitHub private vulnerability reporting"
-    enforcement = _section(CODE_OF_CONDUCT.read_text(), "## Enforcement")
-    assert "security/advisories/new" in enforcement, "CODE_OF_CONDUCT.md gives no private GitHub channel for reports"
-    for doc in (SECURITY, CODE_OF_CONDUCT):
-        text = doc.read_text()
-        assert "mailto:" not in text, f"{doc.name} publishes a mailto: link; reports go through GitHub only"
-        lines = [n for n, line in enumerate(text.splitlines(), 1) if _EMAIL.search(line)]
-        assert not lines, f"{doc.name} publishes an e-mail address on lines {lines}; reports go through GitHub only"
+    text = SECURITY.read_text()
+    assert "mailto:" not in text, "SECURITY.md publishes a mailto: link; reports go through GitHub only"
+    lines = [n for n, line in enumerate(text.splitlines(), 1) if _EMAIL.search(line)]
+    assert not lines, f"SECURITY.md publishes an e-mail address on lines {lines}; reports go through GitHub only"
 
 
 def test_adr_0008_is_indexed() -> None:

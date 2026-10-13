@@ -71,6 +71,7 @@ _JOB_STATUSES = [
     "failed",
     "cancelled",
     "expired",
+    "skipped",
     "pr_merged",
     "pr_closed",
 ]
@@ -94,6 +95,8 @@ def _expected(job_status: str, pr_url: str | None, issue_status: str, delivery: 
         return False, f"issue_{issue_status}"
     if job_status in {"failed", "cancelled", "expired"}:
         return True, ""
+    if job_status == "skipped":
+        return False, "existing_pr"
     return False, "work_delivered"
 
 
@@ -163,3 +166,11 @@ def test_a_completed_job_whose_pr_was_closed_still_needs_a_person() -> None:
 def test_a_failure_after_a_merged_pr_is_not_retried() -> None:
     verdict = dispatch_eligibility(_OPEN, [_job("failed", "job-2"), _job("pr_merged", "job-1")])
     assert not verdict.eligible and verdict.reason == "work_delivered"
+
+
+def test_a_ticket_whose_latest_job_was_skipped_waits_on_the_existing_pr() -> None:
+    """#474: a skipped job leaves its issue open (the fix is not merged), so
+    the open issue must not let a label start a second job beside the PR."""
+    verdict = dispatch_eligibility(_OPEN, [_job("skipped", "job-9")])
+    assert (verdict.eligible, verdict.reason) == (False, "existing_pr"), verdict
+    assert verdict.blocking_job is not None and verdict.blocking_job["job_id"] == "job-9"

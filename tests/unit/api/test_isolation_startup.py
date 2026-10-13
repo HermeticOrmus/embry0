@@ -1,4 +1,4 @@
-"""Startup writes the sandbox isolation chain once the proxies are up (#554).
+"""Startup writes the rules that name proxy addresses once the proxies are up (#554, #568).
 
 The proxies get new addresses at every start, and the paused sandboxes kept
 from the previous process can reach only the addresses the chain allows, so
@@ -17,6 +17,7 @@ import pytest
 from embry0.api.app import create_app, lifespan
 from embry0.execution.runtime.isolation import IsolationError
 from embry0.storage.database import DatabasePool
+from tests.fixtures.postgres import postgres_unavailable
 
 
 class _StopLifespan(BaseException):
@@ -37,19 +38,20 @@ async def test_startup_writes_the_chain_after_the_proxies_and_survives_a_failure
         conn = await asyncpg.connect(database_url)
         await conn.close()
     except (OSError, asyncpg.PostgresError) as exc:
-        pytest.skip(f"PostgreSQL unavailable: {exc}")
+        postgres_unavailable(exc)
 
     order: list[str] = []
 
     async def _proxy_start(self, **kwargs):
         order.append("proxies started")
 
-    async def _ensure_isolation():
+    async def _refresh_proxy_policy():
+        # The isolation chain and the egress exceptions (#568), in SandboxManager.
         order.append("chain written")
         raise IsolationError("no proxy is running on 'sandbox-restricted'")
 
     sandbox_mgr = MagicMock()
-    sandbox_mgr.ensure_isolation = _ensure_isolation
+    sandbox_mgr.refresh_proxy_policy = _refresh_proxy_policy
 
     async def _clean_orphans(*args, **kwargs):
         order.append("orphans cleaned")

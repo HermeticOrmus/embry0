@@ -87,6 +87,45 @@ async def _developer_working_branch(
     return own, {"name": derived, **taken}
 
 
+async def _grant_push_branch(state: dict[str, Any], configurable: dict[str, Any], branch: str) -> str:
+    """Let the sandbox push ``branch``, or fall back to the branch it may already push (#559).
+
+    init_node enrolled the sandbox for the job's own name (``job_push_branch``).
+    When the developer chose another branch (the issue's shared name, found
+    free on origin), the git-proxy is told to accept that one instead. If it
+    cannot be told, the job keeps its own name rather than pushing to a
+    branch the proxy would refuse.
+    """
+    from embry0.orchestration.branch_names import job_push_branch
+
+    enrolled = job_push_branch(
+        issue_id=state.get("issue_id"),
+        task=state.get("task"),
+        job_id=state.get("job_id"),
+        context=state.get("context"),
+        chosen=state.get("branch_name"),
+    )
+    if branch == enrolled:
+        return branch
+    proxy_mgr = configurable.get("proxy_manager")
+    container_id = state.get("sandbox_container_id")
+    if not proxy_mgr or not getattr(proxy_mgr, "git_proxy_url", "") or not container_id:
+        # No git-proxy: no enrollment to change, and nothing to push through.
+        return branch
+    try:
+        await proxy_mgr.set_git_push_branches(str(container_id), [branch])
+    except Exception as exc:  # noqa: BLE001 — the job carries on, on the branch it may push
+        logger.warning(
+            "developer_push_branch_not_granted",
+            job_id=state.get("job_id"),
+            branch=branch,
+            fallback=enrolled,
+            error=str(exc)[:300],
+        )
+        return enrolled
+    return branch
+
+
 def _developer_delta_sections(state: dict[str, Any]) -> list[str]:
     """The one-shot context blocks that are NEW since the developer's last
     turn: user answers, review feedback, user retry guidance, and the QA
@@ -214,6 +253,10 @@ def _build_developer_full_prompt(
     prompt_parts.append("3. Write or update tests")
     prompt_parts.append("4. Commit your changes")
     prompt_parts.append(f"5. Push to branch {branch_name}" if existing_pr_url else "5. Push the branch")
+    prompt_parts.append(
+        f"   The git remote accepts pushes to {branch_name} only. It refuses any other branch or tag, "
+        "and deleting a branch, so do not spend turns on them."
+    )
     if existing_pr_url:
         prompt_parts.append(
             f"6. A pull request for this branch already exists ({existing_pr_url}) — do NOT create a new PR"
@@ -749,7 +792,7 @@ def _branch_missing_explanation(branch: str, diagnostics: dict[str, Any]) -> str
             + ". The work exists in the sandbox only."
         )
     return (
-        why + " This breaks the QA handoff: init_qa_node cannot clone what was never pushed. "
+        why + " This breaks the QA handoff: QA cannot clone what was never pushed. "
         "Restart the job after the dev agent has been corrected."
     )
 
@@ -771,6 +814,7 @@ async def developer_node(state: dict[str, Any], config: RunnableConfig) -> Comma
 
     user_answers = state.get("user_answers")
     branch_name, taken_branch = await _developer_working_branch(state, configurable)
+    branch_name = await _grant_push_branch(state, configurable, branch_name)
 
     # Collect agent events locally so we can scan for agent_ask_user events
     # after the agent finishes. We still forward every event to the graph
@@ -958,6 +1002,17 @@ async def developer_node(state: dict[str, Any], config: RunnableConfig) -> Comma
             "developer_reported_taken_branch", job_id=state.get("job_id"), reported=branch, branch=branch_name
         )
         branch = branch_name
+    elif branch != branch_name:
+        # #559: the sandbox may push only branch_name, so another branch the
+        # agent reports holds none of this job's work. Recording it would also
+        # hand it the push right: a resume enrolls the branch state names.
+        logger.warning(
+            "developer_reported_other_branch",
+            job_id=state.get("job_id"),
+            reported=str(branch)[:200],
+            branch=branch_name,
+        )
+        branch = branch_name
 
     if pr_url:
         writer({"type": "pr_created", "pr_url": pr_url, "branch": branch})
@@ -1050,7 +1105,7 @@ async def developer_node(state: dict[str, Any], config: RunnableConfig) -> Comma
     else:
         # Programmatic verification: the LLM is INSTRUCTED to push the branch
         # (prompt step 5) but doesn't always follow through. If we proceed to
-        # review→init_qa with no branch on remote, init_qa hits a generic
+        # review→QA with no branch on remote, QA hits a generic
         # "Remote branch not found" clone error after spinning up the QA
         # sandbox — wastes time + cost + obscures the real cause. Verify
         # here and fail fast with a clear error code.

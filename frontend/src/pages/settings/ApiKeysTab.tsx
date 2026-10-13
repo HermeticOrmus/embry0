@@ -1,9 +1,15 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Copy, KeyRound, Trash2 } from "lucide-react";
+import { Copy, FolderGit2, KeyRound, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useApiKeys } from "@/hooks/useApiKeys";
-import { createApiKey, revokeApiKey, type ApiKey, type CreatedApiKey } from "@/api/apiKeys";
+import {
+  createApiKey,
+  revokeApiKey,
+  setApiKeyAllowedRepos,
+  type ApiKey,
+  type CreatedApiKey,
+} from "@/api/apiKeys";
 import { useAuthStore } from "@/stores/authStore";
 import { Badge, type BadgeTone } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -14,6 +20,7 @@ import { Select } from "@/components/ui/Select";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { PageError } from "@/components/PageError";
 import { TableSkeleton } from "@/components/TableSkeleton";
+import { parseRepoList } from "@/lib/repoList";
 import { formatDate } from "@/lib/utils";
 
 const SCOPE_TONES: Record<ApiKey["scope"], BadgeTone> = {
@@ -53,6 +60,7 @@ export default function ApiKeysTab() {
   const [scope, setScope] = useState("read");
   const [expiresDays, setExpiresDays] = useState("");
   const [service, setService] = useState(false);
+  const [allowedRepos, setAllowedRepos] = useState("");
   const [minted, setMinted] = useState<CreatedApiKey | null>(null);
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["api-keys"] });
@@ -64,9 +72,21 @@ export default function ApiKeysTab() {
       setName("");
       setExpiresDays("");
       setService(false);
+      setAllowedRepos("");
       invalidate();
     },
     onError: () => toast.error("Key creation failed"),
+  });
+
+  const reposMut = useMutation({
+    mutationFn: ({ id, repos }: { id: string; repos: string[] }) => setApiKeyAllowedRepos(id, repos),
+    onSuccess: (row) => {
+      toast.success(
+        row.allowed_repos ? `Key "${row.name}" limited to ${row.allowed_repos.length} repo(s)` : `Key "${row.name}" unrestricted`,
+      );
+      invalidate();
+    },
+    onError: () => toast.error("Could not change the key's repositories"),
   });
 
   const revokeMut = useMutation({
@@ -127,6 +147,19 @@ export default function ApiKeysTab() {
               />
             </div>
           </div>
+          <div>
+            <Label htmlFor="key-repos">Repositories (optional)</Label>
+            <Input
+              id="key-repos"
+              placeholder="all repositories — or e.g. acme/widgets, acme/docs"
+              value={allowedRepos}
+              onChange={(e) => setAllowedRepos(e.target.value)}
+            />
+            <p className="mt-1 text-xs text-muted-foreground">
+              Limits the work this key may start (jobs, issues, triage, resumes) to these repositories.
+              A limited key cannot mint other keys.
+            </p>
+          </div>
           {isAdmin && (
             <label className="flex items-center gap-2 text-sm text-muted-foreground">
               <input type="checkbox" checked={service} onChange={(e) => setService(e.target.checked)} />
@@ -141,6 +174,7 @@ export default function ApiKeysTab() {
                 scope,
                 expires_days: expiresDays ? Number(expiresDays) : undefined,
                 service: service || undefined,
+                allowed_repos: parseRepoList(allowedRepos).length ? parseRepoList(allowedRepos) : undefined,
               })
             }
           >
@@ -221,6 +255,7 @@ export default function ApiKeysTab() {
                 <th className="px-4 py-2.5">Name</th>
                 <th className="px-4 py-2.5">Key</th>
                 <th className="px-4 py-2.5">Scope</th>
+                <th className="px-4 py-2.5">Repositories</th>
                 {isAdmin && <th className="px-4 py-2.5">Owner</th>}
                 <th className="px-4 py-2.5">Last used</th>
                 <th className="px-4 py-2.5">Expires</th>
@@ -235,6 +270,13 @@ export default function ApiKeysTab() {
                   <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">{k.prefix}…</td>
                   <td className="px-4 py-2.5">
                     <Badge tone={SCOPE_TONES[k.scope]}>{k.scope}</Badge>
+                  </td>
+                  <td className="px-4 py-2.5 text-xs" data-testid={`key-repos-${k.id}`}>
+                    {k.allowed_repos ? (
+                      <span className="font-mono">{k.allowed_repos.join(", ")}</span>
+                    ) : (
+                      <span className="text-muted-foreground">all</span>
+                    )}
                   </td>
                   {isAdmin && (
                     <td className="px-4 py-2.5 text-xs text-muted-foreground">
@@ -252,6 +294,25 @@ export default function ApiKeysTab() {
                   </td>
                   <td className="px-4 py-2.5">
                     <div className="flex justify-end">
+                      {!k.revoked_at && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          title="Change the repositories this key may start work on"
+                          disabled={reposMut.isPending}
+                          onClick={() => {
+                            const answer = window.prompt(
+                              `Repositories key "${k.name}" may start work on, comma-separated. Leave empty for all.`,
+                              (k.allowed_repos ?? []).join(", "),
+                            );
+                            if (answer !== null) {
+                              reposMut.mutate({ id: k.id, repos: parseRepoList(answer) });
+                            }
+                          }}
+                        >
+                          <FolderGit2 size={14} />
+                        </Button>
+                      )}
                       {!k.revoked_at && (
                         <Button
                           variant="ghost"

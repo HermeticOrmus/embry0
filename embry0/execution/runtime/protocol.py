@@ -118,6 +118,19 @@ class AgentRuntime(Protocol):
         must still reach). A named container whose address cannot be read is
         left out, which keeps it closed. Raises when the policy cannot be put
         in place; the caller must not hand that sandbox to a job.
+
+        The proxy exceptions are shared by every sandbox, so this also
+        rewrites them for every sandbox (#568).
+        """
+        ...
+
+    async def refresh_egress(self, proxies: Sequence[str]) -> list[str]:
+        """Point every sandbox's proxy exceptions at the running ``proxies`` (#568).
+
+        The exceptions are one rule set shared by every sandbox, rewritten
+        from the proxies' internet-network addresses now; a sandbox whose
+        rules predate that rule set is converted to it. Returns the allowed
+        proxy addresses; raises when the rules cannot be written and verified.
         """
         ...
 

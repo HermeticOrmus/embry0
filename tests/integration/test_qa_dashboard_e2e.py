@@ -75,7 +75,6 @@ def fixtures():
                 status=SubTaskStatus.PASSED,
                 duration_ms=1100,
                 cache_hits=CacheHits(),
-                trace_url=None,
                 failure_summary=None,
                 raw_result={},
             ),
@@ -85,7 +84,6 @@ def fixtures():
                 status=SubTaskStatus.QA_FAILURE,
                 duration_ms=2300,
                 cache_hits=CacheHits(prebaked_image=True),
-                trace_url="https://x/trace.zip",
                 failure_summary="loads page did not render",
                 raw_result={},
             ),
@@ -137,7 +135,7 @@ def test_full_dashboard_journey_with_bearer(fixtures):
     detail = r.json()
     assert detail["overall_status"] == "failed"
     by_app = {a["app_name"]: a for a in detail["apps"]}
-    assert by_app["companion"]["trace_url"] == "https://x/trace.zip"
+    assert "trace_url" not in by_app["companion"]  # #644
 
     # 4. Per-run, per-app
     r = client.get("/api/v1/qa/runs/job-1/apps/companion", headers=headers)

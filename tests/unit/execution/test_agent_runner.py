@@ -18,6 +18,7 @@ import pytest
 import structlog.testing
 
 from embry0.execution.agent_runner import AgentOutput, AgentRunner
+from embry0.safety.error_codes import ErrorCode
 
 
 def test_agent_output_dataclass():
@@ -117,7 +118,9 @@ async def test_runner_surfaces_stderr_when_subprocess_exits_nonzero_with_no_stdo
     )
 
     assert out.is_error is True
-    assert "No final result received from sandbox" in out.error_message
+    # #354: zero stdout lines + a traceback is a runner that never started
+    # the agent, and says so; the stderr still rides the message.
+    assert "could not start the agent" in out.error_message
     assert "NameError: boom" in out.error_message, out.error_message
 
 
@@ -354,6 +357,8 @@ _OLD_RUNNER_USAGE = (
     b"runner.py: error: the following arguments are required: --config\n"
 )
 _FINAL_OK = b'{"type": "final_result", "agent_type": "qa", "is_error": false, "output": "done"}\n'
+# An event the runner writes once the agent is under way.
+_STARTED = b'{"type": "progress", "message": "agent started"}\n'
 
 
 class _LinesStdout:
@@ -548,7 +553,8 @@ async def test_turn_cap_death_gets_its_own_code() -> None:
 
 @pytest.mark.asyncio
 async def test_no_final_result_and_idle_kill_are_coded() -> None:
-    out = await _runner_with_procs([_proc(returncode=1, stderr=b"Traceback: boom\n")]).run(
+    # The agent started (one event on stdout), then died without a result.
+    out = await _runner_with_procs([_proc(returncode=1, stdout=[_STARTED], stderr=b"Traceback: boom\n")]).run(
         container="c", config={"agent_type": "qa"}
     )
     assert out.error_code == "ERR_AGENT_NO_RESULT"
@@ -671,8 +677,102 @@ async def test_stderr_mentioning_a_turn_cap_does_not_hijack_the_diagnosis() -> N
     as text, a traceback that merely MENTIONS the turn cap would be read as
     one — so that site states its code instead."""
     stderr = b"Traceback (most recent call last):\n  RuntimeError: Reached maximum number of turns (25)\n"
-    proc = _proc(returncode=1, stderr=stderr)
+    proc = _proc(returncode=1, stdout=[_STARTED], stderr=stderr)
     out = await _runner_with_procs([proc]).run(container="c", config={"agent_type": "review"})
 
     assert out.error_code == "ERR_AGENT_NO_RESULT"
     assert "Reached maximum number of turns" in out.error_message
+
+
+# --- #354: a crash before the runner starts the agent -------------------------
+
+_PARTIAL_IMAGE_STDERR = (
+    b"Traceback (most recent call last):\n"
+    b'  File "/app/embry0/sandbox/runner.py", line 22, in <module>\n'
+    b"ImportError: cannot import name 'classify_agent_error' from 'embry0.safety.error_codes'\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_a_crash_before_the_first_event_is_a_start_failure_not_no_result() -> None:
+    proc = _proc(returncode=1, stderr=_PARTIAL_IMAGE_STDERR)
+    out = await _runner_with_procs([proc]).run(container="c", config={"agent_type": "developer"})
+
+    assert out.error_code == "ERR_SANDBOX_AGENT_START_FAILED", (
+        f"a runner that died importing its modules was coded {out.error_code!r}"
+    )
+    assert "could not start the agent" in out.error_message
+    assert "classify_agent_error" in out.error_message
+    assert "classify_agent_error" in out.stderr_tail, "the stored stderr tail must carry the import failure"
+
+
+@pytest.mark.asyncio
+async def test_a_start_crash_stderr_is_redacted() -> None:
+    token = "ghp_" + "g7H8" * 9
+    stderr = _PARTIAL_IMAGE_STDERR + f"ModuleNotFoundError: GITHUB_TOKEN={token}\n".encode()
+    out = await _runner_with_procs([_proc(returncode=1, stderr=stderr)]).run(
+        container="c", config={"agent_type": "developer"}
+    )
+    assert out.error_code == "ERR_SANDBOX_AGENT_START_FAILED"
+    assert token not in out.error_message
+    assert token not in out.stderr_tail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr"),
+    [
+        (1, [_STARTED], _PARTIAL_IMAGE_STDERR),  # the agent had started: it ran and returned nothing
+        (1, [], b"killed\n"),  # no Python failure on stderr: nothing says the start failed
+        (0, [], _PARTIAL_IMAGE_STDERR),  # a clean exit is not a crash
+    ],
+)
+async def test_only_a_pre_start_python_crash_is_a_start_failure(returncode, stdout, stderr) -> None:
+    out = await _runner_with_procs([_proc(returncode=returncode, stdout=stdout, stderr=stderr)]).run(
+        container="c", config={"agent_type": "developer"}
+    )
+    assert out.error_code == ErrorCode.AGENT_NO_RESULT.value
+
+
+@pytest.mark.asyncio
+async def test_an_image_with_inconsistent_baked_modules_is_reported_as_a_start_failure(tmp_path) -> None:
+    """The shape PR #352's review reproduced: a partial image refresh that
+    pairs a new runner with an older embry0/safety/. A real interpreter runs
+    the runner module from such a tree and dies importing it."""
+    import asyncio
+    import os
+    import sys
+
+    pkg = tmp_path / "embry0"
+    for sub in ("", "sandbox", "safety"):
+        (pkg / sub).mkdir(exist_ok=True)
+        (pkg / sub / "__init__.py").write_text("")
+    (pkg / "safety" / "error_codes.py").write_text("class ErrorCode:\n    pass\n")  # the older module
+    (pkg / "sandbox" / "runner.py").write_text(
+        "from embry0.safety.error_codes import classify_agent_error\n"  # the newer runner
+    )
+
+    async def _stream_exec(*, command, stdin_data=None, **_kwargs):
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            *command[1:],
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONPATH": str(tmp_path)},
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        assert proc.stdin is not None
+        proc.stdin.write(stdin_data or b"")
+        proc.stdin.close()
+        return proc
+
+    runner = _runner_with_procs([])
+    runner._docker.stream_exec = AsyncMock(side_effect=_stream_exec)
+
+    out = await runner.run(container="c", config={"agent_type": "developer"})
+
+    assert out.error_code == "ERR_SANDBOX_AGENT_START_FAILED", (
+        f"an image whose runner cannot import its safety module was coded {out.error_code!r}: {out.error_message}"
+    )
+    assert "cannot import name 'classify_agent_error'" in out.stderr_tail

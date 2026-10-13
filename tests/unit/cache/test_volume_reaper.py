@@ -19,6 +19,7 @@ def _labels(scope: str, key: str, instance_id: str | None = INSTANCE) -> dict[st
 
 def _reaper(docker, jobs, **kwargs) -> VolumeReaper:
     kwargs.setdefault("instance_id", INSTANCE)
+    kwargs.setdefault("state_repo", None)
     return VolumeReaper(DockerRuntime(docker), jobs, **kwargs)
 
 
@@ -239,3 +240,33 @@ async def test_decision_not_the_list_filter_is_what_protects_foreign_volumes():
     docker.run_cmd = AsyncMock(side_effect=leaky)
     await _reaper(docker, _jobs({"job-theirs": "failed"})).sweep()
     assert _removed(docker) == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_forgets_the_state_rows_of_removed_volumes_only():
+    """A qa_volume_state row must not outlive its volume (#328)."""
+    docker = _docker(
+        [
+            _vol("embry0-qa-vol-job-a", _labels("per-job", "job-a")),
+            _vol("embry0-qa-vol-job-b", _labels("per-job", "job-b")),
+            _vol("embry0-qa-vol-job-live", _labels("per-job", "job-live")),
+        ],
+        rm_fails={"embry0-qa-vol-job-b"},
+    )
+    state_repo = MagicMock()
+    state_repo.delete_by_volume_name = AsyncMock()
+    jobs = _jobs({"job-a": "failed", "job-b": "failed", "job-live": "running"})
+    await _reaper(docker, jobs, state_repo=state_repo).sweep()
+    forgotten = [c.args[0] for c in state_repo.delete_by_volume_name.await_args_list]
+    assert forgotten == ["embry0-qa-vol-job-a"], (
+        f"the reaper must forget exactly the volumes it removed; got {forgotten}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dry_run_forgets_nothing():
+    docker = _docker([_vol("embry0-qa-vol-job-a", _labels("per-job", "job-a"))])
+    state_repo = MagicMock()
+    state_repo.delete_by_volume_name = AsyncMock()
+    await _reaper(docker, _jobs({"job-a": "failed"}), state_repo=state_repo, dry_run=True).sweep()
+    state_repo.delete_by_volume_name.assert_not_awaited()

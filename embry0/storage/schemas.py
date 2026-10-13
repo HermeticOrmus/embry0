@@ -18,6 +18,10 @@ class JobStatus(StrEnum):
     AWAITING_INPUT = "awaiting_input"
     PAUSED = "paused"
     EXPIRED = "expired"
+    # #474: ended without doing the work because someone else's open pull
+    # request already covers the ticket. Opened nothing; neither a success
+    # nor a failure. Terminal.
+    SKIPPED = "skipped"
     PR_MERGED = "pr_merged"
     PR_CLOSED = "pr_closed"
 

@@ -1,6 +1,6 @@
 # Contributing to embry0
 
-Thanks for your interest in contributing. This document covers the practical workflow; the [README](README.md) covers what embry0 is and how to run it. Everyone taking part is expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+Thanks for your interest in contributing. This document covers the practical workflow; the [README](README.md) covers what embry0 is and how to run it.
 
 ## Development setup
 

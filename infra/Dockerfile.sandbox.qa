@@ -31,11 +31,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         # JVM apps (macro-lab style):
         temurin-21-jdk \
     # Docker CLI only — no daemon. Talks to DinD over TCP+TLS.
-    && curl -fsSL https://download.docker.com/linux/static/stable/$(uname -m)/docker-29.6.2.tgz \
+    && curl -fsSL https://download.docker.com/linux/static/stable/"$(uname -m)"/docker-29.6.2.tgz \
        | tar -xz --strip-components=1 -C /usr/local/bin docker/docker \
     && chmod +x /usr/local/bin/docker \
     && mkdir -p /usr/local/lib/docker/cli-plugins \
-    && curl -fsSL https://github.com/docker/compose/releases/download/v5.3.1/docker-compose-linux-$(uname -m) \
+    && curl -fsSL https://github.com/docker/compose/releases/download/v5.3.1/docker-compose-linux-"$(uname -m)" \
        -o /usr/local/lib/docker/cli-plugins/docker-compose \
     && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose \
     && ln -s /usr/local/lib/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose \

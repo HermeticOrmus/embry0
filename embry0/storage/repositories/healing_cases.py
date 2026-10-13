@@ -105,6 +105,9 @@ _FIX_DEPLOYED = (
     " AND c.deployed_at >= c.merged_at)"
 )
 
+# How many times a case was sent back for another fix attempt (#451).
+_REOPENS = "(SELECT COUNT(*) FROM healing_case_events e WHERE e.case_id = c.id AND e.event = 'reopened')"
+
 # The PR that stands for a case in a one-line view: the merged one, else the
 # newest open one, else the newest.
 _CURRENT_PR = """
@@ -826,7 +829,8 @@ class HealingCasesRepository:
             f"""
             SELECT c.id, c.repo, c.title, c.signature_id, c.signature, c.tracker, c.tracker_key,
                    c.tracker_url, c.stage, c.merge_sha, c.merged_at, c.deployed_at,
-                   c.deploy_sha, c.deploy_marker_at, c.healed_verdict, c.occurrence_count
+                   c.deploy_sha, c.deploy_marker_at, c.healed_verdict, c.occurrence_count,
+                   {_REOPENS} AS reopens
               FROM healing_cases c
              WHERE c.healed_verdict = 'pending'
                AND {_FIX_DEPLOYED}
@@ -834,6 +838,36 @@ class HealingCasesRepository:
              ORDER BY c.deployed_at, c.id
              LIMIT $2
             """,  # noqa: S608 - _FIX_DEPLOYED is a module constant, never input
+            repo,
+            limit,
+        )
+        return [dict(r) for r in rows]
+
+    async def not_healed_awaiting_retry(
+        self, *, max_reopens: int, repo: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Cases whose fix was judged ``not_healed`` and that may still be
+        reopened for another attempt (#451).
+
+        A case qualifies while it sits at ``verified`` with that verdict and
+        has been reopened fewer than ``max_reopens`` times. Counted from the
+        case's own history, so a restart does not refill the budget. A case
+        past the budget is left where it is: the verdict that spent it said so
+        in its evidence (``ConfirmHealedSweep``).
+        """
+        rows = await self._db.fetch(
+            f"""
+            SELECT c.id, c.repo, c.title, c.tracker, c.tracker_key, c.deploy_sha,
+                   c.deploy_marker_at, c.deployed_at, {_REOPENS} AS reopens
+              FROM healing_cases c
+             WHERE c.stage = 'verified'
+               AND c.healed_verdict = 'not_healed'
+               AND {_REOPENS} < $1
+               AND ($2::text IS NULL OR c.repo = $2)
+             ORDER BY c.verdict_checked_at, c.id
+             LIMIT $3
+            """,  # noqa: S608 - _REOPENS is a module constant, never input
+            max_reopens,
             repo,
             limit,
         )

@@ -9,6 +9,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from embry0.api.schemas.repo_path import validate_repo_path
+from embry0.execution.auth_provider import env_override_refusal
 from embry0.execution.profile_isolation import ISOLATION_FIELDS, field_problem
 
 # Slash-separated alnum + . _ - : segments. Colon allowed for ISO timestamps in
@@ -231,6 +232,10 @@ class JobResponse(BaseModel):
     job_kind: str | None = None
     result_summary: str | None = None
     cost_breakdown: list[dict[str, Any]] = Field(default_factory=list)
+    # #307: when an orchestrator shutdown last stopped this job (cleared once
+    # boot resumed it), and how many times boot recovered it after a crash.
+    interrupted_at: datetime | None = None
+    resume_attempts: int = 0
 
 
 class JobListResponse(BaseModel):
@@ -277,6 +282,17 @@ class SandboxProfileRequest(BaseModel):
                 ipaddress.ip_address(ip)
             except ValueError as exc:
                 raise ValueError(f"extra_hosts: value for {host!r} must be an IP literal, got {ip!r}") from exc
+        return v
+
+    @field_validator("env_defaults")
+    @classmethod
+    def _env_defaults_not_reserved(cls, v: dict[str, str]) -> dict[str, str]:
+        # #544: the env-var API's check. SandboxManager.create drops a refused
+        # key from stored rows too, but silently — refuse it here with a 422.
+        for key, value in v.items():
+            refusal = env_override_refusal(key, value)
+            if refusal is not None:
+                raise ValueError(f"env_defaults: {refusal}")
         return v
 
     # #553: the isolation fields take only the safe defaults. SandboxManager.create
@@ -353,22 +369,38 @@ class AgentUpdateRequest(BaseModel):
 # --- Pipeline Templates ---
 
 
-class TemplateCreateRequest(BaseModel):
+class _TemplateWriteRequest(BaseModel):
+    """#468: a template carries its models on its steps, not in a side map.
+
+    ``agent_models`` used to be accepted and stored, and nothing read it. A
+    request that still sends it is refused rather than silently ignored.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_agent_models(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "agent_models" in data:
+            raise ValueError(
+                "agent_models is not a template field: set the model on the step's config.model "
+                "in graph_definition, or per job with POST /jobs agent_models"
+            )
+        return data
+
+
+class TemplateCreateRequest(_TemplateWriteRequest):
     name: str = Field(..., min_length=1, max_length=100)
     description: str = ""
     graph_definition: dict[str, Any]
-    agent_models: dict[str, str] = Field(default_factory=dict)
     sandbox_profile: str | None = None
     # RAV-601: at most one template per kind is that kind's default route
     # (DB partial unique index enforces the at-most-one).
     default_for_kind: str | None = Field(default=None, pattern="^(code|research|analysis|ops)$")
 
 
-class TemplateUpdateRequest(BaseModel):
+class TemplateUpdateRequest(_TemplateWriteRequest):
     name: str | None = None
     description: str | None = None
     graph_definition: dict[str, Any] | None = None
-    agent_models: dict[str, str] | None = None
     sandbox_profile: str | None = None
     default_for_kind: str | None = Field(default=None, pattern="^(code|research|analysis|ops)$")
 

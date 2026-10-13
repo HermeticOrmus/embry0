@@ -16,7 +16,7 @@ from typing import Any
 
 import httpx
 
-# Hosted-endpoint auth (embry0_mcp.http): the middleware stashes the MCP
+# Hosted-endpoint auth (embry0.mcp_server.http): the middleware stashes the MCP
 # caller's own bearer here per request; when set it OVERRIDES the env key so
 # the orchestrator enforces the caller's key and scope, not the service's.
 # Unset (stdio transport), the env-configured key applies as before.
@@ -24,7 +24,7 @@ caller_bearer: ContextVar[str | None] = ContextVar("embry0_caller_bearer", defau
 
 DEFAULT_API_URL = "http://localhost:8200"
 
-TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled", "partial", "expired"})
+TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled", "partial", "expired", "skipped"})
 
 _SECRET_MASK = "****"
 
@@ -68,8 +68,8 @@ _REPO_PATH_ERROR = "repo must be 'group/name' or 'group/subgroup/name'"
 def _repo_path(repo: str) -> str:
     r"""Validate a repo path and return it verbatim for use in a URL.
 
-    embry0_mcp ships standalone (it must never import embry0), so the rule of
-    embry0/api/schemas/repo_path.py — the source of truth — is restated here
+    embry0.mcp_server is a thin HTTP client that imports nothing else from
+    embry0, so the rule of embry0/api/schemas/repo_path.py — the source of truth — is restated here
     verbatim, ``\Z`` anchor included, so a trailing newline cannot slip into a
     URL. Two or more segments: the orchestrator's /repos routes are
     ``{full_repo:path}`` catch-alls, so a GitLab subgroup path goes through
@@ -261,7 +261,20 @@ class Embry0Client:
         return _as_dict(await self._request("POST", f"/api/v1/jobs/{job_id}/cancel"))
 
     async def job_logs(self, job_id: str) -> dict[str, Any]:
-        return _as_dict(await self._request("GET", f"/api/v1/jobs/{job_id}/logs/events"))
+        """The whole pipeline event log, read page by page (the API pages at 500, #203)."""
+        events: list[Any] = []
+        since_seq = 0
+        while True:
+            page = _as_dict(
+                await self._request(
+                    "GET", f"/api/v1/jobs/{job_id}/logs/events", params={"since_seq": since_seq, "limit": 1000}
+                )
+            )
+            events.extend(page.get("events") or [])
+            next_seq = page.get("next_since_seq")
+            if not page.get("has_more") or not isinstance(next_seq, int) or next_seq <= since_seq:
+                return {"events": events}
+            since_seq = next_seq
 
     async def job_deliverables(self, job_id: str) -> list[dict[str, Any]]:
         rows = _as_list(await self._request("GET", f"/api/v1/jobs/{job_id}/deliverables"))

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -51,6 +52,17 @@ class FakeLinear:
         self.comments: list[str] = []
         self.fail: set[str] = set()
         self.after_add: Callable[[], Awaitable[None]] | None = None
+        # Linear's issue history: one entry per label add, newest first (#462).
+        self.history: list[dict[str, Any]] = []
+
+    def apply_label_by_hand(self) -> None:
+        """A person takes the trigger label off and puts it back, now."""
+        self.labels = [label for label in self.labels if label["id"] != LABEL_ID]
+        self.labels.append({"id": LABEL_ID, "name": self.trigger_label})
+        self._record_add()
+
+    def _record_add(self) -> None:
+        self.history.insert(0, {"createdAt": datetime.now(UTC).isoformat(), "addedLabelIds": [LABEL_ID]})
 
     @property
     def labelled(self) -> bool:
@@ -74,12 +86,25 @@ class FakeLinear:
         query, variables = payload["query"], payload["variables"]
         op = next(
             name
-            for name in ("issueAddLabel", "issueRemoveLabel", "commentCreate", "issueLabels", "IssueForTrigger")
+            for name in (
+                "IssueLabelHistory",
+                "issueAddLabel",
+                "issueRemoveLabel",
+                "commentCreate",
+                "issueLabels",
+                "IssueForTrigger",
+            )
             if name in query
         )
         self.ops.append(op)
         if op in self.fail:
             return httpx.Response(200, json={"errors": [{"message": f"{op} refused by the fake"}]})
+        if op == "IssueLabelHistory":
+            issue = {
+                "labels": {"nodes": [dict(label) for label in self.labels]},
+                "history": {"nodes": list(self.history), "pageInfo": {"hasNextPage": False, "endCursor": None}},
+            }
+            return httpx.Response(200, json={"data": {"issue": issue}})
         if op == "IssueForTrigger":
             assert variables["id"] in (KEY, NATIVE_ID), variables
             return httpx.Response(200, json={"data": {"issue": self._issue()}})
@@ -108,6 +133,7 @@ class FakeLinear:
             assert variables == {"id": NATIVE_ID, "labelId": LABEL_ID}, variables
             self.mutations.append(("add", variables["id"], variables["labelId"]))
             self.labels.append({"id": LABEL_ID, "name": self.trigger_label})
+            self._record_add()
             if self.after_add is not None:
                 hook, self.after_add = self.after_add, None
                 await hook()
@@ -145,6 +171,9 @@ async def wired(api_client: AsyncClient, monkeypatch: pytest.MonkeyPatch) -> dic
         "TRUNCATE TABLE healing_cases, issues, jobs, watcher_stacks, tracker_dispatch_notices,"
         " tracker_dispatch_failures CASCADE"
     )
+    # A dispatch to an unregistered repo is refused (#360): the stack's repo is registered.
+    await app.state.db.execute("TRUNCATE TABLE repos CASCADE")
+    await app.state.repos_repo.register(REPO, forge="github")
     stacks = WatcherStacksRepository(app.state.db)
     await stacks.upsert(WatcherStack(repo=REPO, logql='{compose_project="x"}', tracker="linear"))
     app.state.watcher_stacks_repo = stacks
@@ -290,9 +319,31 @@ async def test_that_webhook_is_not_a_retry_request_when_the_job_has_already_fail
     assert [job["job_id"] for job in await _jobs(app)] == [accepted["job_id"]]
 
     # A person now takes the label off and puts it back: that one is a retry.
+    linear.apply_label_by_hand()
     retry = await api_client.post("/api/v1/webhook/linear", json=linear.label_webhook())
     assert retry.json().get("action") == "dispatched", retry.json()
     assert len(await _jobs(app)) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_redelivered_label_webhook_after_the_job_failed_is_not_a_retry(
+    api_client: AsyncClient, wired: dict[str, Any]
+) -> None:
+    """#462: Linear redelivers the label-add that started the job, after the
+    job failed. Nobody re-applied the label, so nothing may dispatch."""
+    linear: FakeLinear = wired["linear"]
+    app = wired["app"]
+    accepted = await _accept(api_client, await _draft(wired["cases"]))
+    await _fail_the_job(app, accepted)
+    echo = await api_client.post("/api/v1/webhook/linear", json=linear.label_webhook())
+    assert echo.json().get("skip") == "own_label", echo.json()
+
+    redelivered = await api_client.post("/api/v1/webhook/linear", json=linear.label_webhook())
+
+    assert redelivered.json().get("action") != "dispatched", (
+        f"a redelivery of the original label-add was read as a retry request: {redelivered.json()}"
+    )
+    assert [job["job_id"] for job in await _jobs(app)] == [accepted["job_id"]]
 
 
 @pytest.mark.asyncio
@@ -305,6 +356,7 @@ async def test_the_expectation_of_that_webhook_expires(api_client: AsyncClient, 
     assert set(linear_sync._OWN_LABELS) == {KEY, NATIVE_ID}
     for ticket_id in linear_sync._OWN_LABELS:
         linear_sync._OWN_LABELS[ticket_id] -= linear_sync._OWN_LABEL_ECHO_SECONDS
+    linear.apply_label_by_hand()
 
     relabel = await api_client.post("/api/v1/webhook/linear", json=linear.label_webhook())
 
@@ -460,6 +512,8 @@ async def test_a_ticket_that_resolves_to_another_repo_is_refused_untouched(
     the stack's. A job run elsewhere would never be linked to this case."""
     linear: FakeLinear = wired["linear"]
     linear.stamp = "acme/frontend"
+    # Registered, so the refusal is about the mismatch, not the registry (#360).
+    await wired["app"].state.repos_repo.register("acme/frontend", forge="github")
     case_id = await _draft(wired["cases"])
 
     r = await api_client.post(f"/api/v1/cases/{case_id}/accept", json={})

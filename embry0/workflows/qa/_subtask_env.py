@@ -1,7 +1,7 @@
 """Shared sandbox-env builder for QA pipelines.
 
-Both single-app (init_qa_node) and multi-app (acquire_sandbox_node) sandbox
-allocation uses the same env shape:
+QA sandbox allocation (init_orchestrator_node, acquire_sandbox_node) and the
+onboarding smoke boot use the same env shape:
 
   - User-supplied env vars (filtered for safety via _filter_user_env_for_sandbox)
   - EMBRY0_GIT_PROXY_URL (if proxy is configured)

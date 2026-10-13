@@ -6,10 +6,26 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from embry0.api.deps import get_templates_repo
 from embry0.api.schemas import TemplateCreateRequest, TemplateDuplicateRequest, TemplateUpdateRequest
+from embry0.services.model_enablement import UnpricedModelError, ensure_models_priced
 from embry0.storage.repositories.pipeline_templates import PipelineTemplatesRepository
 from embry0.workflows._validation import validate_graph_definition
 
 router = APIRouter()
+
+
+def _reject_unpriced(graph: dict[str, Any] | None) -> None:
+    """#219: a template's models — one per step, on ``config.model`` (#468) — must not run unmetered.
+
+    Save-time only: ``validate_graph_definition`` also runs in plan_route, where
+    a problem silently skips the template, and the resolver refuses an unpriced
+    model at run time anyway.
+    """
+    nodes = (graph or {}).get("nodes") or []
+    step_models = [str(n["config"].get("model") or "") for n in nodes if isinstance(n.get("config"), dict)]
+    try:
+        ensure_models_priced(step_models)
+    except UnpricedModelError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/pipelines/templates")
@@ -40,11 +56,11 @@ async def create_template(
     problems = validate_graph_definition(req.name, req.graph_definition)
     if problems:
         raise HTTPException(status_code=422, detail="; ".join(problems))
+    _reject_unpriced(req.graph_definition)
     return await repo.create(
         name=req.name,
         description=req.description,
         graph_definition=req.graph_definition,
-        agent_models=req.agent_models,
         sandbox_profile=req.sandbox_profile,
         default_for_kind=req.default_for_kind,
     )
@@ -66,6 +82,7 @@ async def update_template(
         problems = validate_graph_definition(str(template_id), updates["graph_definition"])
         if problems:
             raise HTTPException(status_code=422, detail="; ".join(problems))
+    _reject_unpriced(updates.get("graph_definition"))
     return await repo.update(template_id, **updates)
 
 

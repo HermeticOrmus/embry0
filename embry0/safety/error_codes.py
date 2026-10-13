@@ -25,8 +25,10 @@ class ErrorCode(StrEnum):
     BUDGET_OVERRUN = "ERR_BUDGET_OVERRUN"  # Hard budget cap hit
     BUDGET_REFUSED = "ERR_BUDGET_REFUSED"  # the dispatch gate refused the job before any agent ran (daily/monthly cap or per-actor rate limit, #331) — distinct from BUDGET_OVERRUN, where the job ran, spent money and was hard-stopped in-run; only a refusal is exempt from rate-limit and attempt counts (embry0/storage/repositories/gate_refusal.py)
     MAX_RETRIES = "ERR_MAX_RETRIES"  # Reviewer rejected past max_feedback_loops
-    TRIAGE_MALFORMED = "ERR_TRIAGE_MALFORMED"  # Triage LLM output failed schema validation
+    TRIAGE_MALFORMED = "ERR_TRIAGE_MALFORMED"  # Triage output unusable after one repair retry (#455)
     ORPHANED = "ERR_ORPHANED"  # Orchestrator restart with in-flight job
+    INTERRUPTED_BY_SHUTDOWN = "ERR_INTERRUPTED_BY_SHUTDOWN"  # an orchestrator shutdown (deploy, restart) stopped the job and boot could not resume it — a QA or onboard job, or one with no checkpoint or launch record (#307)
+    RESUME_LIMIT = "ERR_RESUME_LIMIT"  # the job was already recovered MAX_RESUME_ATTEMPTS times after unclean orchestrator stops; it may be what takes the orchestrator down, so boot fails it instead of resuming it again (#307)
     WORKFLOW_UNKNOWN = "ERR_WORKFLOW_UNKNOWN"  # Referenced workflow not in registry
     SANDBOX_INIT = "ERR_SANDBOX_INIT"  # Sandbox container setup failed
     SANDBOX_GONE = (
@@ -64,6 +66,11 @@ class ErrorCode(StrEnum):
     # #304 — sandbox runner config transport
     SANDBOX_IMAGE_STALE = "ERR_SANDBOX_IMAGE_STALE"  # the sandbox image's runner predates --config-stdin AND the agent config is too large for the argv fallback — rebuild the named image (prebaked QA / profile images are not covered by the standard deploy recipe)
     SANDBOX_EXEC_STALLED = "ERR_SANDBOX_EXEC_STALLED"  # docker exec never read the agent config from stdin within the hand-off window (wedged exec / daemon); the runner was killed before any agent work
+    # #305 — the duplicate-PR check fails closed
+    PR_LISTING_FAILED = "ERR_PR_LISTING_FAILED"  # the forge could not list the repo's open pull requests before the job started, so the duplicate-PR check could not run; the job stops instead of risking a second PR for the same ticket
+
+    # #354 — the runner died before its first event
+    SANDBOX_AGENT_START_FAILED = "ERR_SANDBOX_AGENT_START_FAILED"  # the sandbox could not start the agent: the runner exited non-zero without writing one stdout line, with a Python traceback / import failure on stderr (a missing or inconsistent baked module, a bad interpreter invocation) — distinct from AGENT_NO_RESULT, where the agent ran and returned nothing. The redacted stderr tail is on the run's trace row
 
     # spec 2026-09-29 — credential registry
     CREDENTIAL_MISSING = "ERR_CREDENTIAL_MISSING"  # no binding, no pool member and no env value for the role/provider; raised before a sandbox exists
@@ -84,7 +91,7 @@ class ErrorCode(StrEnum):
     EMPTY_INTERRUPT = "ERR_EMPTY_INTERRUPT"  # an ask_user interrupt was reached with zero questions (upstream routing bug) — failed loudly instead of pausing on nothing
 
     # Spec 1A §3.8 — fail loud on an unregistered repo
-    REPO_UNREGISTERED = "ERR_REPO_UNREGISTERED"  # a job named a repo with no `repos` row while DEFAULT_FORGE is empty — failed at dispatch, before any sandbox, rather than cloning from the wrong forge
+    REPO_UNREGISTERED = "ERR_REPO_UNREGISTERED"  # a dispatch named a repo with no `repos` row under any REPO_RENAMES spelling — refused before any job (#360); with DEFAULT_FORGE empty also a job reaching a sandbox for such a repo, rather than cloning from the wrong forge
 
     # #281 — failure taxonomy. Each of these was a cluster hiding inside
     # ERR_UNKNOWN (or a NULL code) in the 2026-09-20 audit.
@@ -158,6 +165,8 @@ ERROR_CATEGORIES: dict[ErrorCode, FailureCategory] = {
     ErrorCode.MAX_RETRIES: _C.VERIFICATION,
     ErrorCode.TRIAGE_MALFORMED: _C.AGENT,
     ErrorCode.ORPHANED: _C.INFRA,
+    ErrorCode.INTERRUPTED_BY_SHUTDOWN: _C.INFRA,
+    ErrorCode.RESUME_LIMIT: _C.INFRA,
     ErrorCode.WORKFLOW_UNKNOWN: _C.CONFIG,
     ErrorCode.SANDBOX_INIT: _C.INFRA,
     ErrorCode.SANDBOX_GONE: _C.INFRA,
@@ -191,6 +200,8 @@ ERROR_CATEGORIES: dict[ErrorCode, FailureCategory] = {
     ErrorCode.TRIAGE_QA_ACTION_INVALID: _C.AGENT,
     ErrorCode.SANDBOX_IMAGE_STALE: _C.INFRA,
     ErrorCode.SANDBOX_EXEC_STALLED: _C.INFRA,
+    ErrorCode.SANDBOX_AGENT_START_FAILED: _C.INFRA,
+    ErrorCode.PR_LISTING_FAILED: _C.INFRA,
     ErrorCode.DISPATCH_FAILED: _C.INFRA,
     ErrorCode.DEV_BRANCH_NOT_PUSHED: _C.AGENT,
     ErrorCode.EMPTY_INTERRUPT: _C.INFRA,
@@ -273,6 +284,11 @@ def failure_categories(code_counts: Iterable[tuple[str | None, int]]) -> dict[st
 # orchestration layer (and without import cycles). ORDER MATTERS — subclasses
 # before their bases.
 _EXCEPTION_CODES: tuple[tuple[str, ErrorCode], ...] = (
+    # #307: neither is a failure path's to see (ShutdownInterrupt is a
+    # BaseException, ExecutorDraining refuses a resume), but if one ever
+    # reaches a job row it says what happened.
+    ("embry0.orchestration.restart:ShutdownInterrupt", ErrorCode.INTERRUPTED_BY_SHUTDOWN),
+    ("embry0.orchestration.restart:ExecutorDraining", ErrorCode.INTERRUPTED_BY_SHUTDOWN),
     ("embry0.orchestration.budget:BudgetOverrunError", ErrorCode.BUDGET_OVERRUN),
     ("embry0.storage.repositories.repos:UnregisteredRepoError", ErrorCode.REPO_UNREGISTERED),
     ("embry0.storage.repositories.jobs:StatusTransitionConflict", ErrorCode.JOB_STATE_CONFLICT),
@@ -303,6 +319,9 @@ _EXCEPTION_CODES: tuple[tuple[str, ErrorCode], ...] = (
     ("embry0.cache.image_builder:ImageBuildError", ErrorCode.SANDBOX_IMAGE_BUILD),
     ("embry0.cache.lockfile_hash:LockfileNotFoundError", ErrorCode.SANDBOX_IMAGE_BUILD),
     ("embry0.services.model_enablement:DisabledModelError", ErrorCode.MODEL_DISABLED),
+    ("embry0.services.github_prs:OpenPRListError", ErrorCode.PR_LISTING_FAILED),
+    # #219: a provider model with no price entry would run unmetered.
+    ("embry0.services.model_enablement:UnpricedModelError", ErrorCode.INVALID_CONFIG),
     # Third-party / stdlib failures that reached a job row in production.
     ("langgraph.errors:InvalidUpdateError", ErrorCode.STATE_CONCURRENT_UPDATE),
     ("langgraph.errors:GraphRecursionError", ErrorCode.GRAPH_RECURSION),

@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from embry0.api.deps import request_actor
+from embry0.api.repo_allowlist import enforce_repo_allowlist
 from embry0.api.schemas.repo_path import validate_repo_path
 from embry0.audit.helpers import emit_audit
 from embry0.safety.error_codes import ErrorCode
@@ -42,6 +43,7 @@ class QAImageBuildRequest(BaseModel):
 
 @router.post("/qa/images/build")
 async def build_qa_cache_image(req: QAImageBuildRequest, request: Request) -> dict[str, str]:
+    await enforce_repo_allowlist(request, req.repo, action="build a QA cache image")
     state = request.app.state
     deps = {
         "sandbox_mgr": getattr(state, "sandbox_manager", None),

@@ -5,43 +5,13 @@ import { Button } from "@/components/ui/Button";
 import { X } from "lucide-react";
 import type { EnvVar, EnvVarScope } from "@/lib/types/environment";
 import { createFocusTrap } from "@/lib/focus-trap";
+import { envErrorText } from "./envErrorText";
 
 const QA_KEY_PATTERN = /^QA_[A-Z0-9_]+$/;
-
-// Mirror of embry0/execution/auth_provider.py — keep in sync.
-// Backend will reject these with 422 even if the client doesn't catch them;
-// this list exists for fast UX feedback.
-const RESERVED_ENV_KEYS = new Set([
-  "EMBRY0_GIT_PROXY_URL",
-  "CLAUDE_CODE_OAUTH_TOKEN",
-  "ANTHROPIC_API_KEY",
-  "ANTHROPIC_AUTH_TOKEN",
-  "GITHUB_TOKEN",
-  "QA_JOB_ID",
-  "QA_ATTEMPT_N",
-  "QA_NETWORK_NAME",
-  "DOCKER_HOST",
-  "DOCKER_TLS_VERIFY",
-  "DOCKER_CERT_PATH",
-]);
-
-const RESERVED_ENV_PREFIXES = ["QA_ARTIFACT_", "DOCKER_"] as const;
 
 function validateQaKey(key: string): string | null {
   if (!QA_KEY_PATTERN.test(key)) {
     return `QA test credentials must use keys starting with "QA_" (uppercase letters, digits, underscores). Got: "${key}".`;
-  }
-  return null;
-}
-
-function validateNotReserved(key: string): string | null {
-  if (RESERVED_ENV_KEYS.has(key)) {
-    return `"${key}" is reserved for embry0 infrastructure and cannot be set here.`;
-  }
-  for (const p of RESERVED_ENV_PREFIXES) {
-    if (key.startsWith(p)) {
-      return `Keys starting with "${p}" are reserved for embry0 infrastructure.`;
-    }
   }
   return null;
 }
@@ -53,7 +23,8 @@ interface EnvVarModalProps {
    * QA-section keys are validated against ^QA_[A-Z0-9_]+$ before submit.
    */
   envScope?: EnvVarScope;
-  onSave: (variable: EnvVar) => void;
+  /** Rejects with the API error when the save is refused; the modal shows why. */
+  onSave: (variable: EnvVar) => Promise<void>;
   onClose: () => void;
 }
 
@@ -70,6 +41,7 @@ export function EnvVarModal({ variable, envScope = "app", onSave, onClose }: Env
   const [description, setDescription] = useState(variable?.description ?? "");
   const [required, setRequired] = useState(variable?.required ?? false);
   const [keyError, setKeyError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     setKeyError(null);
@@ -98,7 +70,7 @@ export function EnvVarModal({ variable, envScope = "app", onSave, onClose }: Env
     };
   }, []);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!key.trim()) return;
 
@@ -108,14 +80,6 @@ export function EnvVarModal({ variable, envScope = "app", onSave, onClose }: Env
     // Key problems belong under the Key field, not in a corner toast: the toast
     // lands on top of this dialog's own buttons on short viewports, and sonner
     // holds it there for as long as the pointer rests on it (RAV-1289).
-    if (!isEdit) {
-      const reservedErr = validateNotReserved(trimmedKey);
-      if (reservedErr) {
-        setKeyError(reservedErr);
-        return;
-      }
-    }
-
     if (effectiveScope === "qa" && !isEdit) {
       const err = validateQaKey(trimmedKey);
       if (err) {
@@ -127,17 +91,26 @@ export function EnvVarModal({ variable, envScope = "app", onSave, onClose }: Env
     const finalValue =
       isEdit && varType === "secret" && value === "" ? variable!.value : value;
 
-    onSave({
-      key: trimmedKey,
-      value: finalValue,
-      var_type: varType,
-      description: description.trim(),
-      required,
-      scope: effectiveScope,
-    });
+    // The API's refusal (a reserved key, a value a key may not carry) lands
+    // under the Key field like the checks above.
+    setSaving(true);
+    try {
+      await onSave({
+        key: trimmedKey,
+        value: finalValue,
+        var_type: varType,
+        description: description.trim(),
+        required,
+        scope: effectiveScope,
+      });
+    } catch (err) {
+      setKeyError(envErrorText(err));
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const canSave = key.trim().length > 0 && (isEdit || value.length > 0 || varType === "config");
+  const canSave = !saving && key.trim().length > 0 && (isEdit || value.length > 0 || varType === "config");
 
   return (
     <div

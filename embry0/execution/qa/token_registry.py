@@ -1,8 +1,8 @@
 """In-memory registry mapping sandbox bearer tokens to (job_id, attempt_n).
 
-Lives in `app.state.qa_token_registry`. The QA pipeline's init_qa node
-calls register() after starting the sandbox; the report node calls
-unregister() at attempt end. Survives nothing — tokens are tied to the
+Lives in `app.state.qa_token_registry`. The QA sub-task's acquire_sandbox
+node registers a token after starting the sandbox; its release_sandbox node
+unregisters it at attempt end. Survives nothing — tokens are tied to the
 orchestrator process. Phase 2 will add rebind-on-restart via persisted
 job state.
 """

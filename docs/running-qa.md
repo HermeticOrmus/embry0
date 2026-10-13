@@ -30,7 +30,7 @@ version: 2
 
 defaults:
   mode: dind
-  sandbox_profile: qa-node       # or qa-jvm, qa-python — see /sandboxes
+  sandbox_profile: qa-jvm        # DinD: needs the repo's Docker access grant; see /sandboxes
   ready_checks:
     - http: "http://my-app:8080/healthz"
       expect_status: 200

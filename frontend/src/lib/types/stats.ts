@@ -81,12 +81,14 @@ export interface StatsResponse {
   queued?: number;
   awaiting_input?: number;
   paused?: number;
-  /** Share of jobs that completed OR whose PR merged (#280). */
+  /** Share of jobs that completed OR whose PR merged (#280), over jobs that were not skipped (#474). */
   success_rate: number;
   /** Share of jobs whose own status is a success, whatever became of the PR. Optional for back-compat. */
   job_success_rate?: number;
   job_succeeded?: number;
   cancelled?: number;
+  /** Jobs that ended without work because an open PR already covered the ticket (#474). */
+  skipped?: number;
   delivery?: DeliveryStats;
   total_cost_usd: number;
   failure_categories: Record<string, number>;

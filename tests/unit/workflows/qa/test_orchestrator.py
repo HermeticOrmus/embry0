@@ -232,7 +232,7 @@ async def test_fan_out_isolates_individual_subtask_crashes(monkeypatch):
 
 # ── Task 22: init_orchestrator_node + qa_orchestrator_node ──────────────────
 
-from unittest.mock import AsyncMock, MagicMock  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 
 from embry0.workflows.qa.orchestrator import (  # noqa: E402
     init_orchestrator_node,
@@ -2496,3 +2496,167 @@ async def test_init_orchestrator_fails_loudly_on_an_unregistered_repo():
     outcome = out["qa"]["outcome"]
     assert outcome["overall_status"] == "infra_error"
     assert outcome["failure_summary"].startswith(ErrorCode.REPO_UNREGISTERED)
+
+
+# -------- sandbox_profile job override + the profile recorded (#537) --------
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_node_sandbox_profile_override_reaches_subtasks_and_is_recorded(monkeypatch):
+    """QAJobOverrides.sandbox_profile (stashed at qa["sandbox_profile"])
+    replaces every resolved app's profile, and the profile the sub-tasks
+    ran on is recorded at qa["sandbox_profile_used"] for the jobs row."""
+    from pathlib import Path
+
+    from embry0.workflows.qa.subtask_result_schema import CacheHits, SubTaskResult, SubTaskStatus
+    from embry0.workspace_providers import AffectedSet, WorkspaceApp
+    from embry0.workspace_providers.fakes import FakeWorkspaceProvider
+
+    fake_provider = FakeWorkspaceProvider(
+        apps=[WorkspaceApp("hub", Path("apps/hub"), "@x/hub"), WorkspaceApp("companion", Path("apps/c"), "@x/c")],
+        packages=[],
+        affected_result=AffectedSet(
+            directly_changed=frozenset({"@x/hub", "@x/c"}),
+            cascade_closure=frozenset({"@x/hub", "@x/c"}),
+            apps_to_qa=frozenset({"@x/hub", "@x/c"}),
+        ),
+    )
+    monkeypatch.setattr("embry0.workflows.qa.orchestrator.load_provider", lambda name, root, config: fake_provider)
+
+    seen: list[str] = []
+
+    async def fake_run_subtask(resolved, **kw):
+        seen.append(resolved.sandbox_profile)
+        return SubTaskResult(
+            app_name=resolved.app_name, status=SubTaskStatus.PASSED, duration_ms=10, cache_hits=CacheHits()
+        )
+
+    monkeypatch.setattr("embry0.workflows.qa.orchestrator_helpers.run_subtask", fake_run_subtask)
+
+    def make_state(**qa_extra):
+        return {
+            "job_id": "55555555-5555-5555-5555-555555555555",
+            "repo": "org/repo",
+            "branch_name": "main",
+            "qa": {"qa_yaml_v2_raw": _QA_YAML_V2, "changed_files": ["apps/hub/x.tsx"], **qa_extra},
+        }
+
+    out = await qa_orchestrator_node(make_state(sandbox_profile="qa-custom"), {"configurable": {}})
+    assert out["qa"]["final_status"] == "passed"
+    assert seen == ["qa-custom", "qa-custom"], (
+        f"the job's sandbox_profile override was ignored: sub-tasks ran on {seen}"
+    )
+    assert out["qa"]["sandbox_profile_used"] == "qa-custom"
+
+    # No override: the qa.yaml profile stands and is what gets recorded.
+    seen.clear()
+    out = await qa_orchestrator_node(make_state(), {"configurable": {}})
+    assert seen == ["slim", "slim"]
+    assert out["qa"]["sandbox_profile_used"] == "slim"
+
+
+# -------- the per-job cap covers the QA fan-out (#264) --------
+
+
+def _budget_harness(monkeypatch, *, trace_total: float):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from embry0.workflows.qa.subtask_result_schema import CacheHits, SubTaskResult, SubTaskStatus
+    from embry0.workspace_providers import AffectedSet, WorkspaceApp
+    from embry0.workspace_providers.fakes import FakeWorkspaceProvider
+
+    fake_provider = FakeWorkspaceProvider(
+        apps=[WorkspaceApp("hub", Path("apps/hub"), "@x/hub")],
+        packages=[],
+        affected_result=AffectedSet(
+            directly_changed=frozenset({"@x/hub"}),
+            cascade_closure=frozenset({"@x/hub"}),
+            apps_to_qa=frozenset({"@x/hub"}),
+        ),
+    )
+    monkeypatch.setattr("embry0.workflows.qa.orchestrator.load_provider", lambda name, root, config: fake_provider)
+    seen_configs: list[dict] = []
+
+    async def fake_run_subtask(resolved, **kw):
+        seen_configs.append(kw["config"]["configurable"])
+        return SubTaskResult(
+            app_name=resolved.app_name, status=SubTaskStatus.PASSED, duration_ms=10, cache_hits=CacheHits()
+        )
+
+    monkeypatch.setattr("embry0.workflows.qa.orchestrator_helpers.run_subtask", fake_run_subtask)
+    traces = MagicMock()
+    # $1 before the fan-out (the pre-start check), then the QA agents' bill.
+    calls = iter([1.0])
+    traces.total_cost_for_job = AsyncMock(side_effect=lambda job_id: next(calls, trace_total))
+
+    def config(mode: str) -> dict:
+        settings = SimpleNamespace(budget_overrun_mode=mode, max_budget_usd=0.0, qa_browser_backend_default=None)
+        return {"configurable": {"job_id": "job-qa", "traces_repo": traces, "embry0_config": settings}}
+
+    state = {
+        "job_id": "job-qa",
+        "repo": "org/repo",
+        "branch_name": "main",
+        "total_cost_usd": 1.0,  # state never sees the QA agents' cost
+        "pipeline_config": {"budget_usd": 5.0},
+        "qa": {"qa_yaml_v2_raw": _QA_YAML_V2, "changed_files": ["apps/hub/x.tsx"]},
+    }
+    return state, config, seen_configs
+
+
+@pytest.mark.asyncio
+async def test_a_qa_heavy_job_hits_a_hard_cap(monkeypatch):
+    """#264: $1 in state, $7 in traces after QA, $5 cap — hard mode stops the job."""
+    from embry0.orchestration.budget import BudgetOverrunError
+
+    state, config, seen = _budget_harness(monkeypatch, trace_total=7.0)
+    with pytest.raises(BudgetOverrunError) as excinfo:
+        await qa_orchestrator_node(state, config("hard"))
+    assert excinfo.value.current_cost == pytest.approx(7.0)
+    assert excinfo.value.max_budget == pytest.approx(5.0)
+    assert seen[0]["qa_job_budget"] == {"max_budget_usd": 5.0, "budget_overrun_mode_override": None}
+
+
+@pytest.mark.asyncio
+async def test_a_qa_heavy_job_records_a_soft_overrun(monkeypatch):
+    state, config, _ = _budget_harness(monkeypatch, trace_total=7.0)
+    out = await qa_orchestrator_node(state, config("soft"))
+    assert out.get("budget_overrun_usd") == pytest.approx(2.0), (
+        f"the QA fan-out's spend must reach the job's overrun; got {out.get('budget_overrun_usd')}"
+    )
+    assert out["qa"]["final_status"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_a_qa_run_under_the_cap_records_nothing(monkeypatch):
+    state, config, _ = _budget_harness(monkeypatch, trace_total=3.0)
+    out = await qa_orchestrator_node(state, config("hard"))
+    assert "budget_overrun_usd" not in out
+
+
+@pytest.mark.asyncio
+async def test_no_sub_task_starts_once_a_hard_cap_is_crossed():
+    from embry0.workflows.qa.orchestrator_helpers import fan_out_subtasks
+    from embry0.workflows.qa.qa_yaml_resolve import ResolvedAppConfig
+    from embry0.workflows.qa.subtask_result_schema import SubTaskStatus
+
+    started: list[str] = []
+
+    async def fake_run_subtask(resolved, **kw):  # pragma: no cover - must not run
+        started.append(resolved.app_name)
+
+    resolved = [MagicMock(spec=ResolvedAppConfig, app_name=n, target="managed") for n in ("a", "b")]
+    with patch("embry0.workflows.qa.orchestrator_helpers.run_subtask", fake_run_subtask):
+        results = await fan_out_subtasks(
+            resolved,
+            parent_run_id="job-qa",
+            repo="o/r",
+            branch_name="main",
+            max_concurrent=1,
+            config={"configurable": {}},
+            budget_spent=AsyncMock(return_value=True),
+        )
+    assert started == []
+    assert [r.status for r in results] == [SubTaskStatus.INFRA_FAILURE] * 2
+    assert "budget" in (results[0].failure_summary or "")

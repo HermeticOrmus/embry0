@@ -51,7 +51,6 @@ export interface AppResult {
   status: AppStatus;
   duration_ms: number;
   cache_hits: CacheHits;
-  trace_url: string | null;
   failure_summary: string | null;
   boot_phase?: BootPhaseDetail | null;
 }

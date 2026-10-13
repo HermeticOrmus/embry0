@@ -26,7 +26,6 @@ interface ApiTemplateSummary {
 
 interface ApiTemplate extends ApiTemplateSummary {
   graph_definition: PipelineGraph;
-  agent_models?: Record<string, string>;
 }
 
 function mapSummary(row: ApiTemplateSummary): PipelineTemplateSummary {

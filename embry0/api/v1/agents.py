@@ -6,7 +6,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from embry0.api.deps import get_agent_defs_repo, require_admin
 from embry0.api.schemas import AgentCreateRequest, AgentUpdateRequest
-from embry0.services.model_enablement import DisabledModelError, ensure_models_enabled
+from embry0.services.model_enablement import (
+    DisabledModelError,
+    UnpricedModelError,
+    ensure_models_enabled,
+    ensure_models_priced,
+)
 from embry0.storage.repositories.agent_definitions import AgentDefinitionsRepository
 
 router = APIRouter()
@@ -20,6 +25,11 @@ async def _reject_if_disabled(request: Request, model: str | None) -> None:
     """
     if not model:
         return
+    # #219: an unpriced provider model would run unmetered — never fail-open.
+    try:
+        ensure_models_priced([model])
+    except UnpricedModelError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     provider_repo = getattr(request.app.state, "provider_repo", None)
     if provider_repo is None:
         return

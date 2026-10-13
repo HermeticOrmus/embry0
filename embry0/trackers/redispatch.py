@@ -24,6 +24,9 @@ The rule, evaluated over the embry0 issue row and *all* of its jobs:
 * the embry0 issue must be ``open`` — ``closed`` / ``cancelled`` are never
   resurrected by a label, and any other status means a job owns the issue;
 * with no job at all (a stranded dispatch) the ticket is dispatchable;
+* a latest job ``skipped`` (#474) found an open pull request, not its own,
+  that already covers the ticket: the ticket waits on that PR, and a label
+  does not start another job beside it;
 * otherwise only a latest job in ``failed`` / ``cancelled`` / ``expired``
   qualifies. ``completed`` / ``partial`` / ``pr_closed`` mean work was
   delivered or a human rejected it: a retry is a human decision, taken
@@ -99,6 +102,13 @@ def dispatch_eligibility(issue_row: dict[str, Any], jobs: Sequence[dict[str, Any
     latest = jobs[0]
     if latest.get("status") in REDISPATCHABLE_JOB_STATUSES:
         return DispatchEligibility(True, retry_of=dict(latest))
+    if latest.get("status") == JobStatus.SKIPPED:
+        return DispatchEligibility(
+            False,
+            "existing_pr",
+            f"the latest job `{latest.get('job_id')}` found an open pull request that already covers this ticket",
+            blocking_job=dict(latest),
+        )
     return DispatchEligibility(
         False,
         "work_delivered",

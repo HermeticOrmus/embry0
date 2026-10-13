@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -37,6 +38,11 @@ def _ctx(issues_repo, issue_executor, dashboard_base_url=""):
         issue_executor=issue_executor,
         dashboard_base_url=dashboard_base_url,
     )
+
+
+# When the failed job of the #284 retry tests ended (#462: a relabel counts
+# only if Linear's history dates the label after this).
+_FAILED = {"finished_at": datetime(2026, 9, 20, 10, 0, tzinfo=UTC)}
 
 
 def _service(**kw: Any) -> LinearSyncService:
@@ -114,7 +120,8 @@ async def test_redispatch_writes_the_freshly_resolved_repo_to_the_row(monkeypatc
     issues = _FakeIssues(existing={"id": "iss-old", "status": "open", "repo": "acme/quoting"})
     executor = AsyncMock()
     executor.execute = AsyncMock(return_value="job-new")
-    ctx = _retry_ctx(issues, executor, [{"job_id": "job-old", "status": "failed", "pr_url": None}])
+    ctx = _retry_ctx(issues, executor, [{"job_id": "job-old", "status": "failed", "pr_url": None, **_FAILED}])
+    monkeypatch.setattr(svc, "trigger_label_added_since", AsyncMock(return_value=True))
 
     result = await svc.handle_webhook_event(_relabel_payload(), ctx)
 
@@ -520,12 +527,13 @@ async def test_relabel_after_a_failed_job_dispatches_a_new_job(monkeypatch) -> N
     svc = _service()
     monkeypatch.setattr(svc, "fetch_trigger_issue", AsyncMock(return_value=_ISSUE))
     monkeypatch.setattr(svc, "post_comment", AsyncMock(return_value=True))
+    monkeypatch.setattr(svc, "trigger_label_added_since", AsyncMock(return_value=True))
     issues = _FakeIssues(existing={"id": "iss-old", "status": "open"})
     executor = AsyncMock()
     executor.execute = AsyncMock(return_value="job-2")
 
     result = await svc.handle_webhook_event(
-        _relabel_payload(), _retry_ctx(issues, executor, [{"job_id": "job-1", "status": "failed"}])
+        _relabel_payload(), _retry_ctx(issues, executor, [{"job_id": "job-1", "status": "failed", **_FAILED}])
     )
 
     assert result["action"] == "dispatched" and result["job_id"] == "job-2"
@@ -533,6 +541,45 @@ async def test_relabel_after_a_failed_job_dispatches_a_new_job(monkeypatch) -> N
     assert issues.created is None  # the tracked row is reused, never duplicated
     assert {"issue_id": "iss-old", "status": "triaging"} in issues.updates
     assert executor.execute.call_args.args[0] == "iss-old"
+
+
+async def test_a_redelivered_label_add_after_a_failed_job_is_not_a_retry(monkeypatch) -> None:
+    """#462: the payload adds the label, but Linear's history dates that add
+    before the job ended — a redelivery, or a late first delivery."""
+    svc = _service()
+    monkeypatch.setattr(svc, "fetch_trigger_issue", AsyncMock(return_value=_ISSUE))
+    monkeypatch.setattr(svc, "post_comment", AsyncMock(return_value=True))
+    history = AsyncMock(return_value=False)
+    monkeypatch.setattr(svc, "trigger_label_added_since", history)
+    issues = _FakeIssues(existing={"id": "iss-old", "status": "open"})
+    executor = AsyncMock()
+
+    result = await svc.handle_webhook_event(
+        _relabel_payload(), _retry_ctx(issues, executor, [{"job_id": "job-1", "status": "failed", **_FAILED}])
+    )
+
+    assert result.get("action") != "dispatched", f"a redelivered label-add was read as a retry: {result}"
+    assert result.get("dedupe") == "label_not_reapplied", result
+    executor.execute.assert_not_called()
+    history.assert_awaited_once_with(_ISSUE.native_id, {"embry0"}, _FAILED["finished_at"])
+
+
+async def test_a_failed_job_with_no_end_time_is_never_retried_on_a_payload_alone(monkeypatch) -> None:
+    svc = _service()
+    monkeypatch.setattr(svc, "fetch_trigger_issue", AsyncMock(return_value=_ISSUE))
+    monkeypatch.setattr(svc, "post_comment", AsyncMock(return_value=True))
+    monkeypatch.setattr(svc, "trigger_label_added_since", AsyncMock(return_value=True))
+    executor = AsyncMock()
+
+    result = await svc.handle_webhook_event(
+        _relabel_payload(),
+        _retry_ctx(
+            _FakeIssues(existing={"id": "iss-old", "status": "open"}), executor, [{"job_id": "j", "status": "failed"}]
+        ),
+    )
+
+    assert result.get("dedupe") == "label_not_reapplied", result
+    executor.execute.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -587,10 +634,11 @@ async def test_redispatch_loses_cleanly_to_a_concurrent_status_writer(monkeypatc
             raise StatusTransitionConflict("someone else owns it")
 
     monkeypatch.setattr(issues, "update", _conflicting_update)
+    monkeypatch.setattr(svc, "trigger_label_added_since", AsyncMock(return_value=True))
     executor = AsyncMock()
 
     result = await svc.handle_webhook_event(
-        _relabel_payload(), _retry_ctx(issues, executor, [{"job_id": "job-1", "status": "failed"}])
+        _relabel_payload(), _retry_ctx(issues, executor, [{"job_id": "job-1", "status": "failed", **_FAILED}])
     )
 
     assert result["status"] == "ignored" and result["dedupe"] == "concurrent_dispatch"

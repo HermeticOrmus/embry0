@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from embry0.api.deps import request_actor
+from embry0.api.repo_allowlist import enforce_repo_allowlist, restricted_key_name
 from embry0.audit.helpers import emit_audit
 from embry0.services.merge_approvals import DecisionRefused, MergeApprovalService
 
@@ -70,6 +71,12 @@ async def get_merge_approval(approval_id: str, request: Request) -> dict[str, An
 @router.post(DECIDE_PATH)
 async def decide_merge_approval(approval_id: str, body: DecideBody, request: Request) -> dict[str, Any]:
     service = _service(request)
+    if restricted_key_name(request) is not None:
+        # Only a restricted key pays for the extra read; an unknown id falls
+        # through to decide(), which owns the 404.
+        row = await service.get(approval_id)
+        if row is not None:
+            await enforce_repo_allowlist(request, row.get("repo"), action="decide a merge")
     try:
         result = await service.decide(
             approval_id, decision=body.decision, decided_by=body.decided_by, chat_id=body.chat_id

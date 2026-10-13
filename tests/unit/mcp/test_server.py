@@ -1,8 +1,8 @@
-"""Unit tests for embry0_mcp.server — tool registry, confirm-gates, log tailing."""
+"""Unit tests for embry0.mcp_server.server — tool registry, confirm-gates, log tailing."""
 
 import pytest
 
-from embry0_mcp import server
+from embry0.mcp_server import server
 
 EXPECTED_TOOLS = {
     "health",

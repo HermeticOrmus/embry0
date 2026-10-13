@@ -96,7 +96,7 @@ async def test_a_job_row_lookup_failure_does_not_break_the_emit():
 
 @pytest.mark.asyncio
 async def test_duplicate_pr_skip_payload_carries_the_title_too():
-    """_skip_as_duplicate is the second job.completed emitter — same contract."""
+    """_skip_as_duplicate emits job.skipped (#474) — same title contract."""
     ex = _executor()
     ex._emit_audit = AsyncMock()
     await ex._skip_as_duplicate(
@@ -107,8 +107,10 @@ async def test_duplicate_pr_skip_payload_carries_the_title_too():
         task="feat(tools): add PDF compression\n\nbody...",
     )
     _event, data = ex._webhook_notifier.emit_soon.call_args_list[0].args
-    assert _event == "job.completed"
+    assert _event == "job.skipped"
     assert data["title"] == "feat(tools): add PDF compression"
+    assert data["pr_url"] is None
+    assert data["existing_pr_url"] == "https://github.com/acme/app/pull/7"
 
 
 @pytest.mark.asyncio

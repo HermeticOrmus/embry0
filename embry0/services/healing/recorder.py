@@ -268,6 +268,29 @@ class CaseRecorder:
         case = await self._guard("job_dispatched", write, issue_id=issue_id, job_id=job_id, tracker_key=key)
         return str(case["id"]) if case is not None else None
 
+    async def pr_followup_dispatched(self, *, pr_url: str, job_id: str) -> str | None:
+        """A follow-up job was dispatched from a comment on a PR (#344). It
+        carries the PR but no issue, so ``job_dispatched`` never sees it;
+        link it to the case that owns that PR — whichever job attached the PR
+        first — so the case's job list holds the review-feedback work too.
+        A PR no case owns is a no-op. Returns the case id.
+        """
+        url = normalize_repo_url(pr_url)
+
+        async def write() -> CaseResult | None:
+            case = None
+            for variant in repo_url_variants(pr_url):
+                case = await self._cases.find_by_pr_url(variant)
+                if case is not None:
+                    break
+            if case is None:
+                logger.debug("healing_case_none_for_pr_followup", pr_url=url, job_id=job_id)
+                return None
+            return await self._cases.attach_job(case["id"], job_id, event_key=f"job:{job_id}")
+
+        case = await self._guard("pr_followup_dispatched", write, job_id=job_id, pr_url=url)
+        return str(case["id"]) if case is not None else None
+
     async def job_abandoned(self, *, issue_id: str | None, job_id: str, note: str | None = None) -> str | None:
         """A person chose "abandon" at the retry pause and the job produced no
         PR (#410). Closes the issue's case as ``abandoned``; returns the case id.
@@ -296,11 +319,6 @@ class CaseRecorder:
         orchestrator's fallback). Recorded on the case that already owns that
         PR, else on the issue's case; returns the case id.
 
-        The PR is matched across every spelling of a renamed repo: migration
-        65 rewrote the URL columns that existed then, so the same PR can be
-        stored under the old slug here and the new one elsewhere, and a
-        single-spelling lookup would add a second row for it.
-
         ``opened_at`` is asked of the forge, because later readers use it to
         judge whether an event is stale: a time stamped when the JOB ended
         would be later than the real one and would make a genuine forge event
@@ -311,31 +329,94 @@ class CaseRecorder:
         url = normalize_repo_url(pr_url)
 
         async def write() -> CaseResult | None:
-            case, stored_url = None, None
-            for variant in repo_url_variants(pr_url):
-                found = await self._cases.find_by_pr_url(variant)
-                if found is not None:
-                    case, stored_url = found, variant
-                    break
-            if case is None and issue_id:
-                case = await self._cases.find_by_issue(issue_id)
-            if case is None:
-                return None
-            # Keep the PR under the spelling the ledger already knows it by;
-            # a new row gets the repo's current one.
-            known_url = stored_url or url
-            match = _PR_NUMBER.search(known_url)
-            return await self._cases.attach_pr(
-                case["id"],
-                url=known_url,
-                number=int(match.group(1)) if match else None,
-                job_id=job_id,
-                at=await self._pr_opened_at(url, job_id, job_started_at),
+            return await self._attach_pr(
+                issue_id,
+                pr_url,
+                owner_job_id=job_id,
+                opened_at=lambda: self._pr_opened_at(url, job_id, job_started_at),
                 event_key=f"job-pr:{job_id}",
             )
 
         case = await self._guard("pr_opened", write, issue_id=issue_id, job_id=job_id, pr_url=url)
         return str(case["id"]) if case is not None else None
+
+    async def existing_pr_found(self, *, issue_id: str | None, job_id: str, pr_url: str) -> str | None:
+        """A job found that an open PR it did not open already covers its
+        ticket, and ended skipped (#474). The PR is the case's — it is what
+        will fix the finding — but it has NO owning job, so its merge
+        resolves the case ``out_of_band``: a person (or another system) did
+        that work. Returns the case id.
+
+        Keyed on the skipping job, so a retried call adds nothing; a later
+        ``pr_opened`` for the same PR by a job that really opened it still
+        claims the row (``attach_pr`` fills a missing ``job_id``).
+        """
+        url = normalize_repo_url(pr_url)
+
+        async def opened_at() -> datetime | None:
+            # The forge's open time when it can say; otherwise None ("now"):
+            # this job started after the PR was opened, so it bounds nothing.
+            return cast("datetime | None", await self._pr_times.opened_at(url)) if self._pr_times is not None else None
+
+        async def write() -> CaseResult | None:
+            return await self._attach_pr(
+                issue_id, pr_url, owner_job_id=None, opened_at=opened_at, event_key=f"existing-pr:{job_id}"
+            )
+
+        case = await self._guard("existing_pr_found", write, issue_id=issue_id, job_id=job_id, pr_url=url)
+        return str(case["id"]) if case is not None else None
+
+    async def _attach_pr(
+        self,
+        issue_id: str | None,
+        pr_url: str,
+        *,
+        owner_job_id: str | None,
+        opened_at: Callable[[], Awaitable[datetime | None]],
+        event_key: str,
+    ) -> CaseResult | None:
+        """Attach a PR to the case that already owns it, else the issue's case.
+
+        The PR is matched across every spelling of a renamed repo: migration
+        65 rewrote the URL columns that existed then, so the same PR can be
+        stored under the old slug here and the new one elsewhere, and a
+        single-spelling lookup would add a second row for it.
+        """
+        case, stored_url = None, None
+        for variant in repo_url_variants(pr_url):
+            found = await self._cases.find_by_pr_url(variant)
+            if found is not None:
+                case, stored_url = found, variant
+                break
+        if case is None and issue_id:
+            case = await self._cases.find_by_issue(issue_id)
+        if case is None:
+            return None
+        # Keep the PR under the spelling the ledger already knows it by;
+        # a new row gets the repo's current one.
+        known_url = stored_url or normalize_repo_url(pr_url)
+        match = _PR_NUMBER.search(known_url)
+        return await self._cases.attach_pr(
+            case["id"],
+            url=known_url,
+            number=int(match.group(1)) if match else None,
+            job_id=owner_job_id,
+            # Asked only once a case is found: no forge call for a PR no case wants.
+            at=await opened_at(),
+            event_key=event_key,
+        )
+
+    async def case_origin(self, issue_id: str) -> str | None:
+        """The origin of the case this issue belongs to (``watcher``,
+        ``human``, …), or None — no case, or the ledger could not say. A read,
+        and fail-open like every method here: the caller only uses it to
+        tighten what a job runs (#306)."""
+        try:
+            case = await self._cases.find_by_issue(issue_id)
+        except Exception:
+            logger.error("healing_case_read_failed", action="case_origin", issue_id=issue_id, exc_info=True)
+            return None
+        return str(case["origin"]) if case and case.get("origin") else None
 
     async def _pr_opened_at(self, url: str, job_id: str, job_started_at: datetime | None) -> datetime | None:
         """The forge's open time for this PR, else the best defensible bound."""

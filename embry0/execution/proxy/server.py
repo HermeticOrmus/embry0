@@ -11,6 +11,7 @@ Dispatches to one of the stateless proxy apps based on PROXY_TYPE env:
 - presign -> presign_proxy.create_presign_proxy_app(UPSTREAM_URL)
 - context -> context_proxy.create_context_proxy_app(UPSTREAM_URL, ORCHESTRATOR_API_KEY,
              PROXY_ADMIN_TOKEN, CONTAINER_ALLOWLIST, QUERY_QUOTA)  # RAV-1140
+             (LOG_REDACTION_FIELDS: payload fields its redaction also removes, #294)
 
 Listens on 0.0.0.0:LISTEN_PORT (default depends on proxy type).
 PROXY_ADMIN_TOKEN must be set for credential-injection proxies (git/github/auth)
@@ -34,6 +35,7 @@ from embry0.execution.proxy.minio_proxy import create_minio_proxy_app
 from embry0.execution.proxy.presign_proxy import create_presign_proxy_app
 from embry0.execution.proxy.xai_proxy import create_xai_proxy_app
 from embry0.execution.tls import build_ssl_context
+from embry0.safety.redaction import register_redacted_fields
 
 logger = structlog.get_logger(__name__)
 
@@ -151,6 +153,7 @@ def build_app_from_env() -> web.Application:
             logger.warning("context_proxy_no_api_key")
         allowlist = [c for c in _require_env("CONTAINER_ALLOWLIST").split(",") if c.strip()]
         quota = int(os.environ.get("QUERY_QUOTA", "30"))
+        register_redacted_fields(os.environ.get("LOG_REDACTION_FIELDS", ""))
         return create_context_proxy_app(
             _require_env("UPSTREAM_URL"),
             api_key,

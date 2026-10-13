@@ -32,7 +32,9 @@ So:
 .venv/bin/python -m pytest tests/unit -q
 ```
 
-A clean checkout gives **9 failed, 50 errors** with no test Postgres (`ConnectionRefused`; tests want `TEST_DATABASE_URL`, default `postgresql://embry0:embry0@localhost:5432/embry0_test`). That is the expected floor — anything beyond it is yours. Confirm by running the same suite on `origin/main` and diffing the failure sets.
+A clean checkout with **`TEST_DATABASE_URL` unset** and no Postgres on the default `postgresql://embry0:embry0@localhost:5432/embry0_test` gives **9 failed, 50 errors and about 850 skipped** (`ConnectionRefused`). About 800 of those skips are database tests reporting `PostgreSQL unavailable`: they measured nothing. That is the expected floor for a bare local run — anything beyond it is yours. Confirm by running the same suite on `origin/main` and diffing the failure sets.
+
+**Set `TEST_DATABASE_URL` and an unreachable database fails instead of skipping** (#509, one helper: `tests/fixtures/postgres.py`): pointed at a dead port the run reports about 880 errors and 14 skips, so a misconfigured or slow database can never pass as a green run with the SQL layer silently skipped. Any run that is meant to test SQL, and every CI run, sets it.
 
 **Given a database, the suite is fully green: 9129 passed, 12 skipped, 0 failed** (measured 2026-10-09 on `main` at `226135ec`; the 9 failed, 50 errors floor was re-measured the same day). So those 9 failures and 50 errors are entirely the missing-Postgres condition, not latent breakage — which also means CI (#272) needs a Postgres service container, not test repairs.
 

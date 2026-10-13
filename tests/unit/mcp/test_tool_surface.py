@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from embry0_mcp import server
+from embry0.mcp_server import server
 
 EXPECTED_PARAMETERS: dict[str, list[str]] = {
     "agent_get": ["agent_type: string"],

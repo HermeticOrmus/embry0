@@ -56,6 +56,9 @@ class Principal:
     key_id: str | None = None
     key_name: str | None = None
     email: str | None = None
+    # Repositories this key may start work on; None = unrestricted. Enforced
+    # by embry0.api.repo_allowlist at each route that starts or continues work.
+    allowed_repos: tuple[str, ...] | None = None
 
 
 # RAV-1056 Phase A: per-request session gate against the users table
@@ -101,8 +104,8 @@ async def validate_session_user(app: Any, session: SessionData) -> bool:
 # RAV-1056 Phase B: DB-backed API keys. Cache mirrors the user-gate cache:
 # 30s TTL, busted directly by mint/revoke (single-process deploy).
 _KEY_CACHE_TTL_SECONDS = 30.0
-# key_hash -> (expires, key_id, key_name, scope, user_id, revoked, expired)
-_api_key_cache: dict[str, tuple[float, str, str, str, str | None, bool, bool]] = {}
+# key_hash -> (expires, key_id, key_name, scope, user_id, revoked, expired, allowed_repos)
+_api_key_cache: dict[str, tuple[float, str, str, str, str | None, bool, bool, tuple[str, ...] | None]] = {}
 # user_id -> (expires, disabled, email) — owner gate for owned keys
 _key_owner_cache: dict[str, tuple[float, bool, str]] = {}
 
@@ -133,21 +136,31 @@ async def resolve_bearer_principal(app: Any, token: str) -> Principal | None:
     now = time.monotonic()
     cached = _api_key_cache.get(key_hash)
     if cached and cached[0] > now:
-        _, key_id, key_name, scope, user_id, revoked, expired = cached
+        _, key_id, key_name, scope, user_id, revoked, expired, allowed_repos = cached
     else:
         row = await keys_repo.get_by_hash(key_hash)
         if row is None:
-            _api_key_cache[key_hash] = (now + _KEY_CACHE_TTL_SECONDS, "", "", "", None, True, True)
+            _api_key_cache[key_hash] = (now + _KEY_CACHE_TTL_SECONDS, "", "", "", None, True, True, None)
             return None
         expired = row.expires_at is not None and row.expires_at.timestamp() < time.time()
-        key_id, key_name, scope, user_id, revoked = (
+        key_id, key_name, scope, user_id, revoked, allowed_repos = (
             row.id,
             row.name,
             row.scope,
             row.user_id,
             row.revoked_at is not None,
+            row.allowed_repos,
         )
-        _api_key_cache[key_hash] = (now + _KEY_CACHE_TTL_SECONDS, key_id, key_name, scope, user_id, revoked, expired)
+        _api_key_cache[key_hash] = (
+            now + _KEY_CACHE_TTL_SECONDS,
+            key_id,
+            key_name,
+            scope,
+            user_id,
+            revoked,
+            expired,
+            allowed_repos,
+        )
     if not key_id or revoked or expired:
         return None
 
@@ -170,7 +183,14 @@ async def resolve_bearer_principal(app: Any, token: str) -> Principal | None:
     task = asyncio.create_task(keys_repo.touch_last_used(key_id))
     task.add_done_callback(lambda t: t.exception())
 
-    return Principal(kind="key", tier=_SCOPE_TIER[scope], key_id=key_id, key_name=key_name, email=email or None)
+    return Principal(
+        kind="key",
+        tier=_SCOPE_TIER[scope],
+        key_id=key_id,
+        key_name=key_name,
+        email=email or None,
+        allowed_repos=allowed_repos,
+    )
 
 
 async def _resolve_session_auth(request: Request) -> str | None:
@@ -290,6 +310,39 @@ def request_actor(request: Request) -> str:
 
 # Reusable dependency: requires a valid API key OR an operator+ SSO session.
 require_auth = Depends(_auth_dependency)
+
+
+async def authenticate_stream(request: Request, scope: str, token: str | None) -> None:
+    """Auth for a browser stream: a scoped ``token`` query param, a session or a Bearer header.
+
+    EventSource cannot send an Authorization header, so a stream route also
+    accepts a short-lived token minted for ``scope`` by an authenticated POST
+    (RAV-1060). The API key itself is never accepted from the query string:
+    a URL lands in access logs, history and Referer. Raises 401 otherwise.
+    """
+    from embry0.api.scoped_tokens import signing_material, verify_scoped_token
+
+    config = request.app.state.config
+    # #518: only AUTH_DEV_MODE skips this, never an empty API_KEY.
+    if config.auth_dev_mode:
+        return
+    if token is not None and verify_scoped_token(signing_material(config), scope, token):
+        return
+    # RAV-1069: an SSO session (operator+) authenticates the stream directly —
+    # same-origin EventSource sends the cookie with no header plumbing.
+    # RAV-1056: subject to the users-table gate (disabled / stale epoch).
+    session = request_session(request)
+    if session is not None and session.tier in (TIER_ADMIN, TIER_OPERATOR):
+        if await validate_session_user(request.app, session):
+            return
+    # RAV-1056: any live key (>= read) authenticates the stream.
+    authorization = request.headers.get("authorization", "")
+    if authorization.startswith("Bearer "):
+        principal = await resolve_bearer_principal(request.app, authorization[7:])
+        if principal is not None:
+            return
+    raise HTTPException(status_code=401, detail="Missing or invalid credentials")
+
 
 # Stricter dependency for admin-tier operations.
 require_admin = Depends(_admin_dependency)

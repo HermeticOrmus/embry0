@@ -23,6 +23,7 @@ const TERMINAL_JOB_STATUSES = new Set([
   "expired",
   "pr_merged",
   "pr_closed",
+  "skipped",
 ]);
 
 function physicalOf(node: PipelineGraph["nodes"][number]): string {
@@ -144,7 +145,7 @@ export function deriveNodeStates(
   // interrupted by the terminal transition (same orphan rule the job
   // detail page applies).
   if (jobStatus && TERMINAL_JOB_STATUSES.has(jobStatus)) {
-    const ok = jobStatus === "completed" || jobStatus === "pr_merged";
+    const ok = jobStatus === "completed" || jobStatus === "pr_merged" || jobStatus === "skipped";
     for (const st of Object.values(states)) {
       if (st.state === "running") {
         st.state = ok ? "completed" : "failed";

@@ -20,6 +20,7 @@ import os
 import pytest
 
 from embry0.storage.database import DatabasePool
+from tests.fixtures.postgres import postgres_unavailable
 
 pytestmark = pytest.mark.requires_postgres
 
@@ -31,14 +32,14 @@ async def db_url() -> str:
 
 @pytest.fixture
 async def fresh_db(db_url: str) -> DatabasePool:
-    """A connected pool with a wiped schema. Skips when Postgres is unavailable."""
+    """A connected pool with a wiped schema. Skips when Postgres is unavailable, fails when TEST_DATABASE_URL is set (#509)."""
     import asyncpg
 
     db = DatabasePool(db_url)
     try:
         await db.connect()
     except (OSError, asyncpg.PostgresError) as exc:
-        pytest.skip(f"PostgreSQL unavailable: {exc}")
+        postgres_unavailable(exc)
     async with db.pool.acquire() as conn:
         await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
     yield db

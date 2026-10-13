@@ -5,8 +5,8 @@ upsert that finds an existing comment by COMMENT_MARKER and PATCHes vs POSTs.
 
 Layout:
   - Header line: status banner with run number
-  - Summary table: per-app result, duration, trace link
-  - Per-app collapsibles: failed apps auto-expanded with reason + trace,
+  - Summary table: per-app result, duration, cache
+  - Per-app collapsibles: failed apps auto-expanded with the reason,
     passed/skipped collapsed under one summary
   - Workspace warnings (if any) in a final collapsed section
 """
@@ -69,9 +69,8 @@ def _cache_glyphs(hits: CacheHits) -> str:
 
 
 def _summary_row(r: SubTaskResult) -> str:
-    trace = f"[trace]({r.trace_url})" if r.trace_url else "—"
     cache = _cache_glyphs(r.cache_hits)
-    return f"| apps/{r.app_name} | {_human_status(r.status)} | {_human_duration(r.duration_ms)} | {cache} | {trace} |"
+    return f"| apps/{r.app_name} | {_human_status(r.status)} | {_human_duration(r.duration_ms)} | {cache} |"
 
 
 def _detail_block(r: SubTaskResult, *, expanded: bool) -> str:
@@ -82,8 +81,6 @@ def _detail_block(r: SubTaskResult, *, expanded: bool) -> str:
     if r.failure_summary:
         lines.append(f"**Reason:** {r.failure_summary}")
         lines.append("")
-    if r.trace_url:
-        lines.append(f"**Trace:** {r.trace_url}")
     lines.append("</details>")
     return "\n".join(lines)
 
@@ -127,8 +124,8 @@ def render_qa_comment(
 
     sorted_results = sorted(results, key=lambda r: r.app_name)
 
-    lines.append("| App | Result | Duration | Cache | Trace |")
-    lines.append("|---|---|---:|:---:|:---:|")
+    lines.append("| App | Result | Duration | Cache |")
+    lines.append("|---|---|---:|:---:|")
     for r in sorted_results:
         lines.append(_summary_row(r))
     lines.append("")

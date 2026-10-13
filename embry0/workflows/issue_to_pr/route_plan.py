@@ -149,7 +149,24 @@ def step_template_config(state: dict[str, Any], run_agent_type: str) -> dict[str
     }
     if step_to_runtime.get(step.get("agent_type", "")) != run_agent_type:
         return None
-    cfg = step.get("config") or {}
+    return _config_overrides(step.get("config") or {}, run_agent_type)
+
+
+def triage_template_config(graph_definition: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolver-shaped overrides from a template's ``triage`` node (#468).
+
+    Triage is the template's root but not a route step: it runs before
+    plan_route, so its node config can only apply when the template is known
+    before triage starts — a job that names its template. None when the
+    graph has no triage node or that node sets nothing.
+    """
+    for node in graph_definition.get("nodes", []):
+        if node.get("agent_type") == "triage":
+            return _config_overrides(node.get("config") or {}, "triage")
+    return None
+
+
+def _config_overrides(cfg: dict[str, Any], run_agent_type: str) -> dict[str, Any] | None:
     out: dict[str, Any] = {}
     if cfg.get("model"):
         out["agent_models"] = {run_agent_type: cfg["model"]}

@@ -23,6 +23,7 @@ PAUSED_STATE = {
     "sandbox_container_id": "cid-1",
     "repo": "acme/widgets",
     "case_log_containers": ["widgets-backend"],
+    "branch_name": "embry0/iss-1-fix-widgets",
 }
 
 
@@ -113,8 +114,10 @@ async def test_a_resume_reenrolls_the_sandbox_before_the_graph_runs(resume_value
         "forge": "github",
         "xai_credential_id": "cred-xai",
         "context_scope": ["widgets-backend"],
-        # #521: an issue-to-pr job's sandbox keeps the push right it was created with.
+        # #521: an issue-to-pr job's sandbox keeps the push right it was created with,
+        # #559: for the branch its developer chose.
         "git_push": True,
+        "git_push_branches": ["embry0/iss-1-fix-widgets"],
     }, kwargs
 
 
@@ -212,3 +215,39 @@ async def test_a_resume_restores_the_push_right_of_the_pipeline_that_made_the_sa
 
     assert order[0][0] == "reenroll"
     assert order[0][2]["git_push"] is push, f"{pipeline}: {order[0][2]}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra", "branch"),
+    [
+        ({"branch_name": "embry0/iss-1-fix-widgets"}, "embry0/iss-1-fix-widgets"),
+        ({"branch_name": None, "context": {"type": "git", "ref": "feature/pr-branch"}}, "feature/pr-branch"),
+        ({"branch_name": None, "issue_id": "iss-1", "task": "Fix widgets", "job_id": "job-1a2b3c4d"}, None),
+    ],
+    ids=["chosen", "follow-up", "not-yet-chosen"],
+)
+async def test_a_resume_enrolls_the_one_branch_the_checkpoint_names(extra, branch):
+    """#559: the push branch survives a proxy restart because it is re-derived from the checkpoint.
+
+    Before the developer chooses, the job's own name, never the issue's shared
+    name another job may hold (#478).
+    """
+    order: list[Any] = []
+    ex = _executor(order, state={**PAUSED_STATE, **extra})
+
+    await ex._execute_workflow_stream(Command(resume={"q1": "yes"}), "iss-1", "job-1a2b3c4d")
+
+    expected = branch or "embry0/iss-1-fix-widgets-1a2b3c4d"
+    assert order[0][2]["git_push_branches"] == [expected], order[0][2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pipeline", ["qa", "onboard"])
+async def test_a_read_only_resume_enrolls_no_push_branch(pipeline):
+    order: list[Any] = []
+    ex = _executor(order)
+
+    await ex._execute_workflow_stream(Command(resume={"q1": "yes"}), "iss-1", "job-1", pipeline=pipeline)
+
+    assert order[0][2]["git_push_branches"] == [], order[0][2]

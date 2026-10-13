@@ -560,6 +560,51 @@ async def _record_pr_opened(
     return job_row
 
 
+def _flagged_duplicate_pr(result: dict[str, Any]) -> dict[str, Any] | None:
+    """The open PR triage's ``duplicate_of_pr`` flag names, from the open-PR
+    list the executor put on state. triage_node only routes to
+    ``skipped_duplicate`` after matching the number against that list."""
+    decision = result.get("triage_decision")
+    flag = decision.get("duplicate_of_pr") if isinstance(decision, dict) else None
+    if not isinstance(flag, dict):
+        return None
+    return next((p for p in result.get("open_prs") or [] if p.get("number") == flag.get("pr_number")), None)
+
+
+async def _end_triage_duplicate(self: IssueExecutor, issue_id: str | None, job_id: str, result: dict[str, Any]) -> None:
+    """Triage judged the task a duplicate of an open PR (#474): the job ends
+    ``skipped`` like the executor's pre-graph ticket match, with what triage
+    spent."""
+    duplicate = _flagged_duplicate_pr(result)
+    if duplicate is None:
+        # Cannot happen while triage_node validates the flag; fail loudly
+        # rather than end a job skipped against a PR nobody can name.
+        raise RuntimeError("triage ended the job as a duplicate but its PR is not in the open-PR list")
+    job_row: dict[str, Any] | None = None
+    try:
+        job_row = await self._jobs.get(job_id)
+    except Exception:
+        logger.warning("duplicate_skip_job_fetch_failed", job_id=job_id, exc_info=True)
+    await self._skip_as_duplicate(
+        issue_id,
+        job_id,
+        str(result.get("repo") or (job_row or {}).get("repo") or ""),
+        {**duplicate, "matched_by": "triage"},
+        task=str(result.get("task") or (job_row or {}).get("task") or "") or None,
+        summary=str(result.get("result_summary") or "") or None,
+        total_cost_usd=await resolve_job_total_cost(
+            getattr(self, "_traces", None), job_id, float(result.get("total_cost_usd", 0.0) or 0.0)
+        ),
+        kind=result.get("job_kind") or (job_row or {}).get("job_kind"),
+    )
+    from embry0.orchestration.checkpoint import purge_thread
+
+    try:
+        await purge_thread(self._database_url, job_id)
+    except Exception:
+        logger.warning("checkpoint_purge_on_skip_failed", job_id=job_id, exc_info=True)
+
+
 async def _handle_workflow_result(
     self: IssueExecutor, issue_id: str | None, job_id: str, result: dict[str, Any]
 ) -> None:
@@ -581,6 +626,10 @@ async def _handle_workflow_result(
     if current_stage == "awaiting_input":
         triage_decision = result.get("triage_decision", {})
         await self._handle_needs_info(issue_id, job_id, triage_decision)
+        return
+
+    if current_stage == "skipped_duplicate":
+        await _end_triage_duplicate(self, issue_id, job_id, result)
         return
 
     if action == "split":

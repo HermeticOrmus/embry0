@@ -432,3 +432,48 @@ async def test_a_renamed_pr_of_another_case_is_never_stolen(recorder, service, s
     assert await recorder.pr_opened(issue_id=other_issue, job_id=other_job, pr_url=new) == owner
     assert [p["url"] for p in (await service.get(owner))["prs"]] == [old]
     assert (await service.get(other))["prs"] == []
+
+
+# ---- #306: the case origin a job's issue belongs to -----------------------------
+
+
+async def test_case_origin_reads_the_issues_case(recorder, service, seed):
+    issue_id = await seed.issue("[ENG-60] t")
+    job_id = await seed.job(issue_id)
+    await recorder.job_dispatched(_issue(issue_id, "ENG-60"), job_id)
+    assert await recorder.case_origin(issue_id) == "human"
+    assert await recorder.case_origin(await seed.issue("no case")) is None
+
+
+async def test_case_origin_is_fail_open():
+    cases = MagicMock(find_by_issue=AsyncMock(side_effect=RuntimeError("db down")))
+    assert await CaseRecorder(cases).case_origin("iss-1") is None
+
+
+# ---- #344: PR-comment follow-ups join the case of their PR ----------------------
+
+
+async def test_a_pr_follow_up_joins_the_case_whose_pr_another_job_attached(recorder, service, seed):
+    issue_id = await seed.issue("[ENG-70] t")
+    first = await seed.job(issue_id)
+    case_id = await recorder.job_dispatched(_issue(issue_id, "ENG-70"), first)
+    url = "https://github.com/acme/widgets/pull/70"
+    await recorder.pr_opened(issue_id=issue_id, job_id=first, pr_url=url)
+    follow_up = await seed.job()  # issue-less, as comment dispatch creates it
+
+    assert await recorder.pr_followup_dispatched(pr_url=url, job_id=follow_up) == case_id
+    assert await recorder.pr_followup_dispatched(pr_url=url, job_id=follow_up) == case_id  # idempotent
+
+    case = await service.get(case_id)
+    assert {j["job_id"] for j in case["jobs"]} == {first, follow_up}, "the follow-up job is missing from the case"
+    assert case["stage"] == "pr_open", "linking a follow-up moved the case backwards"
+    assert [p["job_id"] for p in case["prs"]] == [first], "the follow-up took over the PR"
+
+
+async def test_a_follow_up_on_a_pr_with_no_case_records_nothing(recorder, cases_repo, seed):
+    job_id = await seed.job()
+    with structlog.testing.capture_logs() as logs:
+        got = await recorder.pr_followup_dispatched(pr_url="https://github.com/acme/widgets/pull/71", job_id=job_id)
+    assert got is None
+    assert (await cases_repo.list_page())[1] == 0
+    assert [e["log_level"] for e in logs if e["event"] == "healing_case_none_for_pr_followup"] == ["debug"]

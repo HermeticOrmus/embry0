@@ -22,6 +22,7 @@ from embry0.config import Embry0Config
 from embry0.storage.database import DatabasePool
 from embry0.storage.encryption import FernetSecretsProvider
 from embry0.storage.migrations.runner import run_migrations
+from tests.fixtures.postgres import postgres_unavailable
 
 
 @pytest.fixture
@@ -56,7 +57,7 @@ async def api_client() -> AsyncIterator[AsyncClient]:
                 pass
         await sys_conn.close()
     except (OSError, asyncpg.PostgresError) as exc:
-        pytest.skip(f"PostgreSQL unavailable: {exc}")
+        postgres_unavailable(exc)
         return
 
     # Truncate tables touched by API unit tests so each test starts clean,

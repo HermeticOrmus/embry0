@@ -187,3 +187,26 @@ async def test_sessionless_pr_url_candidate_does_not_mask_branch_fallback():
 
     assert out["adopted_session_from"] == "job-original"
     svc._executor._issues.find_by_id_prefix.assert_awaited_once_with("iss-e9077b36")
+
+
+# ---- #344: the follow-up job is linked to the PR's healing case ----
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_is_reported_to_the_case_ledger():
+    svc = _service()
+    svc._case_recorder = MagicMock(pr_followup_dispatched=AsyncMock(return_value="hc-1"))
+    result = await svc.handle_pr_comment(_payload())
+    assert result["dispatched"] is True
+    svc._case_recorder.pr_followup_dispatched.assert_awaited_once_with(
+        pr_url="https://github.com/acme/backend/pull/418", job_id="job-new1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_ledger_failure_never_stops_the_follow_up():
+    svc = _service()
+    svc._case_recorder = MagicMock(pr_followup_dispatched=AsyncMock(side_effect=RuntimeError("ledger down")))
+    result = await svc.handle_pr_comment(_payload())
+    assert result["dispatched"] is True
+    assert svc._executor.dispatched == ["job-new1"]

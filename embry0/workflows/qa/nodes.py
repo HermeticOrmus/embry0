@@ -1,38 +1,24 @@
-"""QA pipeline nodes: init_qa, qa, report, retry.
+"""The QA agent node: ``qa_node`` runs the QA agent inside a prepared sandbox.
 
-Dependency injection: each node reads runtime dependencies from
-``config["configurable"]`` (LangGraph standard ``RunnableConfig`` injection),
-matching the pattern used by ``embry0/workflows/issue_to_pr/nodes.py``.
-
-Phase 1.5 architecture: configurable carries TWO MinIO clients —
-- ``qa_minio_sandbox``: endpoint=minio-proxy:9100, used to mint URLs the
-  sandbox will hit through Docker DNS in DinD.
-- ``qa_minio_internal``: endpoint=minio:9000, used by report_node for direct
-  orchestrator-side uploads.
+Its only caller is the sub-task graph's ``exploratory_qa_node``
+(``subtask_nodes.py``), which hands it a pseudo-state for one app. Runtime
+dependencies come from ``config["configurable"]`` (LangGraph standard
+``RunnableConfig`` injection).
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any
 
-import httpx
 import structlog
 from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
-from langgraph.graph import END
-from langgraph.types import Command
 
-from embry0.safety.error_codes import ErrorCode
-from embry0.workflows.qa._subtask_env import build_qa_sandbox_env
-from embry0.workflows.qa.boot import run_boot_phase
 from embry0.workflows.qa.browser_backends import (
     DEFAULT_BROWSER_BACKEND,
     backend_for,
     with_browser_backend,
 )
-from embry0.workflows.qa.qa_yaml import parse_qa_yaml
-from embry0.workflows.qa.screenshot import take_diagnostic_screenshot
 
 logger = structlog.get_logger(__name__)
 
@@ -65,336 +51,20 @@ _TRANSIENT_AGENT_ERROR_SIGNATURES = (
 
 
 def _is_transient_agent_error(error_message: str) -> bool:
-    """True when an agent failure looks environmental (network/MCP/API blip)."""
+    """True when an agent failure looks environmental (network/MCP/API blip).
+
+    The agent's own wall-clock limit ("Agent timed out after Ns") matches the
+    "timed out" signature but is not a blip: retrying it would spend the
+    whole budget again (#643).
+    """
     msg = (error_message or "").lower()
+    if msg.startswith("agent timed out after"):
+        return False
     return any(sig in msg for sig in _TRANSIENT_AGENT_ERROR_SIGNATURES)
 
 
-async def init_qa_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
-    """Initialize a QA attempt: resolve profile, start sandbox, clone repo,
-    parse qa.yaml, register sandbox token, mint presigned URLs, write job.json.
-
-    Dependencies are read from ``config["configurable"]``:
-      - ``docker``, ``runtime``, ``sandbox_manager``, ``profiles_repo``
-      - ``qa_minio_sandbox``, ``qa_token_registry``
-      - ``proxy_manager`` (optional but required for git auth into private repos)
-
-    On any failure during steps 2-9, all partially-allocated resources
-    (sandbox token registration, sandbox container, qa-net) are rolled back
-    in reverse order before the exception is re-raised.
-    """
-    configurable = (config or {}).get("configurable", {}) if isinstance(config, dict) else {}
-    docker = configurable.get("docker")
-    runtime = configurable.get("runtime")
-    sandbox_mgr = configurable.get("sandbox_manager")
-    profiles_repo = configurable.get("profiles_repo")
-    minio_sandbox = configurable.get("qa_minio_sandbox")
-    token_registry = configurable.get("qa_token_registry")
-    proxy_mgr = configurable.get("proxy_manager")
-
-    if (
-        docker is None
-        or runtime is None
-        or sandbox_mgr is None
-        or profiles_repo is None
-        or minio_sandbox is None
-        or token_registry is None
-    ):
-        raise RuntimeError("init_qa_node missing required dependencies in config['configurable']")
-
-    job_id = state["job_id"]
-    repo = state["repo"]
-    branch = state.get("branch_name") or "main"
-    qa = state.setdefault("qa", {})
-
-    # Spec 3.6: the forge decides the clone origin and the git-proxy
-    # credential host. Resolved before any resource is allocated so an
-    # unregistered repo costs nothing — same failure channel as an unknown
-    # sandbox profile below.
-    from embry0.safety.error_codes import ErrorCode
-    from embry0.services.forge_resolver import resolve_forge
-    from embry0.storage.repositories.repos import UnregisteredRepoError
-
-    gitlab_url = getattr(configurable.get("embry0_config"), "gitlab_url", "") or ""
-    try:
-        forge = await resolve_forge(configurable.get("repos_repo"), repo, job_id=job_id)
-    except UnregisteredRepoError as exc:
-        raise RuntimeError(f"{ErrorCode.REPO_UNREGISTERED}: {exc}") from exc
-
-    attempt_n = len(qa.get("attempts", [])) + 1
-    qa_net = f"qa-net-{job_id}"
-
-    # 1. Resolve sandbox profile.
-    profile_name = qa.get("sandbox_profile_name") or qa.get("qa_yaml_parsed", {}).get("sandbox_profile") or "qa-jvm"
-    if profile_name == "qa-jvm" and not qa.get("sandbox_profile_name") and not qa.get("qa_yaml_parsed"):
-        logger.warning(
-            "qa_profile_fallback_to_default",
-            job_id=job_id,
-            msg="Neither qa.sandbox_profile_name nor qa.qa_yaml_parsed.sandbox_profile set; "
-            "defaulting to 'qa-jvm'. Set sandbox_profile in .embry0/qa.yaml.",
-        )
-    profile = await profiles_repo.get(profile_name)
-    if profile is None:
-        msg = f"qa: sandbox profile {profile_name!r} does not exist"
-        raise RuntimeError(msg)
-
-    is_dind = bool(profile.get("dind_enabled", False))
-
-    # #268: before the qa-net or any sandbox exists.
-    from embry0.workflows.qa.runtime_gate import dind_mode_refusal
-
-    refusal = dind_mode_refusal(runtime, mode=(qa.get("qa_yaml_parsed") or {}).get("mode"), dind_profile=is_dind)
-    if refusal is not None:
-        raise RuntimeError(f"{ErrorCode.INCOHERENT_CONFIG}: {refusal}")
-
-    # Track allocated resources for rollback on failure.
-    container_id: str | None = None
-    sandbox_token: str | None = None
-    qa_net_created = False
-
-    try:
-        # 2. (Mode 2) create per-job network.
-        if is_dind:
-            await runtime.create_network(qa_net, labels={"embry0.qa_job_id": job_id}, timeout=15)
-            qa_net_created = True
-            logger.info("qa_net_created", job_id=job_id, network=qa_net)
-
-        # 3. Build sandbox env (filtered user env + infra vars) and start sandbox.
-        git_proxy_url = getattr(proxy_mgr, "git_proxy_url", "") if proxy_mgr else ""
-        env = build_qa_sandbox_env(
-            user_env_vars=state.get("user_env_vars"),
-            git_proxy_url=git_proxy_url,
-            qa_job_id=job_id,
-            attempt_n=attempt_n,
-            qa_network_name=qa_net,
-        )
-
-        # PR-flow handoff: when this QA run was reached via the issue→PR
-        # graph (review → init_qa), the developer sandbox from init_node
-        # is still alive at sandbox-{job_id}. Sandbox name is derived from
-        # job_id, so sandbox_mgr.create() would hit a "container name in
-        # use" conflict. The dev sandbox has done its job by this point
-        # (developer + review both ran inside it); destroy it before we
-        # spin up the QA sandbox.
-        existing = state.get("sandbox_container_id")
-        if existing:
-            try:
-                await sandbox_mgr.destroy(existing)
-                logger.info("qa_predecessor_sandbox_destroyed", job_id=job_id, container_id=existing)
-            except Exception as exc:
-                logger.warning(
-                    "qa_predecessor_sandbox_destroy_failed",
-                    job_id=job_id,
-                    container_id=existing,
-                    error=str(exc),
-                )
-
-        container_id, sandbox_token = await sandbox_mgr.create(
-            job_id,
-            profile=profile,
-            env=env,
-            repo=repo,
-            forge=forge,
-            llm_providers=tuple(configurable.get("llm_providers") or ()),
-        )
-
-        # 4–5. Network attach, git creds, clone, capture HEAD sha.
-        from embry0.workflows.qa._subtask_prep import (
-            prep_qa_sandbox_clone,
-            prep_qa_sandbox_jobjson,
-        )
-
-        cloned = await prep_qa_sandbox_clone(
-            docker=docker,
-            proxy_mgr=proxy_mgr,
-            container_id=container_id,
-            sandbox_token=sandbox_token,
-            job_id=job_id,
-            repo=repo,
-            branch=branch,
-            is_dind=is_dind,
-            qa_net=qa_net,
-            runtime=runtime,
-            prefs_repo=configurable.get("repo_preferences_repo"),
-            forge=forge,
-            gitlab_url=gitlab_url,
-            forge_credential=(
-                sandbox_mgr.last_forge_credential(container_id)
-                if hasattr(sandbox_mgr, "last_forge_credential")
-                else None
-            ),
-        )
-
-        # 6. Read + parse .embry0/qa.yaml from inside the sandbox.
-        # (Stays here — sub-task acquire_sandbox_node has its own qa.yaml dict
-        # already and does not go through this path.)
-        yaml_text = await docker.run_cmd(
-            docker.build_exec_cmd(container_id, ["cat", "/workspace/.embry0/qa.yaml"]),
-            timeout=10,
-        )
-        qa_yaml = parse_qa_yaml(yaml_text)
-
-        # 7–9. Register token, mint presigned URLs, write job.json.
-        artifact_prefix = f"{job_id}/{attempt_n}/"
-        job_json = {
-            "schema_version": 1,
-            "job_id": job_id,
-            "attempt_n": attempt_n,
-            "mode": qa_yaml.mode,
-            "qa_yaml": qa_yaml.model_dump(),
-            "acceptance_criteria": qa.get("acceptance_criteria") or qa_yaml.acceptance_criteria_template,
-            "changed_files": qa.get("changed_files", []),
-            "frontend_url": qa_yaml.frontend_url,
-            "presign_refresh_url": "http://presign-proxy:9104/api/v1/internal/qa/presign",
-            "sandbox_token": sandbox_token,
-        }
-        await prep_qa_sandbox_jobjson(
-            docker=docker,
-            minio_sandbox=minio_sandbox,
-            token_registry=token_registry,
-            container_id=container_id,
-            sandbox_token=sandbox_token,
-            job_id=job_id,
-            attempt_n=attempt_n,
-            artifact_prefix=artifact_prefix,
-            job_json=job_json,
-        )
-
-        # 10. Update state with the new attempt.
-        qa.setdefault("attempts", []).append(
-            {
-                "attempt_n": attempt_n,
-                "started_at": datetime.now(UTC).isoformat(),
-                "ended_at": None,
-                "sandbox_id": container_id,
-                "qa_net_name": qa_net if is_dind else None,
-                "artifact_prefix": artifact_prefix,
-                "last_phase": None,
-                "exit_reason": None,
-                "result_summary": None,
-                "log_artifact_url": None,
-            }
-        )
-        qa["sandbox_token"] = sandbox_token
-        qa["qa_yaml_raw"] = yaml_text
-        qa["qa_yaml_parsed"] = qa_yaml.model_dump()
-        qa["head_sha"] = cloned.head_sha
-        state["qa"] = qa
-        # run_agent_node (used by qa_node) reads state["sandbox_container_id"] to
-        # know which container to docker exec into. Without this, it would pass
-        # an empty string and the runner would exec on container "" → exit 1.
-        state["sandbox_container_id"] = container_id
-
-        logger.info("init_qa_done", job_id=job_id, attempt_n=attempt_n, sandbox=container_id)
-        return state
-
-    except Exception as exc:
-        logger.error("init_qa_failed", job_id=job_id, error=str(exc), exc_info=True)
-        # Roll back in reverse order of allocation.
-        if sandbox_token:
-            try:
-                token_registry.unregister(sandbox_token)
-            except Exception:
-                logger.warning("init_qa_rollback_token_unregister_failed", exc_info=True)
-        if container_id:
-            try:
-                await sandbox_mgr.destroy(container_id)
-            except Exception:
-                logger.warning("init_qa_rollback_destroy_failed", exc_info=True)
-        if qa_net_created:
-            from embry0.workflows.qa.cleanup import cleanup_qa_resources
-
-            try:
-                await cleanup_qa_resources(runtime, job_id=job_id)
-            except Exception:
-                logger.warning("init_qa_rollback_cleanup_failed", exc_info=True)
-        raise
-
-
-async def boot_qa_node(state: dict[str, Any], config: RunnableConfig) -> Command[Literal["qa", "qa_report"]]:
-    """Backend-owned QA boot phase.
-
-    Runs qa.yaml startup.command in the sandbox, polls ready_checks until all
-    pass, the budget elapses, or startup fails. Routes to qa (success) or
-    qa_report (timeout / startup_failed). On non-success, captures a Playwright
-    screenshot of frontend_url best-effort and uploads to MinIO for operator
-    diagnostics.
-
-    Reads:
-      - state["qa"]["qa_yaml_parsed"]: parsed qa.yaml dict
-      - state["qa"]["attempts"][-1]["sandbox_id"], ["artifact_prefix"]
-      - state["sandbox_container_id"]: fallback container id
-      - config["configurable"]["docker"]: required
-      - config["configurable"]["qa_minio"]: required for screenshot upload
-    """
-    configurable = (config or {}).get("configurable", {}) if isinstance(config, dict) else {}
-    docker = configurable.get("docker")
-    minio = configurable.get("qa_minio")
-
-    if docker is None:
-        raise RuntimeError("boot_qa_node requires docker in config['configurable']")
-
-    qa = state.get("qa") or {}
-    qa_yaml = qa.get("qa_yaml_parsed") or {}
-    attempts = qa.get("attempts") or []
-    last_attempt = attempts[-1] if attempts else {}
-    container_id = state.get("sandbox_container_id") or last_attempt.get("sandbox_id")
-    if not container_id:
-        raise RuntimeError("boot_qa_node: no sandbox container id available in state")
-    artifact_prefix = last_attempt.get("artifact_prefix", f"{state['job_id']}/1/")
-
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=3.0, read=8.0, write=8.0, pool=8.0)) as http:
-        result = await run_boot_phase(
-            qa_yaml=qa_yaml,
-            container_id=container_id,
-            docker=docker,
-            http=http,
-        )
-
-    qa["boot_outcome"] = result.outcome
-    qa["boot_duration_ms"] = result.duration_ms
-    qa["boot_attempts"] = result.attempts
-
-    if result.outcome == "passed":
-        return Command(goto="qa", update={"qa": qa})
-
-    # Timeout or startup_failed — capture diagnostic screenshot best-effort,
-    # via the job's browser backend (#235; legacy v1 documents carry no
-    # browser_backend key -> default backend).
-    frontend_url = qa_yaml.get("frontend_url", "")
-    screenshot_bytes: bytes | None = None
-    if frontend_url:
-        screenshot_bytes = await take_diagnostic_screenshot(
-            docker=docker,
-            container_id=container_id,
-            frontend_url=frontend_url,
-            browser_backend=qa_yaml.get("browser_backend") or DEFAULT_BROWSER_BACKEND,
-        )
-
-    if screenshot_bytes and minio is not None:
-        screenshot_key = f"{artifact_prefix}screenshots/boot-timeout.png"
-        try:
-            await minio.put_object(
-                "qa-artifacts",
-                screenshot_key,
-                screenshot_bytes,
-                content_type="image/png",
-            )
-            qa["boot_diagnostic_screenshot_path"] = screenshot_key
-        except Exception as exc:
-            logger.warning("boot_screenshot_upload_failed", error=str(exc))
-
-    # Stamp the exit_reason on the attempt so report_node + retry_node route correctly.
-    if attempts:
-        attempts[-1]["exit_reason"] = "boot_timeout" if result.outcome == "timeout" else "startup_failed"
-        attempts[-1]["last_phase"] = "boot"
-        qa["attempts"] = attempts
-
-    return Command(goto="qa_report", update={"qa": qa})
-
-
 async def qa_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
-    """Invoke the QA agent inside the sandbox started by init_qa_node.
+    """Invoke the QA agent inside the sandbox started by acquire_sandbox_node.
 
     The agent reads /workspace/.qa/job.json on its own; we just dispatch
     via the standard run_agent_node pipeline with agent_type='qa'.
@@ -602,6 +272,9 @@ async def qa_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, An
         credentials=credentials,
         config=config,
         resume_session=resume_session,
+        # #468: the template's QA step config, set by the issue-to-PR graph's
+        # orchestrate_qa node. Absent for standalone QA (no template).
+        template_config=configurable.get("qa_template_config"),
     )
 
     # Plan C Task 7: capture post-run session state so the next invocation of
@@ -634,8 +307,8 @@ async def qa_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, An
 
     # run_agent_node returns a state-update dict; the agent's outcome is in
     # result["agent_outputs"][-1]. For now we record the basics; richer parsing
-    # of the agent's structured output happens in report_node by reading
-    # /workspace/.qa/result.json.
+    # of the agent's structured output happens in the sub-task's
+    # collect_artifacts_node by reading /workspace/.qa/result.json.
     agent_outputs = result.get("agent_outputs", [])
     if agent_outputs:
         last_output = agent_outputs[-1]
@@ -643,219 +316,21 @@ async def qa_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, An
             last["last_phase"] = None
             err_msg = last_output.get("error_message", "unknown")
             # EMB-34 fix #2: classify obviously-environmental agent failures
-            # as transient so retry_node can grant ONE bounded re-attempt
-            # instead of terminating the run outright.
+            # as transient; the sub-task's exploratory_qa_node then runs the
+            # agent once more (#643).
             reason_prefix = "agent_transient" if _is_transient_agent_error(err_msg) else "agent_error"
             last["exit_reason"] = f"{reason_prefix}: {err_msg[:200]}"
         else:
-            # Agent completed cleanly. report_node will read /workspace/.qa/result.json
-            # to get the actual phase_reached + overall.
-            last["last_phase"] = "report"  # tentative; report_node confirms
+            # Agent completed cleanly. collect_artifacts_node reads
+            # /workspace/.qa/result.json for the actual phase_reached + overall.
+            last["last_phase"] = "report"  # tentative
 
     qa["attempts"][-1] = last
     state["qa"] = qa
     # Merge any state updates run_agent_node returned (e.g. agent_outputs accumulator)
     if "agent_outputs" in result:
         state.setdefault("agent_outputs", []).extend(result["agent_outputs"])
+    # A soft per-job cap crossing: exploratory_qa_node must not retry past it.
+    if result.get("budget_overrun_usd"):
+        state["budget_overrun_usd"] = result["budget_overrun_usd"]
     return state
-
-
-async def report_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
-    """End-of-attempt: capture logs, validate result.json, cleanup.
-
-    Always best-effort: every cleanup step is wrapped in try/except so a
-    failing rollback doesn't mask the result. Runs after qa_node regardless
-    of pass/fail.
-    """
-    from embry0.workflows.qa.cleanup import cleanup_qa_resources
-    from embry0.workflows.qa.result_schema import QAResult
-
-    configurable = (config or {}).get("configurable", {}) if isinstance(config, dict) else {}
-    docker = configurable.get("docker")
-    runtime = configurable.get("runtime")
-    sandbox_mgr = configurable.get("sandbox_manager")
-    minio_internal = configurable.get("qa_minio")
-    token_registry = configurable.get("qa_token_registry")
-
-    if docker is None or runtime is None or sandbox_mgr is None or minio_internal is None or token_registry is None:
-        raise RuntimeError("report_node missing required dependencies in config['configurable']")
-
-    qa = state["qa"]
-    job_id = state["job_id"]
-    last = qa["attempts"][-1]
-    container_id = last["sandbox_id"]
-    artifact_prefix = last["artifact_prefix"]
-    mode = (qa.get("qa_yaml_parsed") or {}).get("mode", "dind")
-
-    # 1. Capture end-of-attempt logs from the sandbox.
-    if mode == "dind":
-        log_cmd = [
-            "bash",
-            "-c",
-            "docker compose --project-name qa_${QA_JOB_ID} logs --no-color --timestamps 2>&1 || true",
-        ]
-    else:
-        log_cmd = [
-            "bash",
-            "-c",
-            "find /workspace/.qa/logs -type f -exec cat {} +; true",
-        ]
-    try:
-        full_log = await docker.run_cmd(docker.build_exec_cmd(container_id, log_cmd), timeout=30)
-    except Exception as exc:
-        logger.warning("qa_log_capture_failed", error=str(exc), exc_info=True)
-        full_log = f"[log capture failed: {exc}]"
-
-    # 2. Upload logs directly via internal SDK (orchestrator holds creds; no presign).
-    log_key = artifact_prefix + "logs/full.log"
-    try:
-        await minio_internal.put_object(
-            "qa-artifacts",
-            log_key,
-            full_log.encode("utf-8"),
-            content_type="text/plain",
-        )
-    except Exception as exc:
-        logger.warning("qa_log_upload_failed", error=str(exc), exc_info=True)
-
-    # 3. Read + validate result.json.
-    result_summary: dict[str, Any] | None = None
-    overall = "inconclusive"
-    try:
-        import json
-
-        result_text = await docker.run_cmd(
-            docker.build_exec_cmd(container_id, ["cat", "/workspace/.qa/result.json"]),
-            timeout=10,
-        )
-        parsed_dict = json.loads(result_text)
-
-        # Backend-owned boot phase: synthesize the result.json `boot` section from
-        # state so the agent never has to fabricate it. Always wins over any value
-        # the agent emitted.
-        qa_state = state.get("qa") or {}
-        if qa_state.get("boot_outcome"):
-            parsed_dict["boot"] = {
-                "command": (qa_state.get("qa_yaml_parsed") or {}).get("startup", {}).get("command", ""),
-                "duration_ms": qa_state.get("boot_duration_ms", 0),
-                "ready_checks": [
-                    {
-                        "url": rc.get("http", ""),
-                        "status": 200 if qa_state["boot_outcome"] == "passed" else 0,
-                        "duration_ms": qa_state.get("boot_duration_ms", 0),
-                    }
-                    for rc in (qa_state.get("qa_yaml_parsed") or {}).get("startup", {}).get("ready_checks", [])
-                ]
-                or [{"url": "<no-checks-configured>", "status": 200, "duration_ms": 0}],
-            }
-
-        result = QAResult.model_validate(parsed_dict)
-        result_summary = result.model_dump(mode="json")
-        overall = result.overall
-    except Exception as exc:
-        logger.warning("qa_result_invalid_or_missing", error=str(exc))
-        if not last.get("exit_reason"):
-            last["exit_reason"] = "result_json_missing"
-
-    # 4. Update attempt + final_status.
-    last["result_summary"] = result_summary
-    last["ended_at"] = datetime.now(UTC).isoformat()
-    last["log_artifact_url"] = f"/api/v1/jobs/{job_id}/artifacts/logs/full.log"
-
-    qa["attempts"][-1] = last
-    if overall == "passed":
-        qa["final_status"] = "passed"
-    elif overall == "failed":
-        qa["final_status"] = "failed"
-    else:
-        qa["final_status"] = qa.get("final_status", "pending")
-
-    # 5. Unregister token + destroy sandbox + cleanup. Each step independently
-    # try/excepted so a single rollback failure doesn't mask the others.
-    # Order matters: sandbox MUST be destroyed BEFORE cleanup_qa_resources runs
-    # `network rm qa-net-<job_id>`. Otherwise the network removal fails because
-    # the still-alive sandbox container is attached as an active endpoint.
-    token = qa.get("sandbox_token")
-    if token:
-        try:
-            token_registry.unregister(token)
-        except Exception as exc:
-            logger.warning("qa_token_unregister_failed", error=str(exc))
-    try:
-        await sandbox_mgr.destroy(container_id)
-    except Exception as exc:
-        logger.warning("qa_sandbox_destroy_failed", error=str(exc))
-    try:
-        await cleanup_qa_resources(runtime, job_id=job_id)
-    except Exception as exc:
-        logger.warning("qa_cleanup_failed", error=str(exc))
-
-    state["qa"] = qa
-    return state
-
-
-async def retry_node(state: dict[str, Any], config: RunnableConfig) -> Command[Any]:
-    """Decide whether to retry the QA attempt or end (Section 6.2).
-
-    - boot_timeout / seed_timeout / infra_error -> auto-retry (bounded)
-    - agent_transient: ...                      -> ONE bounded retry (EMB-34)
-    - agent_error: ...                          -> END (terminal)
-    - idle_timeout                              -> hard-fail (ERR_QA_IDLE)
-    - validation_failed                         -> standalone: END (Phase 5 routes to triage)
-    - total_budget_exceeded                     -> END (Phase 5 routes to triage)
-    - result_json_missing                       -> END (treat as inconclusive)
-    - None (success)                            -> END
-    """
-    qa = state.get("qa") or {}
-    attempts = qa.get("attempts", [])
-    if not attempts:
-        return Command(goto=END, update={"qa": {**qa, "final_status": "exhausted"}})
-
-    last = attempts[-1]
-    reason = last.get("exit_reason")
-    n = len(attempts)
-    max_retries = qa.get("max_qa_retries", 2)
-
-    # Success path — no retry, just end.
-    if reason is None:
-        return Command(goto=END, update={"qa": qa})
-
-    # EMB-34 fix #2: one-shot bounded retry for classified-transient agent
-    # failures (network blip, MCP disconnect, API 5xx). Exactly ONE retry
-    # regardless of max_qa_retries — a second transient in the same run is
-    # treated as a real failure, not bad luck.
-    if isinstance(reason, str) and reason.startswith("agent_transient"):
-        transient_attempts = sum(1 for a in attempts if str(a.get("exit_reason") or "").startswith("agent_transient"))
-        if transient_attempts <= 1 and n <= max_retries:
-            logger.warning(
-                "qa_agent_transient_retry",
-                job_id=state.get("job_id"),
-                exit_reason=reason[:120],
-                attempt_n=n,
-            )
-            return Command(goto="init_qa", update={"qa": qa})
-        qa["final_status"] = "exhausted"
-        qa["error_code"] = ErrorCode.QA_BUDGET_EXHAUSTED.value
-        return Command(goto=END, update={"qa": qa})
-
-    auto_retry_reasons = {"boot_timeout", "seed_timeout", "infra_error"}
-    if reason in auto_retry_reasons and n <= max_retries:
-        # Expand boot budget for boot timeouts: 1.5x then 2x.
-        if reason == "boot_timeout":
-            yaml_parsed = qa.get("qa_yaml_parsed") or {}
-            startup = yaml_parsed.get("startup") or {}
-            base_budget = startup.get("boot_timeout_seconds", 180)
-            multiplier = 1.5 if n == 1 else 2.0
-            qa["next_attempt_boot_timeout"] = int(base_budget * multiplier)
-        return Command(goto="init_qa", update={"qa": qa})
-
-    # Everything else terminates standalone runs.
-    final = "failed" if reason == "validation_failed" else "exhausted"
-    qa["final_status"] = final
-    if n > max_retries and reason in auto_retry_reasons:
-        qa["error_code"] = ErrorCode.QA_BUDGET_EXHAUSTED.value
-    elif reason == "idle_timeout":
-        qa["error_code"] = ErrorCode.QA_IDLE.value
-    elif reason == "result_json_missing":
-        qa["error_code"] = ErrorCode.QA_RESULT_INVALID.value
-    return Command(goto=END, update={"qa": qa})

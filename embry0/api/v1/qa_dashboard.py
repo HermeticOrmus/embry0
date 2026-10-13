@@ -58,7 +58,6 @@ def _to_app_result(row: QAAppResultRow) -> AppResult:
             turbo_remote_hits=list(row.cache_hits.turbo_remote_hits),
             turbo_remote_misses=list(row.cache_hits.turbo_remote_misses),
         ),
-        trace_url=row.trace_url,
         failure_summary=row.failure_summary,
         boot_phase=boot_phase_obj,
     )

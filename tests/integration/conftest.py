@@ -17,6 +17,7 @@ from embry0.config import Embry0Config
 from embry0.storage.database import DatabasePool
 from embry0.storage.encryption import FernetSecretsProvider
 from embry0.storage.migrations.runner import run_migrations
+from tests.fixtures.postgres import postgres_unavailable
 
 
 @pytest.fixture(scope="session")
@@ -51,7 +52,7 @@ async def setup_database(database_url: str) -> AsyncIterator[str]:
         await sys_conn.execute(f"DROP DATABASE IF EXISTS {db_name} WITH (FORCE)")
         await sys_conn.close()
     except (OSError, asyncpg.PostgresError) as exc:
-        pytest.skip(f"PostgreSQL unavailable: {exc}")
+        postgres_unavailable(exc)
 
 
 def _make_test_lifespan(database_url: str):

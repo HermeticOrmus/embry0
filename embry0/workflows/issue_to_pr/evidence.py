@@ -32,7 +32,7 @@ from typing import Any, Protocol
 
 import structlog
 
-from embry0.execution.proxy.log_redaction import redact_bounded, redact_log_text
+from embry0.safety.redaction import redact_bounded, redact_log_text
 
 logger = structlog.get_logger(__name__)
 

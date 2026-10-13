@@ -22,9 +22,10 @@ Mediation, all server-side:
 - an optional per-sandbox container SCOPE (SH-P4.4): a developer job working a healing
   case is enrolled with ``allowed_containers`` — the case's services — and can query only
   those. The scope can narrow the global allowlist, never widen it, and a scope that grants
-  nothing refuses the enrollment (it must not fall back to the full allowlist). Results for
-  a scoped sandbox are redacted line by line; an unscoped enrollment (the watcher's analysis
-  agent) behaves exactly as before — redacting that path is issue #294.
+  nothing refuses the enrollment (it must not fall back to the full allowlist).
+- every result is redacted line by line before it leaves the proxy (#294), scoped or not:
+  the watcher's analysis agent reads the same production lines the developer does, and
+  both hand them to a model provider. A 200 body the proxy cannot parse is withheld.
 
 The proxy holds the orchestrator API key (auth-proxy precedent) and injects it upstream;
 the key never enters the sandbox.
@@ -40,7 +41,7 @@ import structlog
 from aiohttp import web
 
 from embry0.execution.proxy.enrollment import EnrollRejected, check_bearer, register_admin_routes
-from embry0.execution.proxy.log_redaction import redact_bounded
+from embry0.safety.redaction import redact_bounded, redact_log_text, secret_env_values
 
 logger = structlog.get_logger(__name__)
 
@@ -101,10 +102,17 @@ def _redacted_body(content: bytes) -> bytes | None:
         return None
     lines = payload.get("lines")
     if isinstance(lines, list):
+        # The proxy's own secrets (its admin token, the orchestrator key) are
+        # read once per body, not once per line.
+        known = secret_env_values()
+
+        def redact(text: str) -> str:
+            return redact_log_text(text, known)
+
         for entry in lines:
             if isinstance(entry, dict) and isinstance(entry.get("line"), str):
                 raw = entry["line"]
-                entry["line"] = redact_bounded(raw, MAX_REDACTED_LINE_CHARS) + (
+                entry["line"] = redact_bounded(raw, MAX_REDACTED_LINE_CHARS, redact=redact) + (
                     " … [line truncated]" if len(raw) > MAX_REDACTED_LINE_CHARS else ""
                 )
     return json.dumps(payload).encode()
@@ -276,8 +284,8 @@ async def _query_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": "Upstream API timeout"}, status=504)
 
     body = upstream_resp.content
-    if scope is not None and upstream_resp.status_code == 200:
-        # Scoped (developer) sandboxes never receive a raw log line.
+    if upstream_resp.status_code == 200:
+        # No sandbox ever receives a raw log line (#294).
         redacted = _redacted_body(body)
         if redacted is None:
             logger.warning("context_proxy_unredactable_body", sandbox_id=sandbox_id)

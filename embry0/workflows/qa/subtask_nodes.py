@@ -15,6 +15,7 @@ State shape and helpers live in subtask_state.py.
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 from typing import Any
@@ -155,7 +156,7 @@ async def acquire_sandbox_node(state: SubTaskState, config: RunnableConfig) -> d
     # skip git clone inside prep_qa_sandbox_clone.
     shared_volume_name: str | None = state.get("shared_volume_name")
 
-    # Create network for DinD mode (mirrors init_qa_node behavior)
+    # Create network for DinD mode
     if is_dind:
         try:
             await runtime.create_network(qa_net, timeout=10)
@@ -421,8 +422,8 @@ async def boot_app_node(state: SubTaskState, config: RunnableConfig) -> dict[str
             },
         }
 
-    # #238: boot failed — capture the diagnostic screenshot the legacy path
-    # has always taken. Best-effort by contract: any failure here degrades
+    # #238: boot failed — capture a diagnostic screenshot. Best-effort by
+    # contract: any failure here degrades
     # to "boot failure without screenshot", never an infra crash.
     screenshot_key = await _capture_boot_failure_screenshot(
         state, configurable, docker=docker, sandbox_id=sandbox_id, resolved=resolved
@@ -470,10 +471,10 @@ async def _capture_boot_failure_screenshot(
 ) -> str | None:
     """Best-effort boot-failure screenshot for a sub-task (#238).
 
-    Mirrors the legacy boot_qa_node capture: drive the sub-task's browser
-    backend inside the sandbox, upload under the sub-task's artifact prefix
-    at ``screenshots/boot-failure.png`` (the dashboard's latest-screenshot
-    endpoint surfaces anything under ``screenshots/``). Returns the MinIO
+    Drive the sub-task's browser backend inside the sandbox, upload under
+    the sub-task's artifact prefix at ``screenshots/boot-failure.png`` (the
+    dashboard's latest-screenshot endpoint surfaces anything under
+    ``screenshots/``). Returns the MinIO
     key, or None when anything fails — the boot failure must always report,
     with or without the picture.
     """
@@ -711,6 +712,10 @@ async def e2e_node(state: SubTaskState, config: RunnableConfig) -> dict[str, Any
     return {"raw_result": {**state.get("raw_result", {}), "e2e_stdout": out}}
 
 
+# #643 (EMB-34): runs of the QA agent added after an environmental failure.
+_MAX_AGENT_TRANSIENT_RETRIES = 1
+
+
 async def exploratory_qa_node(state: SubTaskState, config: RunnableConfig) -> dict[str, Any]:
     """Invoke the existing qa_node against this sub-task's sandbox.
 
@@ -763,18 +768,54 @@ async def exploratory_qa_node(state: SubTaskState, config: RunnableConfig) -> di
         # handed — forward it or grok-QA jobs silently run the seed model.
         "agent_models_override": state.get("agent_models_override"),
         "agent_outputs": [],
+        # #264: the parent job's per-job cap and overrun mode, so the QA
+        # agent's turn is held to the job's cap rather than the default.
+        **{
+            k: v
+            for k, v in ((config or {}).get("configurable", {}).get("qa_job_budget") or {}).items()
+            if v is not None
+        },
     }
 
-    try:
-        out = await legacy_qa_node(pseudo_state, config)
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "status": SubTaskStatus.INFRA_FAILURE,
-            "failure_summary": f"qa agent crashed: {exc}",
-            "completed_at": time.monotonic(),
-        }
+    agent_outputs: list[dict[str, Any]] = []
+    retries = 0
+    while True:
+        try:
+            # qa_node mutates the state it is given: each run gets a copy.
+            out = await legacy_qa_node(copy.deepcopy(pseudo_state), config)
+        except Exception as exc:  # noqa: BLE001  — includes a hard budget stop
+            return {
+                "status": SubTaskStatus.INFRA_FAILURE,
+                "failure_summary": f"qa agent crashed: {exc}",
+                "completed_at": time.monotonic(),
+            }
+        agent_outputs.extend(out.get("agent_outputs", []) or [])
+        attempts = (out.get("qa") or {}).get("attempts") or [{}]
+        exit_reason = str(attempts[-1].get("exit_reason") or "")
+        # #643 (EMB-34): an environmental failure (network, MCP, API 5xx)
+        # gets exactly one more run; a second one falls through to
+        # collect_artifacts like any agent failure. Never past the job's cap.
+        if (
+            not exit_reason.startswith("agent_transient")
+            or retries >= _MAX_AGENT_TRANSIENT_RETRIES
+            or out.get("budget_overrun_usd")
+        ):
+            break
+        retries += 1
+        logger.warning(
+            "qa_agent_transient_retry",
+            sub_job_id=sub_job_id,
+            app_name=resolved.app_name,
+            exit_reason=exit_reason[:200],
+        )
+        writer = ((config or {}).get("configurable") or {}).get("qa_parent_writer")
+        if writer is not None:
+            writer({"type": "qa_agent_transient_retry", "app": resolved.app_name, "reason": exit_reason[:200]})
 
-    return {"agent_outputs": out.get("agent_outputs", []) or []}
+    update: dict[str, Any] = {"agent_outputs": agent_outputs}
+    if retries:
+        update["agent_transient_retries"] = retries
+    return update
 
 
 def _synthesize_inconclusive_result(state: SubTaskState, reason: str) -> dict[str, Any]:
@@ -835,8 +876,7 @@ async def collect_artifacts_node(state: SubTaskState, config: RunnableConfig) ->
     """Read /workspace/.qa/result.json from the sandbox; produce SubTaskStatus.
 
     Synthesizes the boot section from sub-task state (the agent never writes
-    boot — that's the orchestrator's responsibility, mirroring the legacy
-    report_node behavior).
+    boot — that's the orchestrator's responsibility).
 
     Phase 5A: when boot did NOT pass we still run, just to populate
     ``boot_phase`` for the dashboard drill-down — but we DO NOT touch
@@ -1057,7 +1097,6 @@ async def emit_result_node(state: SubTaskState, config: RunnableConfig) -> dict[
         status=status,
         duration_ms=duration_ms,
         cache_hits=cache_hits,
-        trace_url=state.get("trace_url"),
         failure_summary=failure_summary,
         raw_result=state.get("raw_result", {}) or {},
         # Phase 5A: thread boot_phase through to the orchestrator so it gets

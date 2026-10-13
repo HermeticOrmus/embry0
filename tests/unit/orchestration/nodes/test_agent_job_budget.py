@@ -260,3 +260,68 @@ async def test_hard_budget_abort_outranks_a_runner_error_code() -> None:
         )
 
     assert error_code_for_exception(excinfo.value) == ErrorCode.BUDGET_OVERRUN
+
+
+class _Traces:
+    """Trace rows of one job: QA sub-task turns land here, never in state (#264)."""
+
+    def __init__(self, already: float) -> None:
+        self.sum = already
+
+    async def create(self, **row: Any) -> str:
+        self.sum += row["cost_usd"]
+        return "trc"
+
+    async def total_cost_for_job(self, job_id: str) -> float:
+        return self.sum
+
+
+async def _run_after_qa(mode: str, *, qa_spend: float) -> dict[str, Any]:
+    """A developer turn after a QA round: state holds $1, traces $1 + the QA bill."""
+    config = _config(mode)
+    config["configurable"]["traces_repo"] = _Traces(1.0 + qa_spend)
+    return await run_agent_node(
+        state={"sandbox_container_id": "c1", "total_cost_usd": 1.0, "pipeline_config": {"budget_usd": 10.0}},
+        agent_runner=_Runner(0.5),
+        agent_type="developer",
+        prompt="fix",
+        credentials={"api_key": "", "oauth_token": "oauth-xyz"},
+        config=config,
+    )
+
+
+@pytest.mark.asyncio
+async def test_qa_spend_counts_toward_the_cap_in_hard_mode() -> None:
+    """#264: $1 in state + $9 of QA in traces + a $0.50 turn crosses a $10 cap."""
+    try:
+        await _run_after_qa("hard", qa_spend=9.0)
+    except BudgetOverrunError as exc:
+        assert exc.current_cost == pytest.approx(10.5)
+        return
+    pytest.fail("a QA-heavy job ran past its hard cap: the cap saw only the $1.50 in state")
+
+
+@pytest.mark.asyncio
+async def test_qa_spend_counts_toward_the_cap_in_soft_mode() -> None:
+    updates = await _run_after_qa("soft", qa_spend=9.0)
+    assert updates.get("budget_overrun_usd") == pytest.approx(0.5), (
+        f"the soft overrun must count the QA bill in traces; updates={updates.get('budget_overrun_usd')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_turn_whose_trace_was_not_written_still_counts() -> None:
+    """State is the floor: a failed trace write must not lower the total."""
+    config = _config("hard")
+    traces = _Traces(0.0)
+    traces.create = None  # type: ignore[assignment]  # the write raises; the sum stays $0
+    config["configurable"]["traces_repo"] = traces
+    with pytest.raises(BudgetOverrunError):
+        await run_agent_node(
+            state={"sandbox_container_id": "c1", "total_cost_usd": 9.5, "pipeline_config": {"budget_usd": 10.0}},
+            agent_runner=_Runner(1.0),
+            agent_type="developer",
+            prompt="fix",
+            credentials={"api_key": "", "oauth_token": "oauth-xyz"},
+            config=config,
+        )

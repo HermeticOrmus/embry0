@@ -16,6 +16,33 @@ _COLUMNS = (
 )
 
 
+# Column names are interpolated into SQL, so only these may ever reach it.
+_WRITABLE = (
+    "sandbox_profile",
+    "language_hint",
+    "notes",
+    "execution_mode",
+    "auth_mode",
+    "git_author_name",
+    "git_author_email",
+    "dev_checks",
+    "base_branch",
+    "verification",
+)
+_CASTS = {"dev_checks": "::jsonb", "verification": "::jsonb"}
+
+
+def _db_value(column: str, value: Any) -> Any:
+    """The stored form of a passed value: the clear value for None."""
+    if column == "notes":
+        return value or ""
+    if column == "dev_checks":
+        return value or []
+    if column == "verification":
+        return value or None
+    return value
+
+
 class RepoPreferencesRepository:
     """CRUD for the repo_preferences table.
 
@@ -34,56 +61,28 @@ class RepoPreferencesRepository:
         )
         return dict(row) if row else None
 
-    async def upsert(
-        self,
-        repo: str,
-        sandbox_profile: str | None = None,
-        language_hint: str | None = None,
-        notes: str = "",
-        execution_mode: str | None = None,
-        auth_mode: str | None = None,
-        git_author_name: str | None = None,
-        git_author_email: str | None = None,
-        dev_checks: list[dict[str, Any]] | None = None,
-        base_branch: str | None = None,
-        verification: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Full replace of the row — EXCEPT ``verification`` (#298/#299):
-        ``None`` keeps the stored value, ``{}`` clears it. Every existing
-        client PUTs the whole preferences object without knowing this field,
-        and must not silently switch a repo's test gate off by saving an
-        unrelated setting."""
+    async def upsert(self, repo: str, **fields: Any) -> dict[str, Any]:
+        """Create the row, or update ONLY the fields passed (#350).
+
+        A field left out keeps its stored value; one passed is written,
+        ``None`` included, which clears it (``notes`` to ``''``,
+        ``dev_checks`` to ``[]``, ``verification`` to NULL; ``{}`` also
+        clears ``verification``). Before #350 this replaced the whole row,
+        so a caller naming one field wiped the rest.
+        """
+        unknown = set(fields) - set(_WRITABLE)
+        if unknown:
+            raise TypeError(f"unknown repo preference field(s): {sorted(unknown)}")
+        cols = [c for c in _WRITABLE if c in fields]
+        values = [_db_value(c, fields[c]) for c in cols]
+        placeholders = [f"${i}{_CASTS.get(c, '')}" for i, c in enumerate(cols, start=2)]
+        assignments = [f"{c} = EXCLUDED.{c}" for c in cols] + ["updated_at = NOW()"]
         await self._db.execute(
-            """
-            INSERT INTO repo_preferences (repo, sandbox_profile, language_hint, notes, execution_mode, auth_mode, git_author_name, git_author_email, dev_checks, base_branch, verification)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, NULLIF($11::jsonb, '{}'::jsonb))
-            ON CONFLICT (repo) DO UPDATE SET
-                sandbox_profile = EXCLUDED.sandbox_profile,
-                language_hint = EXCLUDED.language_hint,
-                notes = EXCLUDED.notes,
-                execution_mode = EXCLUDED.execution_mode,
-                auth_mode = EXCLUDED.auth_mode,
-                git_author_name = EXCLUDED.git_author_name,
-                git_author_email = EXCLUDED.git_author_email,
-                dev_checks = EXCLUDED.dev_checks,
-                base_branch = EXCLUDED.base_branch,
-                verification = CASE
-                    WHEN $11::jsonb IS NULL THEN repo_preferences.verification
-                    ELSE NULLIF($11::jsonb, '{}'::jsonb)
-                END,
-                updated_at = NOW()
-            """,
+            f"INSERT INTO repo_preferences (repo{''.join(', ' + c for c in cols)}) "
+            f"VALUES ($1{''.join(', ' + p for p in placeholders)}) "
+            f"ON CONFLICT (repo) DO UPDATE SET {', '.join(assignments)}",
             repo,
-            sandbox_profile,
-            language_hint,
-            notes,
-            execution_mode,
-            auth_mode,
-            git_author_name,
-            git_author_email,
-            dev_checks or [],
-            base_branch,
-            verification,
+            *values,
         )
         out = await self.get(repo)
         assert out is not None

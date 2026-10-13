@@ -379,3 +379,65 @@ def test_quick_fix_reviews_what_its_developer_wrote() -> None:
     assert any(e["source"] == "developer" and e["target"] == "reviewer" for e in graph["edges"]), (
         "the reviewer must follow the developer"
     )
+
+
+# ---- #306: a watcher-origin case always runs the full pipeline ---------------
+
+
+def _repo_with_code_default():
+    return _FakeTemplatesRepo(
+        [
+            _row("1", "quick-fix", BUILTIN_PIPELINE_TEMPLATES["quick-fix"]["graph_definition"]),
+            _row("2", "review-only", BUILTIN_PIPELINE_TEMPLATES["review-only"]["graph_definition"], kind="research"),
+            _row(
+                "4",
+                "full-magnum-opus",
+                BUILTIN_PIPELINE_TEMPLATES["full-magnum-opus"]["graph_definition"],
+                kind="code",
+            ),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "decision",
+    [
+        {"pipeline_template": "quick-fix", "job_kind": "code"},
+        {"pipeline_template": "review-only", "job_kind": "code"},
+        {"job_kind": "research"},  # a kind whose default has no developer or QA
+    ],
+)
+async def test_triage_cannot_downgrade_a_watcher_case(decision):
+    state = {**_state(**decision), "pin_full_pipeline": True}
+    out = await plan_route_node(state, _config(_repo_with_code_default()))
+    steps = [s["agent_type"] for s in out["route_plan"]]
+    assert out["route_template_name"] == "full-magnum-opus", f"triage's {decision} picked {out['route_template_name']}"
+    assert "reviewer" in steps and "qa" in steps, f"a watcher-origin job runs {steps}"
+    assert out["job_kind"] == "code"
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_job_without_templates_runs_the_full_legacy_plan():
+    state = {**_state(pipeline_template="quick-fix", job_kind="code"), "pin_full_pipeline": True}
+    out = await plan_route_node(state, _config(None))
+    assert [s["agent_type"] for s in out["route_plan"]] == ["developer", "reviewer", "qa"]
+
+
+@pytest.mark.asyncio
+async def test_an_unpinned_job_still_takes_triages_pick():
+    out = await plan_route_node(
+        _state(pipeline_template="quick-fix", job_kind="code"), _config(_repo_with_code_default())
+    )
+    assert out["route_template_name"] == "quick-fix"
+
+
+@pytest.mark.asyncio
+async def test_an_operator_request_still_outranks_the_pin():
+    state = {
+        **_state(pipeline_template="quick-fix", job_kind="code"),
+        "pin_full_pipeline": True,
+        "pipeline_template_request": "review-only",
+    }
+    out = await plan_route_node(state, _config(_repo_with_code_default()))
+    assert out["route_template_name"] == "review-only"

@@ -83,10 +83,8 @@ export function RepoPreferencesSection({ repo }: RepoPreferencesSectionProps) {
           git_author_name: gitAuthorName || null,
           git_author_email: gitAuthorEmail || null,
           base_branch: baseBranch.trim() || null,
-          // PUT replaces the whole row — carry fields this form doesn't edit
-          // so saving here can't wipe them.
-          execution_mode: prefs?.execution_mode ?? null,
-          auth_mode: prefs?.auth_mode ?? null,
+          // PUT is a partial update (#350): fields this form doesn't edit
+          // (execution_mode, auth_mode, verification) are left out and kept.
           dev_checks: fromDrafts(devChecks),
         },
       },

@@ -72,7 +72,6 @@ describe("qaDashboard api client", () => {
         status: "passed",
         duration_ms: 0,
         cache_hits: { prebaked_image: false, shared_volume: false, turbo_remote_hits: [], turbo_remote_misses: [] },
-        trace_url: null,
         failure_summary: null,
       },
     });

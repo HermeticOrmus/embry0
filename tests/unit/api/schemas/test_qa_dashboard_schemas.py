@@ -58,7 +58,6 @@ def test_app_result_with_failure_summary():
         status="qa_failure",
         duration_ms=1500,
         cache_hits=CacheHitsModel(),
-        trace_url="https://x/trace.zip",
         failure_summary="loads page did not render",
     )
     assert ar.app_name == "companion"
@@ -77,7 +76,6 @@ def test_run_detail_inlines_apps():
                 status="passed",
                 duration_ms=1000,
                 cache_hits=CacheHitsModel(),
-                trace_url=None,
                 failure_summary=None,
             ),
             AppResult(
@@ -85,7 +83,6 @@ def test_run_detail_inlines_apps():
                 status="qa_failure",
                 duration_ms=2000,
                 cache_hits=CacheHitsModel(),
-                trace_url="https://x/trace.zip",
                 failure_summary="loads page did not render",
             ),
         ],
@@ -150,7 +147,6 @@ def test_app_result_accepts_boot_phase_field_optional():
             "turbo_remote_hits": [],
             "turbo_remote_misses": [],
         },
-        "trace_url": None,
         "failure_summary": None,
     }
     model = AppResult.model_validate(legacy_dict)
@@ -393,3 +389,8 @@ def test_flake_response_extra_forbid():
                 "unexpected": "x",
             }
         )
+
+
+def test_app_result_no_longer_carries_trace_url():
+    """#644: the field was never set; the response dropped it."""
+    assert "trace_url" not in AppResult.model_fields, "AppResult still exposes the never-set trace_url"

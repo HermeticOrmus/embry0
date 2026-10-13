@@ -596,3 +596,27 @@ def test_resumed_transcript_is_replayed_with_alternating_roles(env, monkeypatch)
     assert roles == ["user", "assistant", "user"], roles
     assert "I'll read the diff." in sent[1]["content"] and "The diff is fine." in sent[1]["content"]
     assert sent[-1]["content"] == "decide now"
+
+
+def test_grep_result_leaves_out_files_a_read_deny_rule_covers(env, monkeypatch):
+    """#542: the executor hands its policy to Grep, so a cleared root cannot leak a denied file."""
+    (env / "secret").mkdir()
+    (env / "secret" / "key.txt").write_text("token=s3cr3t-value\n")
+    (env / "open.txt").write_text("token=s3cr3t-open\n")
+    inv = _invocation()
+    policy = inv.safety_policy
+    inv = dataclasses.replace(
+        inv, safety_policy=dataclasses.replace(policy, deny_rules=[*policy.deny_rules, "Read(/secret/**)"])
+    )
+    responses = [
+        _Resp([_Block("tool_use", id="t", name="Grep", input={"pattern": "s3cr3t"})], "tool_use", _Usage(10, 2)),
+        _Resp([_Block("text", text="done")], "end_turn", _Usage(5, 2)),
+    ]
+    client = _install(monkeypatch, responses)
+
+    out = _run(inv, [])
+
+    assert not out.is_error
+    tr = client.messages.calls[1]["messages"][-1]["content"][0]
+    assert "s3cr3t-value" not in tr["content"], f"the executor's Grep returned a Read-denied file: {tr['content']!r}"
+    assert "s3cr3t-open" in tr["content"], f"the allowed file must still be found: {tr['content']!r}"

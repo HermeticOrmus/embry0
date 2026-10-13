@@ -161,3 +161,91 @@ async def test_triage_agent_error_log_includes_code_and_result(
     assert event["result"] == "no triage decision"
     assert isinstance(result, Command)
     assert token in result.update["errors"][0]
+
+
+# ---- #455: one schema slip gets one repair turn -------------------------------
+
+_MISSING_CONFIDENCE = '{"action": "proceed", "job_kind": "analysis", "reasoning": "stack trace points at the cache"}'
+_VALID = (
+    '{"action": "proceed", "confidence": 0.8, "job_kind": "analysis", "reasoning": "stack trace points at the cache"}'
+)
+
+
+def _answer(text: str, cost: float) -> dict[str, Any]:
+    return {
+        "agent_outputs": [{"agent_type": "triage", "is_error": False, "output": text}],
+        "total_cost_usd": cost,
+        "current_stage": "triage_complete",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_decision_missing_a_required_field_is_repaired_once(
+    base_state: dict[str, Any],
+    mock_config: dict[str, Any],
+) -> None:
+    """The 2026-10-01 shape: a valid answer that left out `confidence`."""
+    from embry0.workflows.issue_to_pr.nodes import triage_node
+
+    run = AsyncMock(side_effect=[_answer(_MISSING_CONFIDENCE, 0.41), _answer(_VALID, 0.45)])
+    with (
+        patch("embry0.workflows.issue_to_pr.nodes.run_agent_node", new=run),
+        patch("embry0.workflows.issue_to_pr.nodes.get_stream_writer", return_value=lambda _: None),
+    ):
+        result = await triage_node(base_state, mock_config)
+
+    assert isinstance(result, Command)
+    assert result.update.get("current_stage") != "failed", (
+        f"one missing field still failed the job: {result.update.get('errors')}"
+    )
+    assert result.goto != END
+    assert result.update["triage_decision"]["confidence"] == 0.8
+    assert run.await_count == 2
+    repair_prompt = run.await_args_list[1].kwargs["prompt"]
+    assert "confidence" in repair_prompt and "Field required" in repair_prompt, repair_prompt
+    assert _MISSING_CONFIDENCE in repair_prompt, "the repair turn must quote the rejected answer"
+    assert result.update["total_cost_usd"] == pytest.approx(0.45), "the repair run's cost was dropped"
+
+
+@pytest.mark.asyncio
+async def test_a_second_invalid_answer_fails_the_job_and_there_is_no_third(
+    base_state: dict[str, Any],
+    mock_config: dict[str, Any],
+) -> None:
+    from embry0.workflows.issue_to_pr.nodes import triage_node
+
+    run = AsyncMock(side_effect=[_answer(_MISSING_CONFIDENCE, 0.41), _answer("still not JSON", 0.43)])
+    with (
+        patch("embry0.workflows.issue_to_pr.nodes.run_agent_node", new=run),
+        patch("embry0.workflows.issue_to_pr.nodes.get_stream_writer", return_value=lambda _: None),
+    ):
+        result = await triage_node(base_state, mock_config)
+
+    assert run.await_count == 2, f"triage was asked {run.await_count} times"
+    assert result.goto == END
+    assert result.update.get("error_code") == "ERR_TRIAGE_MALFORMED"
+    assert "Invalid JSON" in result.update["errors"][0], "the error must be the repair answer's, not the first"
+
+
+@pytest.mark.asyncio
+async def test_an_errored_repair_run_fails_the_job_with_the_original_error(
+    base_state: dict[str, Any],
+    mock_config: dict[str, Any],
+) -> None:
+    from embry0.workflows.issue_to_pr.nodes import triage_node
+
+    errored = {
+        "agent_outputs": [{"agent_type": "triage", "is_error": True, "error_message": "boom", "output": ""}],
+        "total_cost_usd": 0.42,
+    }
+    run = AsyncMock(side_effect=[_answer(_MISSING_CONFIDENCE, 0.41), errored])
+    with (
+        patch("embry0.workflows.issue_to_pr.nodes.run_agent_node", new=run),
+        patch("embry0.workflows.issue_to_pr.nodes.get_stream_writer", return_value=lambda _: None),
+    ):
+        result = await triage_node(base_state, mock_config)
+
+    assert run.await_count == 2
+    assert result.goto == END
+    assert result.update.get("error_code") == "ERR_TRIAGE_MALFORMED"
+    assert "confidence" in result.update["errors"][0]

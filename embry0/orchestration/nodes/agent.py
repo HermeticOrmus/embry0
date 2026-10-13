@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -13,7 +13,13 @@ from embry0.agents.model_policy import TIER_KEYS, build_model_policy
 from embry0.agents.resolver import resolve_agent_invocation
 from embry0.agents.session import AgentSession
 from embry0.execution.auth_provider import AuthConfigError
-from embry0.orchestration.budget import BudgetOverrunError, check_budget, effective_overrun_mode, resolve_job_cap
+from embry0.orchestration.budget import (
+    BudgetCheckResult,
+    BudgetOverrunError,
+    check_budget,
+    effective_overrun_mode,
+    resolve_job_cap,
+)
 from embry0.orchestration.state import AgentOutputEntry
 
 logger = structlog.get_logger(__name__)
@@ -221,6 +227,43 @@ def _as_float(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return parsed if parsed > 0 else 0.0
+
+
+@dataclass(frozen=True)
+class JobCapCheck:
+    """Layer 1's verdict on a job's spend so far (#264)."""
+
+    total: float
+    cap: float
+    mode: str
+    decision: BudgetCheckResult
+
+
+async def evaluate_job_cap(state: dict[str, Any], config: Any, state_total: float) -> JobCapCheck:
+    """The job's spend so far against its per-job cap.
+
+    Spend is the sum of the job's trace rows, not graph state: the QA fan-out
+    runs agents in sub-graphs whose cost never reaches the parent state, but
+    every agent turn writes a trace under the parent job id, so the sum counts
+    them (#264). ``state_total`` is the floor — a turn whose trace write
+    failed still counts. ``state`` supplies the cap and the job's overrun
+    mode; the job id and the trace repository come from the graph config.
+    """
+    from embry0.services._cost import resolve_job_total_cost
+
+    configurable = _graph_configurable(config)
+    traces_repo = configurable.get("traces_repo")
+    job_id = configurable.get("job_id", "")
+    total = state_total
+    if traces_repo is not None and job_id:
+        try:
+            total = max(state_total, await resolve_job_total_cost(traces_repo, job_id, state_total))
+        except Exception:
+            logger.warning("job_cost_sum_failed", job_id=job_id, exc_info=True)
+    ceiling, overrun_mode = await load_budget_policy(config)
+    overrun_mode = effective_overrun_mode(overrun_mode, state.get("budget_overrun_mode_override"))
+    cap = resolve_job_cap(state, ceiling=ceiling)
+    return JobCapCheck(total=total, cap=cap, mode=overrun_mode, decision=check_budget(total, cap, overrun_mode))
 
 
 def _graph_configurable(config: Any) -> dict[str, Any]:
@@ -520,24 +563,23 @@ async def run_agent_node(
     # Per-job cap (layer 1). Every agent turn in every workflow lands here, so
     # this is the finest granularity the orchestrator has: `hard` aborts the
     # run at the ceiling, `soft` only records the overrun and lets the node's
-    # own routing stop the pipeline after it finishes.
-    ceiling, overrun_mode = await load_budget_policy(config)
-    overrun_mode = effective_overrun_mode(overrun_mode, state.get("budget_overrun_mode_override"))
-    max_budget = resolve_job_cap(state, ceiling=ceiling)
-    decision = check_budget(new_total, max_budget, overrun_mode)
+    # own routing stop the pipeline after it finishes. The spend is the job's
+    # trace sum, which counts QA sub-task turns as well (#264).
+    cap_check = await evaluate_job_cap(state, config, new_total)
+    decision = cap_check.decision
     if decision.overrun > 0:
         updates["budget_overrun_usd"] = decision.overrun
         logger.warning(
             "job_budget_exceeded",
             agent_type=agent_type,
-            total_cost_usd=new_total,
-            max_budget_usd=max_budget,
+            total_cost_usd=cap_check.total,
+            max_budget_usd=cap_check.cap,
             overrun_usd=decision.overrun,
-            overrun_mode=overrun_mode,
+            overrun_mode=cap_check.mode,
             job_id=(config or {}).get("configurable", {}).get("job_id") if isinstance(config, dict) else None,
         )
     if not decision.allowed:
-        raise BudgetOverrunError(new_total, max_budget)
+        raise BudgetOverrunError(cap_check.total, cap_check.cap)
 
     logger.info(
         "agent_node_complete",

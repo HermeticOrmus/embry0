@@ -207,8 +207,8 @@ class QAMinioClient:
         *,
         content_type: str = "application/octet-stream",
     ) -> None:
-        """Upload bytes to MinIO. Used by orchestrator-side report_node for log
-        capture (no presign needed — orchestrator holds the root creds).
+        """Upload bytes to MinIO from the orchestrator (no presign needed — it
+        holds the root creds), e.g. a sub-task's boot-failure screenshot.
         """
 
         def _put() -> None:

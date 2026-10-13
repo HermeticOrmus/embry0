@@ -1,11 +1,11 @@
-"""Unit tests for embry0_mcp.client — httpx fully mocked via MockTransport."""
+"""Unit tests for embry0.mcp_server.client — httpx fully mocked via MockTransport."""
 
 import json
 
 import httpx
 import pytest
 
-from embry0_mcp.client import Embry0APIError, Embry0Client
+from embry0.mcp_server.client import Embry0APIError, Embry0Client
 
 BASE = "http://embry0.test"
 
@@ -561,7 +561,7 @@ async def test_merge_approval_paths():
 
 async def test_qa_config_calls_forward_the_caller_bearer():
     """#443: qa_config bypassed _request, so the hosted endpoint sent the service key."""
-    from embry0_mcp.client import caller_bearer
+    from embry0.mcp_server.client import caller_bearer
 
     handler = capture(
         {
@@ -616,7 +616,7 @@ async def test_credential_bind_replaces_same_role_and_keeps_others():
 
 
 async def test_credential_calls_forward_the_caller_bearer():
-    from embry0_mcp.client import caller_bearer
+    from embry0.mcp_server.client import caller_bearer
 
     handler = capture({("GET", "/api/v1/credentials"): [], ("GET", "/api/v1/repos/acme/widgets/qa-config"): {}})
     client = make_client(handler)
@@ -628,3 +628,18 @@ async def test_credential_calls_forward_the_caller_bearer():
         caller_bearer.reset(token)
     assert handler.headers[("GET", "/api/v1/credentials")]["authorization"] == "Bearer caller-key"
     assert handler.headers[("GET", "/api/v1/repos/acme/widgets/qa-config")]["authorization"] == "Bearer caller-key"
+
+
+async def test_job_logs_pages_to_the_tail():
+    """#203: the API pages at 500 events; job_logs must follow the cursor to the end."""
+    pages = Seq(
+        [
+            {"events": [{"n": 1}, {"n": 2}], "next_since_seq": 20, "has_more": True},
+            {"events": [{"n": 3}], "next_since_seq": 30, "has_more": False},
+        ]
+    )
+    handler = capture({("GET", "/api/v1/jobs/j1/logs/events"): pages})
+    result = await make_client(handler).job_logs("j1")
+    assert result == {"events": [{"n": 1}, {"n": 2}, {"n": 3}]}, f"did not page to the tail: {result}"
+    cursors = [r.url.params.get("since_seq") for r in handler.seen]
+    assert cursors == ["0", "20"]

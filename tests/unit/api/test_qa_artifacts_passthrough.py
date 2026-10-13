@@ -224,3 +224,84 @@ async def test_list_app_artifacts_503_when_minio_unconfigured(api_client):
     api_client.app.state.qa_minio = None
     r = await api_client.get("/api/v1/qa/runs/RUN1/apps/hub/artifacts/screenshots")
     assert r.status_code == 503
+
+
+# ─── Job-level byte passthrough for the dashboard (#541) ────────────────────
+
+
+async def test_latest_screenshot_bytes_come_through_the_api_not_a_redirect(api_with_minio):
+    """#541: the live view must get bytes, never a 302 to the internal storage host."""
+    minio = api_with_minio.app.state.qa_minio
+    minio.list_objects_with_meta = AsyncMock(
+        return_value=[
+            {"key": "JOB1/1/screenshots/a.png", "last_modified": 1},
+            {"key": "JOB1/2/screenshots/b.png", "last_modified": 2},
+            {"key": "JOB1/2/result.json", "last_modified": 3},
+        ]
+    )
+    minio.get_object_bytes = AsyncMock(return_value=b"\x89PNG-latest")
+    minio.presign_get = AsyncMock(return_value="http://minio:9000/qa-artifacts/x")
+
+    r = await api_with_minio.get("/api/v1/jobs/JOB1/qa/screenshots/latest", follow_redirects=False)
+
+    assert r.status_code == 200, f"expected the screenshot's bytes, got {r.status_code} {r.headers.get('location')}"
+    assert r.content == b"\x89PNG-latest"
+    assert r.headers["content-type"] == "image/png"
+    assert r.headers["cache-control"] == "no-store"
+    assert minio.get_object_bytes.call_args.args[1] == "JOB1/2/screenshots/b.png"
+    minio.presign_get.assert_not_awaited()
+
+
+async def test_latest_screenshot_bytes_404_when_none(api_with_minio):
+    api_with_minio.app.state.qa_minio.list_objects_with_meta = AsyncMock(return_value=[])
+    r = await api_with_minio.get("/api/v1/jobs/JOB1/qa/screenshots/latest")
+    assert r.status_code == 404
+
+
+async def test_attempt_artifact_bytes_serve_the_named_attempt(api_with_minio):
+    """#541: evidence of attempt 1 stays attempt 1's, even after a retry."""
+    minio = api_with_minio.app.state.qa_minio
+    minio.get_object_bytes = AsyncMock(return_value=b"png")
+    minio.presign_get = AsyncMock(return_value="http://minio:9000/qa-artifacts/x")
+
+    r = await api_with_minio.get(
+        "/api/v1/jobs/JOB1/qa/attempts/1/artifacts/screenshots/exploratory/1-login.png", follow_redirects=False
+    )
+
+    assert r.status_code == 200, f"expected the evidence bytes, got {r.status_code} {r.headers.get('location')}"
+    assert r.content == b"png"
+    assert r.headers["content-type"] == "image/png"
+    assert minio.get_object_bytes.call_args.args[1] == "JOB1/1/screenshots/exploratory/1-login.png"
+    minio.presign_get.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/jobs/JOB1/qa/attempts/0/artifacts/x.png",
+        "/api/v1/jobs/JOB1/qa/attempts/1/artifacts/a/.../x.png",
+        "/api/v1/jobs/JOB1/qa/attempts/1/artifacts/a/%2E%2E/x.png",
+        "/api/v1/jobs/JOB1/qa/attempts/1/artifacts/a%20b.png",
+    ],
+)
+async def test_attempt_artifact_bytes_refuse_unsafe_paths(api_with_minio, path):
+    minio = api_with_minio.app.state.qa_minio
+    r = await api_with_minio.get(path)
+    assert r.status_code == 404
+    minio.get_object_bytes.assert_not_awaited()
+
+
+async def test_attempt_artifact_bytes_missing_object_is_404(api_with_minio):
+    minio = api_with_minio.app.state.qa_minio
+    minio.stat_object = AsyncMock(side_effect=RuntimeError("NoSuchKey"))
+    r = await api_with_minio.get("/api/v1/jobs/JOB1/qa/attempts/1/artifacts/screenshots/x.png")
+    assert r.status_code == 404
+    minio.get_object_bytes.assert_not_awaited()
+
+
+async def test_attempt_artifact_bytes_refuse_oversized(api_with_minio):
+    minio = api_with_minio.app.state.qa_minio
+    minio.stat_object = AsyncMock(return_value={"size": 60 * 1024 * 1024})
+    r = await api_with_minio.get("/api/v1/jobs/JOB1/qa/attempts/1/artifacts/traces/t.zip")
+    assert r.status_code == 413
+    minio.get_object_bytes.assert_not_awaited()

@@ -1,4 +1,4 @@
-export type JobStatus = "pending" | "running" | "completed" | "failed" | "partial" | "cancelled" | "awaiting_input" | "pr_merged" | "pr_closed" | "paused" | "expired";
+export type JobStatus = "pending" | "running" | "completed" | "failed" | "partial" | "cancelled" | "awaiting_input" | "pr_merged" | "pr_closed" | "paused" | "expired" | "skipped";
 export type TraceResult = "pass" | "fail" | "partial" | "error" | "timeout" | "budget_exceeded";
 
 /** Every JobStatus, in board-lane order. The `satisfies` + Record guard makes
@@ -12,6 +12,7 @@ export const ALL_JOB_STATUSES = [
   "running",
   "completed",
   "pr_merged",
+  "skipped",
   "failed",
   "partial",
   "cancelled",

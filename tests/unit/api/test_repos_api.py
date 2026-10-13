@@ -101,7 +101,7 @@ async def test_repo_detail_aggregates_env_and_prefs(api_client) -> None:
 @pytest.mark.asyncio
 async def test_repo_detail_surfaces_the_stored_base_branch(api_client) -> None:
     """GET /repos/{repo} hands the preferences row through as a raw dict, which
-    is what embry0_mcp's repo_get returns — so base_branch reaches MCP with no
+    is what embry0.mcp_server's repo_get returns — so base_branch reaches MCP with no
     MCP-side change. Stored via the API, read back over HTTP."""
     await api_client.post("/api/v1/repos", json={"repo": "acme/widgets"})
     put = await api_client.put(

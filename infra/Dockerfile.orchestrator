@@ -33,7 +33,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # on every docs edit. The image never shows the long description.
 COPY pyproject.toml /app/
 COPY embry0/__init__.py /app/embry0/__init__.py
-COPY embry0_mcp/__init__.py /app/embry0_mcp/__init__.py
 WORKDIR /app
 RUN touch README.md && pip install --no-cache-dir -e . psycopg[binary]
 
@@ -51,9 +50,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # Application code (overwrite with full source)
 COPY embry0/ /app/embry0/
 # The hosted MCP endpoint (embry0-mcp-http, compose service `mcp`) runs from
-# this image too — the entry point comes from pyproject at the pip layer, but
-# the module itself rides the /app source copy like embry0/ does.
-COPY embry0_mcp/ /app/embry0_mcp/
+# this image too: embry0/mcp_server/ rides this copy.
 
 # Non-root user
 RUN useradd --create-home orchestrator \
@@ -80,17 +77,18 @@ ENV EMBRY0_API_URL=http://localhost:8000 \
 WORKDIR /
 RUN embry0 --help > /dev/null \
     && embry0 build-qa-image --help > /dev/null \
-    && python -c "import embry0, embry0_mcp.http, embry0.api.app, pathlib, sysconfig; \
+    && python -c "import embry0, embry0.mcp_server.http, embry0.api.app, pathlib, sysconfig; \
 assert embry0.__file__ == '/app/embry0/__init__.py', embry0.__file__; \
-assert embry0_mcp.__file__ == '/app/embry0_mcp/__init__.py', embry0_mcp.__file__; \
+assert embry0.mcp_server.__file__ == '/app/embry0/mcp_server/__init__.py', embry0.mcp_server.__file__; \
 sp = pathlib.Path(sysconfig.get_paths()['purelib']); \
-assert not (sp / 'embry0').exists() and not (sp / 'embry0_mcp').exists(), 'package copy in site-packages'"
+assert not (sp / 'embry0').exists(), 'package copy in site-packages'"
 WORKDIR /app
 
 EXPOSE 8000
 
+# Exec form (hadolint DL3025): sh -c keeps the documented exit 1 on failure.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl --fail http://localhost:8000/health || exit 1
+    CMD ["sh", "-c", "curl --fail http://localhost:8000/health || exit 1"]
 
 # --proxy-headers is uvicorn's default but stated explicitly: which peers'
 # X-Forwarded-For is trusted comes from FORWARDED_ALLOW_IPS in the compose

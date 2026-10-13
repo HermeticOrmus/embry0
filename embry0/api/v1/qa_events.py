@@ -26,9 +26,8 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sse_starlette.sse import EventSourceResponse
 
-from embry0.api.deps import require_auth
+from embry0.api.deps import authenticate_stream, require_auth
 from embry0.api.scoped_tokens import mint_scoped_token, signing_material, verify_scoped_token
-from embry0.api.session import TIER_ADMIN, TIER_OPERATOR, request_session
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -63,31 +62,7 @@ async def _auth_header_or_scoped_token(
     The master API key is deliberately NOT accepted via the query string
     (RAV-1060) — only the short-lived scoped token rides the URL.
     """
-    config = request.app.state.config
-    # #518: only AUTH_DEV_MODE skips this, never an empty API_KEY.
-    if config.auth_dev_mode:
-        return
-    if token is not None and verify_sse_token(signing_material(config), run_id, token):
-        return
-    # RAV-1069: an SSO session (operator+) authenticates the stream directly —
-    # same-origin EventSource sends the cookie with no header plumbing.
-    # RAV-1056: subject to the users-table gate (disabled / stale epoch).
-    session = request_session(request)
-    if session is not None and session.tier in (TIER_ADMIN, TIER_OPERATOR):
-        from embry0.api.deps import validate_session_user
-
-        if await validate_session_user(request.app, session):
-            return
-    # RAV-1056: any live key (>= read) authenticates the stream — the
-    # master-only literal compare is gone.
-    from embry0.api.deps import resolve_bearer_principal
-
-    authorization = request.headers.get("authorization", "")
-    if authorization.startswith("Bearer "):
-        principal = await resolve_bearer_principal(request.app, authorization[7:])
-        if principal is not None:
-            return
-    raise HTTPException(status_code=401, detail="Missing or invalid credentials")
+    await authenticate_stream(request, f"sse:{run_id}", token)
 
 
 @router.post("/qa/runs/{run_id}/events-token", dependencies=[require_auth])

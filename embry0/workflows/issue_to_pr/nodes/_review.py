@@ -71,7 +71,7 @@ def format_review_task(state: dict[str, Any], *, failure_step_number: int = 7) -
     ticket, but the reviewer may run on a different one, and this prompt must
     not become a new path for raw log lines (#294).
     """
-    from embry0.execution.proxy.log_redaction import redact_bounded
+    from embry0.safety.redaction import redact_bounded
     from embry0.workflows.issue_to_pr.evidence import acceptance_criteria_in, format_evidence_block
 
     raw_task = str(state.get("task") or "").strip()
@@ -138,7 +138,7 @@ async def review_node(state: dict[str, Any], config: RunnableConfig) -> Command[
       - The "happy path" decisions (``approved`` / ``changes_requested``) set
         ``current_stage`` to ``review_passed`` / ``review_failed`` and return
         a plain dict, letting the conditional edge ``route_after_review`` in
-        ``graph.py`` dispatch to ``init_qa`` / ``retry`` / ``END`` based on
+        ``graph.py`` dispatch to ``init_orchestrator`` / ``retry`` / ``END`` based on
         the triage-set ``state["qa"]["needs_qa"]`` flag.
       - The control-flow exits (no runner, ask_user cap exhausted, pending
         agent questions, retry cap hit) keep self-routing via
@@ -531,7 +531,7 @@ The JSON object is the last thing you output — nothing after it."""
     #      retry budget gone) also routes via Command(goto="max_retries").
     #   3. The plain approved / changes_requested decisions set
     #      current_stage and return a plain dict; route_after_review in
-    #      graph.py then dispatches to init_qa / retry / END.
+    #      graph.py then dispatches to init_orchestrator / retry / END.
     if updates.get("agent_questions_exhausted") or state.get("agent_questions_exhausted"):
         return Command(goto="max_retries", update=updates)
     if updates.get("pending_agent_questions") or state.get("pending_agent_questions"):

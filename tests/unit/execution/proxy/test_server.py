@@ -275,3 +275,20 @@ def test_gitlab_ca_pem_rejects_base64_of_non_pem(monkeypatch):
     """Valid base64 is not enough — it must decode to a real certificate."""
     monkeypatch.setenv("GITLAB_CA_PEM", base64.b64encode(b"hello").decode())
     assert server._gitlab_ca_pem() == ""
+
+
+def test_build_app_context_registers_the_redaction_fields(monkeypatch):
+    """#294: LOG_REDACTION_FIELDS is what the context proxy redacts besides secrets."""
+    from embry0.safety import redaction
+
+    monkeypatch.setenv("PROXY_TYPE", "context")
+    monkeypatch.setenv("PROXY_ADMIN_TOKEN", "test-admin-tok")
+    monkeypatch.setenv("UPSTREAM_URL", "http://10.0.0.1:8000")
+    monkeypatch.setenv("CONTAINER_ALLOWLIST", "acme-backend")
+    monkeypatch.setenv("LOG_REDACTION_FIELDS", "phone")
+    try:
+        server.build_app_from_env()
+        out = redaction.redact_log_text("phone=+15551234", [])
+    finally:
+        redaction.register_redacted_fields([])
+    assert out == f"phone={redaction.REDACTED}", out

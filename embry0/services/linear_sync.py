@@ -22,6 +22,7 @@ The one Linear GraphQL client (#163) — the CLI in
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import time
@@ -36,6 +37,7 @@ import httpx
 import structlog
 
 from embry0.orchestration.budget_gate import DispatchDecision
+from embry0.safety.error_codes import ErrorCode
 from embry0.services import linear_notice_texts as texts
 from embry0.services.linear_dispatch import LINEAR_GRAPHQL_URL, compose_additional_context
 from embry0.services.trigger_labels import matching_triggers, normalize_labels
@@ -613,9 +615,15 @@ class LinearSyncService:
             return {"status": "ignored", "reason": "already dispatched", "issue_id": existing["id"]}
 
         issue = await self.fetch_trigger_issue(str(identifier))
+        added_since = label_reapplied_since(self, issue.native_id or issue.key, triggers)
 
-        async def _reapplied(_failed_job: dict[str, Any]) -> bool:
-            return relabeled
+        async def _reapplied(failed_job: dict[str, Any]) -> bool:
+            # The payload says a trigger label was added, never WHEN: a
+            # redelivery, or a first delivery that arrives late, can describe
+            # the very label that started the failed job (#462). Only a label
+            # Linear's history dates after that job ended is a retry request
+            # — the reconciler's test, asked only when the payload adds one.
+            return relabeled and await added_since(failed_job)
 
         return await self.dispatch_trigger_issue(
             issue,
@@ -939,6 +947,35 @@ class LinearSyncService:
                 "reason": f"no repo: stamp on project {issue.project!r} and no LINEAR_REPO_MAP entry",
             }
 
+        # #360: the stamp or map lives outside embry0 and drifts when a repo
+        # is renamed. A repo with no registry row would run with no QA
+        # config, env vars or secrets — refuse it here, where the ticket can
+        # be told why. isinstance, not truthiness: test doubles answer any
+        # attribute. IssueExecutor.execute refuses it again for every caller.
+        unregistered = getattr(ctx.issue_executor, "unregistered_repo_refusal", _no_refusal)(repo)
+        if inspect.isawaitable(unregistered):
+            unregistered = await unregistered
+        if isinstance(unregistered, str):
+            announced = await notices.announce(
+                ref,
+                f"unregistered_repo:{repo}",
+                texts.unregistered_repo(repo, issue.project, auto_retry=ctx.auto_retry),
+            )
+            _log_once(announced)(
+                "linear_trigger_unregistered_repo",
+                identifier=issue.key,
+                repo=repo,
+                repo_source=repo_source,
+                project=issue.project,
+            )
+            return {
+                "status": "ignored",
+                "skip": "unregistered_repo",
+                "error_code": ErrorCode.REPO_UNREGISTERED.value,
+                "reason": unregistered,
+                "repo": repo,
+            }
+
         # Ask the fleet-wide gate before creating anything: a ticket that
         # cannot run today is told so once, instead of collecting a failed
         # ERR_BUDGET_REFUSED job per attempt. The runner re-checks regardless.
@@ -1190,6 +1227,29 @@ async def _gate_refusal(issue_executor: Any, actor: str | None) -> DispatchDecis
     decision = await check(actor=actor)
     # isinstance, not truthiness: test doubles answer any attribute.
     return decision if isinstance(decision, DispatchDecision) and not decision.allowed else None
+
+
+async def _no_refusal(_repo: str) -> None:
+    return None
+
+
+def label_reapplied_since(
+    sync: LinearSyncService, issue_id: str, labels: Iterable[str]
+) -> Callable[[dict[str, Any]], Awaitable[bool]]:
+    """``label_reapplied`` from Linear's issue history: was a trigger label
+    added after the failed job ended? Shared by the webhook (#462) and the
+    reconciler, so the two cannot disagree on what a retry request is."""
+    wanted = set(labels)
+
+    async def _check(failed_job: dict[str, Any]) -> bool:
+        since = failed_job.get("finished_at") or failed_job.get("created_at")
+        if not isinstance(since, datetime):
+            # No timestamp to compare against — never guess in favour of a retry.
+            return False
+        since = since if since.tzinfo else since.replace(tzinfo=UTC)
+        return bool(await sync.trigger_label_added_since(issue_id, wanted, since))
+
+    return _check
 
 
 def trigger_label_added(payload: dict[str, Any], triggers: Iterable[str]) -> bool:

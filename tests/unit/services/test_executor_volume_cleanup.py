@@ -139,3 +139,61 @@ async def test_qa_unexpected_interrupt_still_releases_sandbox_and_volumes():
     assert ex._jobs.update.await_args.kwargs["status"] == "failed"
     ex._sandbox.destroy.assert_awaited_once_with("sandbox-job-1")
     mgr.destroy_for_job.assert_awaited_once_with("job-1")
+
+
+@pytest.mark.asyncio
+async def test_cancel_job_mid_qa_fanout_releases_subtask_sandboxes_and_qa_networks(monkeypatch):
+    """#328: a job cancelled mid fan-out must not leave its QA resources to the reaper."""
+    import embry0.orchestration.checkpoint as ckpt_mod
+    import embry0.services.issue_executor as exec_mod
+    from embry0.execution.runtime.protocol import ContainerSummary
+
+    monkeypatch.setattr(ckpt_mod, "purge_thread", AsyncMock())
+    monkeypatch.setattr(exec_mod, "emit_audit", AsyncMock())
+
+    order: list[str] = []
+    mgr = MagicMock()
+    mgr.destroy_for_job = AsyncMock(side_effect=lambda job_id: order.append("volumes"))
+    ex = _executor(volume_mgr=mgr)
+    ex._sandbox.destroy = AsyncMock(side_effect=lambda cid: order.append(f"destroy {cid}"))
+
+    def _summary(name: str) -> ContainerSummary:
+        return ContainerSummary(id=f"id-{name}", name=name, created_at="", status="Up", running_for="")
+
+    runtime = MagicMock()
+    # Docker's name filter is a substring match: job-10's sandbox comes back too.
+    runtime.list_containers = AsyncMock(
+        side_effect=lambda name=None, label=None, **kw: (
+            [_summary("sandbox-job-1__web"), _summary("sandbox-job-1__api"), _summary("sandbox-job-10__web")]
+            if name == "sandbox-job-1__"
+            else []
+        )
+    )
+    runtime.list_volumes = AsyncMock(return_value=[])
+    runtime.remove_network = AsyncMock(side_effect=lambda net, timeout=10: order.append(f"rm net {net}"))
+    ex._sandbox.runtime = runtime
+    ex._background_tasks = set()
+    ex._tasks_by_job = {}
+    ex._event_bus = None
+    ex._database_url = "postgres://stub"
+    ex._audit_log_path = None
+    ex._db = MagicMock()
+    ex._jobs = MagicMock()
+    ex._jobs.update = AsyncMock()
+    ex._jobs.get = AsyncMock(return_value=None)
+    ex._issues = MagicMock()
+    ex._issues.update = AsyncMock()
+
+    await ex.cancel_job("job-1", actor="tester")
+
+    assert order == [
+        "destroy sandbox-job-1",
+        "destroy sandbox-job-1__web",
+        "destroy sandbox-job-1__api",
+        "rm net qa-net-job-1",
+        "rm net qa-net-job-1__web",
+        "rm net qa-net-job-1__api",
+        "volumes",
+    ], f"cancel must destroy the job's sub-task sandboxes, then remove its QA networks, then its volumes: {order}"
+    labels = {c.kwargs.get("label") for c in runtime.list_containers.await_args_list}
+    assert "embry0.qa_job_id=job-1__web" in labels, f"agent-started QA containers were never looked up: {labels}"

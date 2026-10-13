@@ -8,6 +8,12 @@ The sandbox's git config rewrites the job repository's forge URL to
 credential in ``Authorization``. Both bodies are streamed: a pack can be
 gigabytes, and nothing here holds one in memory.
 
+A push's ref updates are decided before its pack (#559, ADR 0009): the proxy
+reads the command list at the head of the receive-pack body
+(:mod:`embry0.execution.proxy.receive_pack`), refuses the whole push when any
+update touches a ref outside the enrollment's ``git_push_branches`` or deletes
+a branch, and otherwise re-sends the list and streams the rest unchanged.
+
 The forge credential never leaves this process. ``/git-credentials``, which
 used to return it to the sandbox's credential helper, now answers 410.
 
@@ -19,6 +25,7 @@ Bearers are enrolled by the orchestrator at sandbox-create time via
 from __future__ import annotations
 
 import base64
+from collections.abc import AsyncIterator
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -26,7 +33,21 @@ import structlog
 from aiohttp import web
 
 from embry0.execution.proxy.enrollment import check_bearer, git_identity, payload_token, register_admin_routes
-from embry0.execution.proxy.git_scope import GIT_ROUTE_PREFIX, GitGrant, GitScope, GitVerdict, git_verdict
+from embry0.execution.proxy.git_scope import (
+    GIT_ROUTE_PREFIX,
+    RECEIVE_PACK,
+    GitGrant,
+    GitScope,
+    GitVerdict,
+    git_verdict,
+)
+from embry0.execution.proxy.receive_pack import (
+    CommandList,
+    MalformedCommandList,
+    read_command_list,
+    refusal_response,
+    refused_updates,
+)
 from embry0.execution.tls import build_ssl_context
 
 logger = structlog.get_logger(__name__)
@@ -91,6 +112,7 @@ def create_git_proxy_app(github_token: str, admin_token: str, *, ca_pem: str = "
         on_unenroll=scope.forget,
         enroll_extension=scope,
     )
+    scope.register_routes(app)
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     app.router.add_get("/health", _health_handler)
@@ -189,6 +211,13 @@ async def _git_handler(request: web.Request) -> web.StreamResponse:
         )
         return _refusal(403, f"refused ({verdict.reason}): this proxy serves the job's own repository only")
 
+    body: object = request.content if request.method == "POST" else None
+    if request.method == "POST" and verdict.service == RECEIVE_PACK and grant is not None:
+        commands_or_refusal = await _decide_push(request, sandbox_id, grant, verdict)
+        if isinstance(commands_or_refusal, web.StreamResponse):
+            return commands_or_refusal
+        body = _replay(commands_or_refusal.raw, request)
+
     headers = _upstream_headers(request, sandbox_id, verdict)
     session: aiohttp.ClientSession = request.app["http_session"]
     response: web.StreamResponse | None = None
@@ -197,7 +226,7 @@ async def _git_handler(request: web.Request) -> web.StreamResponse:
             request.method,
             verdict.upstream_url,
             headers=headers,
-            data=request.content if request.method == "POST" else None,
+            data=body,
             allow_redirects=False,
         ) as upstream:
             if 300 <= upstream.status < 400:
@@ -246,3 +275,55 @@ async def _git_handler(request: web.Request) -> web.StreamResponse:
         status=response.status,
     )
     return response
+
+
+async def _decide_push(
+    request: web.Request, sandbox_id: str, grant: GitGrant, verdict: GitVerdict
+) -> CommandList | web.StreamResponse:
+    """Read the push's command list; return it when every update is allowed, else the refusal to send."""
+    try:
+        commands = await read_command_list(request.content)
+    except MalformedCommandList as exc:
+        logger.warning(
+            "git_proxy_push_refused",
+            sandbox_id=sandbox_id,
+            job_id=grant.job_id,
+            repo=verdict.repo,
+            reason="malformed_command_list",
+            detail=str(exc)[:300],
+        )
+        await _drain(request)
+        return _refusal(403, f"push refused: {exc}")
+    refused = refused_updates(commands.updates, grant.push_branches)
+    if not refused:
+        return commands
+    allowed = ", ".join(sorted(grant.push_branches)) or "none (the enrollment names no branch)"
+    logger.warning(
+        "git_proxy_push_refused",
+        sandbox_id=sandbox_id,
+        job_id=grant.job_id,
+        repo=verdict.repo,
+        reason="ref_out_of_scope",
+        refused=dict(sorted(refused.items())[:20]),
+        updates=len(commands.updates),
+        allowed_branches=sorted(grant.push_branches),
+    )
+    await _drain(request)
+    message = f"push refused: this job may push only to {allowed}, and may not delete it"
+    report = refusal_response(commands.updates, refused, commands.capabilities, message)
+    if report is None:
+        return _refusal(403, message)
+    return web.Response(status=200, body=report, content_type="application/x-git-receive-pack-result")
+
+
+async def _drain(request: web.Request) -> None:
+    """Read and drop the rest of a refused push, so git reads the answer instead of a broken pipe."""
+    while await request.content.readany():
+        pass
+
+
+async def _replay(head: bytes, request: web.Request) -> AsyncIterator[bytes]:
+    """The command list as it came, then the rest of the body (push options, pack), streamed."""
+    yield head
+    async for chunk in request.content.iter_chunked(_CHUNK_BYTES):
+        yield chunk

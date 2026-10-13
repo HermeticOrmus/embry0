@@ -65,9 +65,9 @@ What the sandbox receives:
 | xai | `llm_api_key` | `XAI_API_KEY` |
 | xai | `llm_oauth` | nothing in env; the xai-proxy serves that credential id |
 
-`auth_mode=oauth` needs an anthropic `llm_oauth` account. `auth_mode=api_key` needs an anthropic `llm_api_key` account. A mismatch raises the existing `ERR_MISSING_OAUTH_TOKEN` or `ERR_MISSING_API_KEY`. A grok model does not take the Anthropic check.
+`auth_mode=oauth` needs an anthropic `llm_oauth` account. `auth_mode=api_key` needs an anthropic `llm_api_key` account, from the registry or the env step below. A mismatch raises the existing `ERR_MISSING_OAUTH_TOKEN` or `ERR_MISSING_API_KEY`. A grok model does not take the Anthropic check.
 
-Env fallback, only when no registry row is usable: `CLAUDE_CODE_OAUTH_TOKEN`, then the orchestrator's Claude credentials file, for Anthropic; `XAI_API_KEY` for xAI. Each key logs `credential_env_fallback` once. `ANTHROPIC_API_KEY` is that same last step for an api-key run. It is not an import source.
+Env fallback, only when no registry row is usable. For Anthropic it follows the deployment's `DEFAULT_AUTH_MODE`: with `api_key`, `ANTHROPIC_API_KEY` and nothing else; otherwise `CLAUDE_CODE_OAUTH_TOKEN`, then the orchestrator's Claude credentials file. For xAI, `XAI_API_KEY`. Each key logs `credential_env_fallback` once. A repo, job or agent that overrides the auth mode away from the deployment default needs a registry account of the matching kind. `ANTHROPIC_API_KEY` is not an import source.
 
 **Quarantine.** A terminal `ERR_PROVIDER_RATE_LIMITED` sets `quarantined_until` to now plus `CREDENTIAL_RATE_LIMIT_QUARANTINE_SECONDS` (default 900). `ERR_PROVIDER_QUOTA_EXHAUSTED` lasts until the reset the provider named, when it named one, capped at eight days (`QUOTA_RESET_QUARANTINE_MAX`); otherwise it uses `CREDENTIAL_QUOTA_QUARANTINE_SECONDS` (default 3600). `ERR_AUTH_REJECTED` quarantines with no until, so an operator clears it. The hook attributes the failure to the terminal agent output's provider, so a 429 on xAI leaves the Anthropic account alone. A missing provider on that output quarantines every LLM account the job used.
 
@@ -141,7 +141,7 @@ All under `/api/v1`. Reads need any authenticated principal; every mutation need
 |---|---|---|
 | `GET /credentials` | read | list: id, kind, provider, host, label, `masked_preview`, `verified_login`, status, `status_reason`, `quarantined_until`, `binding_count`, timestamps |
 | `POST /credentials` | admin | create: `kind`, `provider`, `host`, `label`, `secret`, `git_author_name`, `git_author_email`. 409 on a duplicate label, 422 on a wrong host |
-| `PUT /credentials/{id}` | admin | `label`, author fields, `status` in {`ok`, `disabled`} |
+| `PUT /credentials/{id}` | admin | `label`, author fields, `status` in {`ok`, `disabled`}. An omitted field is kept; an author field sent as `null` or blank is cleared, so the author falls back to branding |
 | `POST /credentials/{id}/rotate` | admin | new `secret`; sets `rotated_at`, clears `decryption_failed` |
 | `POST /credentials/{id}/verify` | admin | forge tokens only: asks the forge `GET /user` and stores `verified_login` |
 | `DELETE /credentials/{id}` | admin | 409 while bindings reference it |
@@ -257,7 +257,7 @@ A credential no listed key can open is never handed to a job as garbage. On the 
 
 Every mutation writes an `audit_log` row with the credential id (and label where relevant), never the secret: `credential.created`, `credential.updated`, `credential.status_changed`, `credential.rotated`, `credential.verified`, `credential.deleted`, `credential.bound` (with scope and credential ids; an empty binding list is how a scope is unbound) and `credential.imported` (with the importer's report).
 
-Which account a job used is in `credential_uses`: one row per registry resolution for a job, with the credential id and a copy of its label (which survives deleting the credential), the job id, role, provider and time. Its `outcome` is `NULL` while the job runs and is stamped at every terminal write: `ok`, the job's error code, `cancelled` when the issue is cancelled through the API, or `ERR_ORPHANED` when the startup sweep reaps a job the previous process left running. A registry resolution also sets `credentials.last_used_at`. Tokens served from env leave no row; `credentials.env_fallback_keys` is their trace.
+Which account a job used is in `credential_uses`: one row per registry resolution for a job, with the credential id and a copy of its label (which survives deleting the credential), the job id, role, provider and time. Its `outcome` is `NULL` while the job runs and is stamped at every terminal write: `ok`, the job's error code, `cancelled` when the issue is cancelled through the API, or `ERR_ORPHANED` (`ERR_RESUME_LIMIT`) when the startup sweep reaps a job the previous process left running and boot does not resume (#307). A job boot resumes keeps its rows open. A registry resolution also sets `credentials.last_used_at`. Tokens served from env leave no row; `credentials.env_fallback_keys` is their trace.
 
 ## Later releases
 

@@ -32,7 +32,6 @@ class QAAppResultRow:
     status: SubTaskStatus
     duration_ms: int
     cache_hits: CacheHits
-    trace_url: str | None
     failure_summary: str | None
     raw_result: dict[str, Any]
     # Phase 5A: per-sub-task boot drill-down. None on legacy rows and on the
@@ -96,7 +95,6 @@ class QAAppResultsRepository:
             status=str(result.status),
             duration_ms=int(result.duration_ms),
             cache_hits=result.cache_hits,
-            trace_url=result.trace_url,
             failure_summary=result.failure_summary,
             raw_result=result.raw_result,
             boot_phase=result.boot_phase,
@@ -110,7 +108,6 @@ class QAAppResultsRepository:
         status: str,
         duration_ms: int,
         cache_hits: CacheHits,
-        trace_url: str | None = None,
         failure_summary: str | None = None,
         raw_result: dict[str, Any] | None = None,
         boot_phase: dict[str, Any] | None = None,
@@ -137,14 +134,13 @@ class QAAppResultsRepository:
         sql = """
         INSERT INTO qa_app_results (
             job_id, app_name, status, duration_ms, cache_hits,
-            trace_url, failure_summary, raw_result, boot_phase, updated_at
+            failure_summary, raw_result, boot_phase, updated_at
         )
-        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, $9::jsonb, NOW())
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8::jsonb, NOW())
         ON CONFLICT (job_id, app_name) DO UPDATE SET
             status          = EXCLUDED.status,
             duration_ms     = EXCLUDED.duration_ms,
             cache_hits      = EXCLUDED.cache_hits,
-            trace_url       = EXCLUDED.trace_url,
             failure_summary = EXCLUDED.failure_summary,
             raw_result      = EXCLUDED.raw_result,
             boot_phase      = EXCLUDED.boot_phase,
@@ -157,7 +153,6 @@ class QAAppResultsRepository:
             status,
             int(duration_ms),
             cache_hits_payload,
-            trace_url,
             failure_summary,
             raw_result or {},
             boot_phase,
@@ -172,7 +167,7 @@ class QAAppResultsRepository:
         """
         sql = """
         SELECT job_id, app_name, status, duration_ms, cache_hits,
-               trace_url, failure_summary, raw_result, boot_phase
+               failure_summary, raw_result, boot_phase
         FROM qa_app_results
         WHERE job_id = $1
         ORDER BY app_name
@@ -200,7 +195,6 @@ class QAAppResultsRepository:
                         turbo_remote_hits=list(cache_hits_data.get("turbo_remote_hits") or []),
                         turbo_remote_misses=list(cache_hits_data.get("turbo_remote_misses") or []),
                     ),
-                    trace_url=row["trace_url"],
                     failure_summary=row["failure_summary"],
                     raw_result=raw_result_data,
                     boot_phase=boot_phase_data,

@@ -161,7 +161,12 @@ def test_an_enroll_body_becomes_a_grant_and_is_echoed():
     )
     assert grant == GitGrant(upstream="https://github.com", repos=frozenset({"acme/widgets"}), push=True)
     echoed = scope.apply(app, "s1", grant)
-    assert echoed == {"allowed_repos": ["acme/widgets"], "git_upstream": "https://github.com", "git_push": True}
+    assert echoed == {
+        "allowed_repos": ["acme/widgets"],
+        "git_upstream": "https://github.com",
+        "git_push": True,
+        "git_push_branches": [],
+    }
     assert app["git_grant_by_id"]["s1"] == grant
     scope.forget(app, "s1")
     assert app["git_grant_by_id"] == {}

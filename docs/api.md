@@ -232,6 +232,71 @@ curl -X PUT http://localhost:8200/api/v1/repos/owner/repo/docker-access \
 Docker on a repo without the grant is refused before it starts, with
 `ERR_INCOHERENT_CONFIG` and a message naming this endpoint.
 
+## API keys
+
+Database API keys authenticate MCP, CLI and other machine clients with
+`Authorization: Bearer <key>`. An operator mints keys for themselves, scoped at
+or below their own tier; an admin also mints unowned service keys and sees and
+revokes every key. The plaintext appears once, in the mint response. Settings
+→ API keys in the dashboard does the same.
+
+| Endpoint | Who |
+|---|---|
+| `GET /api/v1/apikeys` | operator (own keys), admin (all) |
+| `POST /api/v1/apikeys` | operator, admin |
+| `PUT /api/v1/apikeys/{key_id}/allowed-repos` | the key's owner, admin |
+| `DELETE /api/v1/apikeys/{key_id}` | the key's owner, admin |
+
+### Repository allowlist
+
+A key may be limited to a list of repositories with `allowed_repos`. A
+restricted key is refused, with a 403 whose detail starts with
+`repo_not_allowed:`, whenever it would start or continue work on any other
+repository:
+
+- `POST /jobs` (every pipeline; a job with no repository, such as an `http`
+  or `none` context, is refused too), `POST /jobs/{id}/resume` and
+  `POST /jobs/{id}/inputs/{input_id}/answer`;
+- `POST /issues` (an issue without a repository is refused),
+  `PUT /issues/{id}` (the issue's repository and, when it changes, the new
+  one), `POST /issues/{id}/triage`, `POST /issues/{id}/sync` and
+  `POST /issues/{id}/inputs/{input_id}/answer`;
+- `POST /cases/{id}/accept`, `POST /merge-approvals/{id}/decide`,
+  `POST /watcher/run` (the stack ticked), `POST /qa/images/build` and
+  `POST /repos/bootstrap`.
+
+The MCP tools reach embry0 through these routes with the caller's key, so
+they are covered too. Matching ignores case and follows `REPO_RENAMES`
+([configuration.md](configuration.md)): an entry naming a repository's old
+slug also matches its current one, and the reverse. Each refusal logs
+`api_key_repo_refused` with the key's name and id (never the key), the
+repository and the action, and writes an `apikey.repo_refused` audit row.
+
+Omitting the list, or sending an empty one, leaves the key unrestricted;
+every key minted before the allowlist existed is unrestricted. The list
+governs work only: it does not narrow what the key may read, nor the
+settings routes its scope allows. A restricted key may not mint keys or
+change any key's allowlist, its own included, since a key it minted would
+carry no restriction. For an agent that should only dispatch, mint an
+`operate` key with the list.
+
+```bash
+# Mint a key that may only start work on acme/widgets
+curl -X POST http://localhost:8200/api/v1/apikeys \
+  -H "Authorization: Bearer $EMBRY0_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "dispatch-bot", "scope": "operate", "allowed_repos": ["acme/widgets"]}'
+
+# Replace the list (or send {"allowed_repos": []} to lift it). Effective at once.
+curl -X PUT http://localhost:8200/api/v1/apikeys/key-0123456789ab/allowed-repos \
+  -H "Authorization: Bearer $EMBRY0_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"allowed_repos": ["acme/widgets", "acme/widgets-docs"]}'
+```
+
+Each change writes an `apikey.allowed_repos_changed` audit row with the list
+before and after.
+
 ## Sandbox visibility
 
 ```bash

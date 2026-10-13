@@ -18,14 +18,24 @@ import embry0.api.app as app_module
 from embry0.api.app import _clean_orphaned_sandboxes
 from embry0.execution.runtime.protocol import ContainerSummary
 
+_NOW = "2026-10-11 12:00:00 +0000 UTC"
+
 
 class _Runtime:
-    def __init__(self, names: list[str]) -> None:
-        self.names = names
+    """Applies the daemon's filters: ``name`` is a substring match, ``label`` an exact one."""
 
-    async def list_containers(self, *, name=None, timeout=15, **_kwargs):
-        assert name == "sandbox-"
-        return [ContainerSummary(f"id{i}", n, "", "", "") for i, n in enumerate(self.names)]
+    def __init__(self, names: list[str], unlabelled: tuple[str, ...] = ()) -> None:
+        self.containers = [ContainerSummary(f"id{i}", n, _NOW, "", "") for i, n in enumerate([*names, *unlabelled])]
+        self.unlabelled = set(unlabelled)
+
+    async def list_containers(self, *, name=None, label=None, timeout=15, **_kwargs):
+        found = self.containers
+        if name is not None:
+            found = [c for c in found if name in c.name]
+        if label is not None:
+            assert label == "embry0.role=sandbox", label
+            found = [c for c in found if c.name not in self.unlabelled]
+        return found
 
 
 def _jobs(active: set[str] | None = None, error: Exception | None = None) -> MagicMock:
@@ -52,6 +62,18 @@ async def test_a_paused_jobs_sandbox_survives_the_start_sweep():
 
     destroyed = [call.args[0] for call in sandbox.destroy.await_args_list]
     assert destroyed == ["sandbox-job-killed"], f"only the orphan may be destroyed, destroyed {destroyed}"
+
+
+@pytest.mark.asyncio
+async def test_an_unlabelled_container_named_like_a_sandbox_survives_the_start_sweep():
+    """#620: the sweep selects embry0's label, so another tenant of the daemon keeps its container."""
+    sandbox = _sandbox()
+    runtime = _Runtime(["sandbox-job-killed"], unlabelled=("sandbox-dev-db",))
+
+    await _clean_orphaned_sandboxes(runtime, sandbox, _jobs(set()))
+
+    destroyed = [call.args[0] for call in sandbox.destroy.await_args_list]
+    assert destroyed == ["sandbox-job-killed"], f"an unlabelled container must survive, destroyed {destroyed}"
 
 
 @pytest.mark.asyncio

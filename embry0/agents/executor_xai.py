@@ -112,14 +112,18 @@ def _make_mcp_client(server_name: str, server_cfg: Any) -> McpStdioClient:
     )
 
 
-def _compute_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Cost from provider pricing (xAI compat layer returns no total_cost_usd)."""
+def _compute_cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    """Cost from provider pricing (xAI compat layer returns no total_cost_usd).
+
+    None when the model has no price entry (#219): the price table is the only
+    accounting this executor has, so an unpriced model is an error to record,
+    never a silent $0. The resolver refuses such a model before the run; this
+    is the last line if one gets here anyway.
+    """
     prov = provider_for_model(model)
-    if prov is None:
-        return 0.0
-    rates = prov.pricing_usd_per_mtok.get(model)
+    rates = prov.pricing_usd_per_mtok.get(model) if prov is not None else None
     if not rates:
-        return 0.0
+        return None
     in_rate, out_rate = rates
     return (input_tokens / 1_000_000) * in_rate + (output_tokens / 1_000_000) * out_rate
 
@@ -295,7 +299,7 @@ class DirectXaiExecutor:
                         result_content, tool_err = await call_mcp_tool(mcp_clients, name, tool_input)
                         result_text = summarize_content(result_content)
                     else:
-                        result_text, tool_err = execute_tool(name, tool_input, cwd=cwd)
+                        result_text, tool_err = execute_tool(name, tool_input, cwd=cwd, policy=policy)
                         result_content = result_text
                         # ask_user parity: the Bash ask_user helper prints its event to stdout,
                         # which lands in this tool result — recover + re-emit it (EMB-44).
@@ -344,7 +348,25 @@ class DirectXaiExecutor:
             error_code = ErrorCode.AGENT_MAX_TURNS.value
 
         elapsed_ms = int((time.time() - started) * 1000)
-        cost = _compute_cost(invocation.model, totals["in"], totals["out"])
+        priced = _compute_cost(invocation.model, totals["in"], totals["out"])
+        cost = priced if priced is not None else 0.0
+        if priced is None:
+            unpriced_message = (
+                f"cost unknown: model {invocation.model!r} has no price entry in "
+                "embry0/agents/providers.py, so this run's "
+                f"{totals['in']} input and {totals['out']} output tokens are unmetered"
+            )
+            logger.error(
+                "xai_cost_unpriced_model",
+                model=invocation.model,
+                tokens_in=totals["in"],
+                tokens_out=totals["out"],
+            )
+            writer({"type": "error", "error": unpriced_message})
+            if not is_error:
+                is_error = True
+                error_message = unpriced_message
+                error_code = ErrorCode.INVALID_CONFIG.value
         output = final_text.render()
 
         writer(

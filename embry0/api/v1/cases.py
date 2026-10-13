@@ -34,6 +34,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from embry0.api.deps import get_healing_cases_repo, request_actor
+from embry0.api.repo_allowlist import enforce_repo_allowlist
 from embry0.api.schemas.cases import CaseDetailResponse, CaseListResponse, CaseSummary
 from embry0.api.trigger_context import current_linear_sync, linear_trigger_context
 from embry0.audit.helpers import emit_audit
@@ -410,6 +411,7 @@ async def accept_case(
     repo = str(case.get("repo") or "")
     tracker = str(case.get("tracker") or "")
     key = str(case.get("tracker_key") or "")
+    await enforce_repo_allowlist(request, repo, action="accept a finding")
 
     if str(case.get("origin")) != Origin.WATCHER:
         raise HTTPException(status_code=409, detail=f"not a watcher finding (origin {case.get('origin')})")

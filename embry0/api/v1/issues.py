@@ -13,6 +13,7 @@ from embry0.api.deps import (
     get_jobs_repo,
     request_actor,
 )
+from embry0.api.repo_allowlist import enforce_repo_allowlist
 from embry0.api.schemas.inputs import AnswerInputRequest, InputResponse
 from embry0.api.schemas.issues import (
     CreateIssueRequest,
@@ -29,6 +30,7 @@ from embry0.services.issue_executor import IssueExecutor
 from embry0.storage.repositories.issue_inputs import IssueInputsRepository
 from embry0.storage.repositories.issues import IssuesRepository
 from embry0.storage.repositories.jobs import JobsRepository
+from embry0.storage.repositories.repos import UnregisteredRepoError
 from embry0.trackers import github_number_of
 
 logger = structlog.get_logger(__name__)
@@ -53,6 +55,12 @@ async def _dispatch(
     """
     try:
         job_id = await executor.execute(issue_id, dispatched_by=request_actor(request))
+    except UnregisteredRepoError as exc:
+        # #360: the refusal names only the repo and what to do, so it is safe
+        # to hand the client as it is.
+        logger.warning(failure_event, issue_id=issue_id, error_code=ErrorCode.REPO_UNREGISTERED.value)
+        await issues.update(issue_id, status="open")
+        return {"job_id": None, "dispatch_error_code": ErrorCode.REPO_UNREGISTERED.value, "dispatch_error": str(exc)}
     except Exception:
         logger.warning(failure_event, issue_id=issue_id, exc_info=True)
         await issues.update(issue_id, status="open")
@@ -72,17 +80,6 @@ def _actor(request: Request) -> str:
     return request_actor(request)
 
 
-async def _finish_credential_uses(request: Request, job_id: str, outcome: str) -> None:
-    """Stamp the job's credential_uses rows. Best-effort: never fails the request."""
-    repo = getattr(request.app.state, "credentials_repo", None)
-    if repo is None:
-        return
-    try:
-        await repo.finish_uses(job_id, outcome)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("credential_uses_finish_failed", job_id=job_id, error=str(exc)[:200])
-
-
 # ---------------------------------------------------------------------------
 # POST /issues — create a new issue
 # ---------------------------------------------------------------------------
@@ -96,6 +93,7 @@ async def create_issue(
     sync: Any = Depends(get_github_sync),
     executor: IssueExecutor = Depends(get_issue_executor),
 ) -> IssueDispatchResponse:
+    await enforce_repo_allowlist(request, req.repo, action="create an issue")
     issue_id = await issues.create(
         title=req.title,
         body=req.body,
@@ -231,6 +229,11 @@ async def update_issue(
         raise HTTPException(status_code=404, detail="Issue not found")
 
     updates = req.model_dump(exclude_none=True)
+    # Both ends: a restricted key may neither edit another repository's
+    # issue nor move one of its own issues to a repository it may not use.
+    await enforce_repo_allowlist(request, existing.get("repo"), action="update an issue")
+    if "repo" in updates:
+        await enforce_repo_allowlist(request, updates["repo"], action="move an issue")
     if updates:
         await issues.update(issue_id, **updates)
 
@@ -291,22 +294,27 @@ async def delete_issue(
         raise HTTPException(status_code=404, detail="Issue not found")
 
     children = await issues.get_children(issue_id)
-    for child in children:
-        await issues.update(child["id"], status="cancelled")
-
     all_issue_ids = [issue_id] + [c["id"] for c in children]
+
+    # #449: stop every active job through the executor, as POST
+    # /jobs/{id}/cancel does — it cancels the task, destroys the sandbox and
+    # closes the credential ledger. Writing the row alone left the workflow
+    # running. Jobs first: cancel_job reopens the job's issue, so the issues
+    # are marked cancelled after it.
+    executor = request.app.state.issue_executor
+    actor = _actor(request)
     for iid in all_issue_ids:
         issue_jobs, _ = await jobs.list_all(issue_id=iid, limit=100, offset=0)
         for j in issue_jobs:
-            if j["status"] in ("pending", "running", "awaiting_input"):
-                await jobs.update(j["job_id"], status="cancelled")
-                await _finish_credential_uses(request, j["job_id"], "cancelled")
+            if j["status"] in ("pending", "running", "awaiting_input", "paused"):
+                await executor.cancel_job(j["job_id"], actor=actor)
 
+    for child in children:
+        await issues.update(child["id"], status="cancelled")
     await issues.update(issue_id, status="cancelled")
 
     config = request.app.state.config
     db = request.app.state.db
-    actor = _actor(request)
     await emit_audit(
         db,
         "issue.cancelled",
@@ -333,6 +341,7 @@ async def triage_issue(
     if not existing:
         raise HTTPException(status_code=404, detail="Issue not found")
 
+    await enforce_repo_allowlist(request, existing.get("repo"), action="triage an issue")
     current_status = existing["status"]
     if current_status in ("triaging", "closed", "cancelled"):
         raise HTTPException(
@@ -376,12 +385,14 @@ async def triage_issue(
 @router.post("/issues/{issue_id}/sync")
 async def sync_issue(
     issue_id: str,
+    request: Request,
     issues: IssuesRepository = Depends(get_issues_repo),
     sync: Any = Depends(get_github_sync),
 ) -> dict[str, object]:
     existing = await issues.get(issue_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Issue not found")
+    await enforce_repo_allowlist(request, existing.get("repo"), action="sync an issue")
 
     if sync is None:
         raise HTTPException(status_code=400, detail="GitHub sync is not enabled")
@@ -484,6 +495,8 @@ async def answer_issue_input(
     existing = await issues.get(issue_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Issue not found")
+    # An answer resumes the issue's job once no blocking question is left.
+    await enforce_repo_allowlist(request, existing.get("repo"), action="answer a question on an issue")
 
     inp = await inputs.get(input_id)
     if not inp:

@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
@@ -78,3 +79,22 @@ async def sweep_orphan_checkpoints(database_url: str) -> int:
     finally:
         await conn.close()
     return total
+
+
+async def checkpointed_threads(db: Any, thread_ids: list[str]) -> set[str]:
+    """The ids among ``thread_ids`` that have a saved checkpoint (#307).
+
+    Boot recovery resumes a running job from its checkpoint only when one
+    exists. ``db`` is the shared ``DatabasePool``. The saver creates its tables
+    on first use, so a deployment that never ran a graph has none: that is an
+    empty set, not an error.
+    """
+    if not thread_ids:
+        return set()
+    if await db.fetchval("SELECT to_regclass('public.checkpoints') IS NOT NULL") is not True:
+        return set()
+    rows = await db.fetch(
+        "SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id = ANY($1::text[])",
+        thread_ids,
+    )
+    return {row["thread_id"] for row in rows}

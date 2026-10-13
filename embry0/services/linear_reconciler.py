@@ -52,7 +52,7 @@ import structlog
 
 from embry0.metrics import NULL_METRICS, LoopMetrics
 from embry0.services import linear_notice_texts as texts
-from embry0.services.linear_sync import AdmissionRefusal, LinearTriggerIssue
+from embry0.services.linear_sync import AdmissionRefusal, LinearTriggerIssue, label_reapplied_since
 from embry0.services.loop_schedule import seconds_until_next_run
 from embry0.trackers import TriggerContext
 
@@ -204,7 +204,7 @@ class LinearDispatchReconciler:
                         issue,
                         ctx,
                         created_by=ACTOR,
-                        label_reapplied=_reapplied_since(sync, issue.native_id or issue.key, labels),
+                        label_reapplied=label_reapplied_since(sync, issue.native_id or issue.key, labels),
                         announce_dedupe=False,
                         admit=self._admission(ctx),
                         dry_run=shadow,
@@ -413,17 +413,3 @@ class LinearDispatchReconciler:
                 reason=skip,
                 detail=result.get("detail") or result.get("reason") or "",
             )
-
-
-def _reapplied_since(sync: Any, issue_id: str, labels: set[str]) -> Callable[[dict[str, Any]], Awaitable[bool]]:
-    """``label_reapplied`` for a sweep: ask Linear's history, only when needed."""
-
-    async def _check(failed_job: dict[str, Any]) -> bool:
-        since = failed_job.get("finished_at") or failed_job.get("created_at")
-        if not isinstance(since, datetime):
-            # No timestamp to compare against — never guess in favour of a retry.
-            return False
-        since = since if since.tzinfo else since.replace(tzinfo=UTC)
-        return bool(await sync.trigger_label_added_since(issue_id, labels, since))
-
-    return _check

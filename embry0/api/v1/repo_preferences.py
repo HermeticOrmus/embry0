@@ -38,21 +38,11 @@ async def put_repo_preferences(
                 )
 
     prefs_repo = request.app.state.repo_preferences_repo
-    saved = await prefs_repo.upsert(
-        repo=full_repo,
-        sandbox_profile=req.sandbox_profile,
-        language_hint=req.language_hint,
-        notes=req.notes,
-        execution_mode=req.execution_mode,
-        auth_mode=req.auth_mode,
-        git_author_name=req.git_author_name,
-        git_author_email=req.git_author_email,
-        dev_checks=[c.model_dump() for c in req.dev_checks],
-        base_branch=req.base_branch,
-        # exclude_unset: {} must reach the repository as {} (= clear), not as
-        # a dict of defaults.
-        verification=None if req.verification is None else req.verification.model_dump(exclude_unset=True),
-    )
+    # #350: only the fields the client sent are written; an omitted field
+    # keeps its stored value, an explicit null (or "", [] or {}) clears it.
+    # exclude_unset also keeps verification {} as {} (= clear) rather than
+    # a dict of defaults.
+    saved = await prefs_repo.upsert(full_repo, **req.model_dump(exclude_unset=True))
     return RepoPreferencesResponse(**saved)
 
 
