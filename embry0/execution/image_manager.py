@@ -102,8 +102,19 @@ class SandboxImageManager:
         Production pattern is to build on the host and `docker save | docker load`
         into DinD on deployment. This check runs at orchestrator startup to fail
         fast with a clear message if that step was skipped.
+
+        Right after init-push-images pins a new digest the daemon has not
+        pulled it yet, so a miss in its local store is retried as a registry
+        pull before it counts as absent (#655, as #622 does for the sandbox).
         """
-        return await self._runtime.image_exists(self._qualify(image))
+        qualified = self._qualify(image)
+        if await self._runtime.image_exists(qualified):
+            return True
+        pull_error = await self._pull_from_registry(qualified)
+        if pull_error is None:
+            logger.info("proxy_image_pulled_from_registry", image=qualified)
+            return True
+        return False
 
     async def ensure_image(self, image: str = "embry0-sandbox:latest", force: bool = False) -> bool:
         """Ensure the sandbox image is built and up-to-date. Returns True if build occurred."""

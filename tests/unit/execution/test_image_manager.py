@@ -416,3 +416,30 @@ async def test_ensure_image_does_not_pull_an_unqualified_name(tmp_path):
 
     assert await mgr.ensure_image("embry0-sandbox:latest") is False
     assert runtime.pulled == []
+
+
+@pytest.mark.asyncio
+async def test_check_proxy_image_present_pulls_a_pinned_proxy_the_daemon_has_not_pulled_yet(tmp_path, monkeypatch):
+    """#655: right after init-push-images pins a new proxy digest the daemon's
+    store lacks it; the registry has it, so the proxy image is present."""
+    import embry0.execution.image_manager as im
+
+    pinned = "registry:5000/embry0-proxy:latest@sha256:" + "6a" * 32
+    monkeypatch.setattr(im, "qualify_image", lambda image, registry: pinned)
+    runtime = _RegistryRuntime(in_registry=True)
+    mgr = SandboxImageManager(runtime, app_root=str(tmp_path), image_registry="registry:5000")  # type: ignore[arg-type]
+
+    assert await mgr.check_proxy_image_present() is True
+    assert runtime.pulled == [pinned], f"the pinned proxy must be pulled, pulled {runtime.pulled}"
+
+
+@pytest.mark.asyncio
+async def test_check_proxy_image_present_is_false_when_the_registry_lacks_it_too(tmp_path, monkeypatch):
+    import embry0.execution.image_manager as im
+
+    pinned = "registry:5000/embry0-proxy:latest@sha256:" + "6a" * 32
+    monkeypatch.setattr(im, "qualify_image", lambda image, registry: pinned)
+    runtime = _RegistryRuntime(in_registry=False)
+    mgr = SandboxImageManager(runtime, app_root=str(tmp_path), image_registry="registry:5000")  # type: ignore[arg-type]
+
+    assert await mgr.check_proxy_image_present() is False
