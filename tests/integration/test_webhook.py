@@ -20,6 +20,14 @@ def _headers(payload: bytes, secret: str, event: str = "issues") -> dict:
     }
 
 
+async def _register(app: AsyncClient, repo: str) -> None:
+    """Dispatch refuses a repo with no registry row (#360), so register it."""
+    resp = await app.post(
+        "/api/v1/repos", json={"repo": repo, "forge": "github"}, headers={"X-Requested-With": "XMLHttpRequest"}
+    )
+    assert resp.status_code == 201, resp.text
+
+
 @pytest.mark.asyncio
 async def test_webhook_labeled_issue_triggers(app: AsyncClient):
     """Labelling a tracked issue must dispatch a job, not just sync the column.
@@ -28,6 +36,7 @@ async def test_webhook_labeled_issue_triggers(app: AsyncClient):
     label-sync-only branch satisfied — so it passed against behaviour that did
     not exist. It now asserts the dispatch and the resulting job row.
     """
+    await _register(app, "owner/repo")
     # First open the issue *without* the trigger label so it is merely tracked.
     open_payload = json.dumps(
         {
@@ -73,6 +82,7 @@ async def test_webhook_labeled_issue_triggers(app: AsyncClient):
 @pytest.mark.asyncio
 async def test_webhook_labeling_untracked_issue_adopts_it(app: AsyncClient):
     """An issue embry0 has never seen is adopted when it gets the trigger label."""
+    await _register(app, "owner/repo")
     payload = json.dumps(
         {
             "action": "labeled",
