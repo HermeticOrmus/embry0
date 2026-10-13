@@ -570,3 +570,26 @@ def test_inspect_running_cmd_prints_the_running_flag() -> None:
     client = DockerClient(docker_host="tcp://fake", tls_verify=False, cert_path="")
     cmd = client.build_inspect_running_cmd("sandbox-job-1")
     assert cmd[-4:] == ["inspect", "--format", "{{.State.Running}}", "sandbox-job-1"], cmd
+
+
+@pytest.mark.asyncio
+async def test_an_image_the_daemon_lacks_is_an_answer_not_an_error():
+    """#655: ``image_exists`` asks whether the daemon holds an image; "No such
+    image" is its "no". Logged at error, every deploy that pins new digests
+    raised a false self-healing signal before the image was pulled."""
+    from structlog.testing import capture_logs
+
+    from embry0.execution.runtime import DockerRuntime
+
+    runtime = DockerRuntime(DockerClient())
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_proc:
+        process = AsyncMock()
+        process.communicate = AsyncMock(return_value=(b"", b"Error response from daemon: No such image: x\n"))
+        process.returncode = 1
+        mock_proc.return_value = process
+
+        with capture_logs() as logs:
+            assert await runtime.image_exists("registry:5000/embry0-proxy:latest") is False
+
+    errors = [entry for entry in logs if entry["log_level"] == "error"]
+    assert not errors, f"an absent image must not log at error: {errors}"

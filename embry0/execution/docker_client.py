@@ -371,6 +371,7 @@ class DockerClient:
         timeout: int = 60,
         *,
         log_context: dict[str, Any] | None = None,
+        expected_failure: bool = False,
     ) -> str:
         """Execute a Docker command and return stdout.
 
@@ -382,6 +383,10 @@ class DockerClient:
         exit). Callers that already know which container and phase a command
         belongs to — proxy cleanup, which has no job to bind a trace id from —
         pass that here. It is not a retry policy; ``run_cmd`` still fails immediately.
+
+        ``expected_failure`` logs a non-zero exit at debug instead of error, for
+        probes whose "no" is an answer rather than a fault (``image inspect`` of
+        an image the daemon has not pulled yet, #655). It still raises.
         """
         scrubbed = _scrub_cmd_for_log(cmd)
         logger.debug("docker_cmd", cmd=scrubbed)
@@ -419,7 +424,10 @@ class DockerClient:
             # hide the command, the daemon's stderr, or the exit code.
             failure: dict[str, Any] = dict(log_context or {})
             failure.update(cmd=scrubbed, stderr=err[:2000], returncode=proc.returncode)
-            logger.error("docker_cmd_failed", **failure)
+            if expected_failure:
+                logger.debug("docker_cmd_failed", **failure)
+            else:
+                logger.error("docker_cmd_failed", **failure)
             raise RuntimeError(f"Docker command failed: {err}")
 
         return stdout.decode().strip()

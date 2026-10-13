@@ -171,6 +171,10 @@ async def test_three_questions_one_pause_batched_resume(app, monkeypatch) -> Non
 
     issue_id: str | None = None
     try:
+        # Dispatch refuses a repo with no registry row (#360).
+        reg_r = await app.post("/api/v1/repos", json={"repo": "owner/quickwins-smoke", "forge": "github"}, headers=CSRF)
+        assert reg_r.status_code == 201, reg_r.text
+
         # --- 1. Create issue (no auto-triage; we patch then trigger) ---
         create_r = await app.post(
             "/api/v1/issues",

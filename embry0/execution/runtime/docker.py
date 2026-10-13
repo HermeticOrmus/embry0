@@ -274,7 +274,7 @@ class DockerRuntime:
 
     async def image_exists(self, image: str, *, timeout: int = 60) -> bool:
         try:
-            await self._client.run_cmd(self._cmd("image", "inspect", image), timeout=timeout)
+            await self._client.run_cmd(self._cmd("image", "inspect", image), timeout=timeout, expected_failure=True)
         except RuntimeError:
             return False
         return True
