@@ -138,17 +138,18 @@ def test_the_link_check_reports_a_dangling_link(tmp_path):
 
 
 def test_internal_material_is_not_under_docs():
-    """#529: audits, RCAs, specs and plans live under internal/, which the public export drops.
+    """Audits and RCAs name deployments, so they are never in the tree (#529).
 
-    The superpowers skills default to docs/superpowers/, so a new spec lands
-    in the exported tree unless it is moved.
+    They are repo records now, stored in embry0 itself (docs/records.md).
+    Vendor-neutral design specs and plans ship with their code under
+    docs/superpowers/ since development moved to the public repository.
     """
     misplaced = [
         str(p.relative_to(ROOT))
         for p in _markdown_files(ROOT)
-        if p.relative_to(ROOT).parts[:2] in {("docs", "audits"), ("docs", "rca"), ("docs", "superpowers")}
+        if p.relative_to(ROOT).parts[:2] in {("docs", "audits"), ("docs", "rca")}
     ]
-    assert not misplaced, f"internal material under docs/ (move it to internal/): {misplaced}"
+    assert not misplaced, f"audits or RCAs under docs/ (store them as repo records instead): {misplaced}"
     # The public export has no internal/ at all; where it exists, its README
     # says what belongs there.
     internal = ROOT / "internal"
