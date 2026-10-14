@@ -36,6 +36,12 @@ def test_existing_pr_job_gets_no_recipe():
     assert "CANNOT create a pull request" not in prompt
 
 
+def test_full_prompt_ships_a_spec_with_the_code_it_describes():
+    """A design spec or plan rides in the job's branch and PR, never a PR of its own."""
+    prompt = _build_developer_full_prompt(dict(_STATE), "embry0/iss-abc-fix")
+    assert "commit it on this branch with the code" in prompt, prompt
+
+
 # ── RAV-1254: dev_checks self-check block (ex .e0/dev.yaml) ─────────────────
 
 

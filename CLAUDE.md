@@ -145,4 +145,6 @@ The five canonical roles, unmodified: `needs-triage`, `needs-info`, `ready-for-a
 
 Single-context: `docs/glossary.md` (the one glossary — used in place of a root `CONTEXT.md`) and `docs/adr/`. See `docs/agents/domain.md`.
 
-Internal material — audits, RCAs, design specs, implementation plans, and anything that names a customer, deployment, person, host, cost or job id — goes under `internal/`, which the public export drops; the README in that directory says what goes where. Specs and plans from the superpowers skills go in `internal/superpowers/specs/` and `internal/superpowers/plans/`, not the skills' default `docs/superpowers/`.
+**A spec or plan ships with the work it describes.** Specs and plans from the superpowers skills go in `docs/superpowers/specs/` and `docs/superpowers/plans/`, committed on the feature branch next to the code, so they arrive in the same pull request. A spec never gets a pull request of its own.
+
+This repository is public, so nothing that names a customer, deployment, person, host, cost or job id enters it: audits, RCAs and anything else of that kind stay in the deployment's own private records. A spec written for one deployment is that kind of document. The name-denylist CI check refuses a tree that carries a listed name.
