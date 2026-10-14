@@ -2590,6 +2590,55 @@ MIGRATIONS: list[tuple[int, str, str]] = [
             '#657: how the watcher chose signature_id. evidence = a window cluster the proposal quotes; fallback = nothing it quotes is in the window, so the window''s loudest line (confirm-healed answers inconclusive). NULL = not a watcher anchor, or opened before #657.';
         """,
     ),
+    (
+        95,
+        "repo_records / repo_record_revisions — per-repo Markdown records with full history",
+        # Documents about one registered repository that must never live in a
+        # git tree (RCAs, audits, runbooks, deployment-specific specs). Design:
+        # docs/superpowers/specs/2026-10-14-repo-records-design.md.
+        #
+        # ON DELETE RESTRICT: deleting a repository must not silently take its
+        # records with it; the API answers 409 and the operator deletes the
+        # records first. ON UPDATE CASCADE: a registry row renamed in place
+        # keeps its records. The kind list and the slug rule are restated in
+        # embry0/storage/repositories/repo_records.py, and a test pins the two
+        # together.
+        """
+        CREATE TABLE IF NOT EXISTS repo_records (
+            id               BIGSERIAL PRIMARY KEY,
+            repo             TEXT NOT NULL REFERENCES repos(repo) ON DELETE RESTRICT ON UPDATE CASCADE,
+            slug             TEXT NOT NULL,
+            kind             TEXT NOT NULL,
+            title            TEXT NOT NULL,
+            current_revision INTEGER NOT NULL DEFAULT 1,
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT repo_records_repo_slug_key UNIQUE (repo, slug),
+            CONSTRAINT repo_records_kind_check
+                CHECK (kind IN ('rca', 'audit', 'spec', 'plan', 'spike', 'runbook', 'note')),
+            CONSTRAINT repo_records_slug_check CHECK (slug ~ '^[a-z0-9][a-z0-9._-]{0,127}$'),
+            CONSTRAINT repo_records_revision_positive CHECK (current_revision >= 1)
+        );
+        CREATE INDEX IF NOT EXISTS repo_records_repo_updated ON repo_records (repo, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS repo_record_revisions (
+            record_id     BIGINT NOT NULL REFERENCES repo_records(id) ON DELETE CASCADE,
+            revision      INTEGER NOT NULL,
+            title         TEXT NOT NULL,
+            body          TEXT NOT NULL,
+            author        TEXT NOT NULL DEFAULT '',
+            source_job_id TEXT,
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (record_id, revision),
+            CONSTRAINT repo_record_revisions_revision_positive CHECK (revision >= 1)
+        );
+
+        COMMENT ON TABLE repo_records IS
+            'Markdown documents about one registered repository (RCAs, audits, runbooks, specs). Content lives in repo_record_revisions; current_revision is the highest one.';
+        COMMENT ON COLUMN repo_record_revisions.source_job_id IS
+            'The job that wrote this revision, when a pipeline did. No FK: jobs are pruned, records are not.';
+        """,
+    ),
 ]
 
 
