@@ -172,8 +172,9 @@ async def analyze_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     profiles_repo = configurable.get("profiles_repo")
     if profiles_repo is not None:
         try:
-            rows = await profiles_repo.list_all()
-        except Exception:  # noqa: BLE001
+            rows = await profiles_repo.list()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("onboard_profile_catalog_unavailable", error=str(exc))
             rows = []
         if rows:
             lines = []
