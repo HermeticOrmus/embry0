@@ -226,6 +226,7 @@ class ConfirmHealedSweep:
             plan=plan,
             last_seen_at=last_seen,
             deployed_at=deployed_at,
+            signature_source=case.get("signature_source"),
         )
 
         # Keyed on the deploy anchor and the verdict, so a second sweep over

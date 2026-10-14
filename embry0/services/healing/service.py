@@ -69,6 +69,7 @@ from embry0.services.healing.lifecycle import (
     Effect,
     Origin,
     ResolutionPath,
+    SignatureSource,
     Stage,
     Verdict,
     transition,
@@ -243,6 +244,7 @@ class HealingCaseService:
         title: str,
         signature: str | None = None,
         signature_id: str | None = None,
+        signature_source: SignatureSource | str | None = None,
         fingerprint: str | None = None,
         severity: str | None = None,
         fixability: str | None = None,
@@ -261,10 +263,13 @@ class HealingCaseService:
         ``parent_case_id`` unless the caller names a different parent.
         ``signature`` is a query (LogQL), not log output; it will be
         executed, so one longer than ``MAX_SIGNATURE`` is refused, never
-        truncated. Timestamps on every write must be timezone-aware and not
-        in the future (``MAX_CLOCK_SKEW`` tolerated).
+        truncated. ``signature_source`` says how the watcher chose
+        ``signature_id`` (#657); confirm-healed answers ``inconclusive`` for
+        a ``fallback`` one. Timestamps on every write must be timezone-aware
+        and not in the future (``MAX_CLOCK_SKEW`` tolerated).
         """
         origin = Origin(origin)
+        source = SignatureSource(signature_source) if signature_source is not None else None
         if signature is not None and len(signature) > MAX_SIGNATURE:
             raise ValueError(
                 f"signature is {len(signature)} characters (limit {MAX_SIGNATURE}): it is executed as a query, "
@@ -287,6 +292,7 @@ class HealingCaseService:
             "fixability": _cap("fixability", fixability),
             "signature": signature,
             "signature_id": signature_id,
+            "signature_source": source.value if source is not None else None,
             "fingerprint": fingerprint,
             "occurrence_count": 1,
             "last_seen_at": when,

@@ -142,11 +142,13 @@ async def test_a_filed_proposal_opens_one_tracked_case_for_its_run():
         title="Fix the breaker",
         watcher_run_id="wr-new",
         fingerprint=proposal_fingerprint("Fix the breaker"),
-        # #290: all three are None here because this service has no signature
+        # #290: these are None here because this service has no signature
         # memory wired. That is the documented degrade — the case is still
-        # opened, keyed on the title hash exactly as before.
+        # opened, keyed on the title hash exactly as before. With nothing
+        # anchored there is no source to record either (#657).
         signature_id=None,
         signature=None,
+        signature_source=None,
         parent_case_id=None,
         severity="high",
         tracker=TrackerRef("linear", "ENG-7", "https://linear.app/x/ENG-7"),

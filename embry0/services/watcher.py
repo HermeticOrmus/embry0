@@ -69,6 +69,7 @@ from embry0.services.log_signatures import (
 )
 from embry0.services.logql_check import LogQLCheck, LogQLStatus, check_logql
 from embry0.services.loop_schedule import seconds_until_next_run
+from embry0.services.signature_attribution import anchor_signature, fallback_anchor
 from embry0.services.signature_delta import (
     DEFAULT_REGRESSION_SILENCE_SECONDS,
     DEFAULT_SPIKE_FACTOR,
@@ -1699,14 +1700,34 @@ class WatcherService:
                 # LazyInitializationException was filed three times.
                 #
                 # The signature is chosen deterministically from the clusters
-                # (loudest notable, else loudest overall) rather than asked of
-                # the model, because an attribution that changes with the
-                # wording is the bug being fixed. ``primary`` is None when
+                # rather than asked of the model, because an attribution that
+                # changes with the wording is the bug being fixed. #657: it is
+                # a cluster the proposal's own evidence quotes; only when none
+                # is does it fall back to the window's loudest (notable) line,
+                # and the case records which. ``anchor`` is None when
                 # clustering is off or nothing has been recorded yet, and then
                 # this degrades to exactly the old behaviour.
-                primary = delta.primary if delta is not None else None
-                signature_id = primary.signature_id if primary else None
-                signature_template = primary.template if primary else None
+                try:
+                    anchor = anchor_signature(proposal["title"], proposal["body"], clusters, delta)
+                except Exception:
+                    # Reading the evidence is an observation like the
+                    # clustering itself: it must never cost the tick its
+                    # finding. The loudest line, marked as such, is the old rule.
+                    logger.warning("watcher_signature_anchor_failed", exc_info=True)
+                    anchor = fallback_anchor(delta)
+                signature_id = anchor.signature_id if anchor else None
+                signature_template = anchor.template if anchor else None
+                signature_source = anchor.source.value if anchor else None
+                if anchor is not None:
+                    logger.info(
+                        "watcher_signature_anchored",
+                        source=anchor.source.value,
+                        match=anchor.match.value,
+                        signature_id=anchor.signature_id,
+                        mapped=len(anchor.mapped),
+                        # What #290's rule alone would have chosen, for comparison.
+                        primary_signature=delta.primary.signature_id if delta and delta.primary else None,
+                    )
 
                 prior_case = None
                 if signature_id and self._ledger_on():
@@ -1725,7 +1746,7 @@ class WatcherService:
                     await self._recorder.finding_recurred(
                         signature_id=signature_id,
                         fingerprint=fingerprint,
-                        occurrences=primary.count if primary else 1,
+                        occurrences=anchor.count if anchor else 1,
                         repo=self._repo,
                         watcher_run_id=result["run_id"],
                     )
@@ -1769,6 +1790,7 @@ class WatcherService:
                         fingerprint=fingerprint,
                         signature_id=signature_id,
                         signature=signature_template,
+                        signature_source=signature_source,
                         parent_case_id=parent_case_id,
                         severity=proposal.get("severity"),
                         tracker=None,
@@ -1803,6 +1825,7 @@ class WatcherService:
                         fingerprint=fingerprint,
                         signature_id=signature_id,
                         signature=signature_template,
+                        signature_source=signature_source,
                         parent_case_id=parent_case_id,
                         severity=proposal.get("severity"),
                         tracker=TrackerRef(self._tracker, issue["identifier"], issue.get("url")),

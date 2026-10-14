@@ -843,7 +843,7 @@ class HealingCasesRepository:
         """
         rows = await self._db.fetch(
             f"""
-            SELECT c.id, c.repo, c.title, c.signature_id, c.signature, c.tracker, c.tracker_key,
+            SELECT c.id, c.repo, c.title, c.signature_id, c.signature, c.signature_source, c.tracker, c.tracker_key,
                    c.tracker_url, c.stage, c.merge_sha, c.merged_at, c.deployed_at,
                    c.deploy_sha, c.deploy_marker_at, c.healed_verdict, c.occurrence_count,
                    {_REOPENS} AS reopens

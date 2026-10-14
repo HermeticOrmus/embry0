@@ -117,6 +117,21 @@ class Verdict(StrEnum):
     REGRESSED = "regressed"
 
 
+class SignatureSource(StrEnum):
+    """How the watcher chose a case's ``signature_id`` (#657).
+
+    NULL on a case the watcher did not anchor: other origins, cases with no
+    signature, and every case opened before this was recorded.
+    """
+
+    # A window cluster the proposal's own evidence quotes.
+    EVIDENCE = "evidence"
+    # Nothing the proposal quotes is a line of the window: the window's
+    # loudest line (#290's rule), which says nothing about this finding, so
+    # confirm-healed answers ``inconclusive`` for it.
+    FALLBACK = "fallback"
+
+
 class Effect(StrEnum):
     """How an event landed on a case."""
 

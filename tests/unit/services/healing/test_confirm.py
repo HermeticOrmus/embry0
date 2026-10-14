@@ -190,3 +190,42 @@ def test_the_lower_bound_is_labelled_as_one() -> None:
     )
     assert "after_at_least" in j.evidence
     assert "after" not in j.evidence, "an exact-sounding field would overstate what is known"
+
+
+# ---- #657: a signature the evidence never quoted proves nothing ------------
+
+
+@pytest.mark.parametrize("seen_since_deploy", [False, True])
+def test_a_fallback_signature_is_inconclusive_whatever_it_did(seen_since_deploy: bool) -> None:
+    """The window's loudest line stopping (or not) says nothing about this case's error."""
+    j = judge(
+        signature_id="sig1",
+        repo="owner/repo",
+        seen_since_deploy=seen_since_deploy,
+        occurrences_after_at_least=3 if seen_since_deploy else 0,
+        prior_rate_per_hour=50.0,
+        plan=_ready(),
+        signature_source="fallback",
+    )
+    assert j.verdict is Verdict.INCONCLUSIVE, (
+        f"a fallback-anchored case was judged {j.verdict.value} on a line its evidence never quoted"
+    )
+    assert j.evidence["signature_source"] == "fallback"
+    assert "reason" in j.evidence
+    # The counts stay, for a person who wants to read them anyway.
+    assert j.evidence["seen_since_deploy"] is seen_since_deploy
+
+
+@pytest.mark.parametrize(("source", "expected"), [("evidence", Verdict.HEALED), (None, Verdict.HEALED)])
+def test_an_evidence_or_unrecorded_source_is_judged_as_before(source: str | None, expected: Verdict) -> None:
+    j = judge(
+        signature_id="sig1",
+        repo="owner/repo",
+        seen_since_deploy=False,
+        occurrences_after_at_least=0,
+        prior_rate_per_hour=50.0,
+        plan=_ready(),
+        signature_source=source,
+    )
+    assert j.verdict is expected
+    assert j.evidence["signature_source"] == source

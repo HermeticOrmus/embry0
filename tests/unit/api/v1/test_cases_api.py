@@ -333,3 +333,20 @@ async def test_cases_require_auth() -> None:
         assert (await client.get("/api/v1/cases/hc-1")).status_code == 401
         ok = await client.get("/api/v1/cases", headers={"Authorization": "Bearer real-key"})
     assert ok.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_the_signature_source_is_served(api_client: AsyncClient, cases: HealingCaseService) -> None:
+    """#657: a reader can tell a case anchored to its own error from one anchored to the window's loudest line."""
+    anchored = await cases.open_case(
+        repo="acme/widgets", origin="watcher", title="quoted", signature_id="sig-a", signature_source="evidence"
+    )
+    fallback = await cases.open_case(
+        repo="acme/widgets", origin="watcher", title="loudest", signature_id="sig-b", signature_source="fallback"
+    )
+    legacy = await cases.open_case(repo="acme/widgets", origin="human", title="no anchor")
+
+    listed = {c["id"]: c["signature_source"] for c in (await api_client.get("/api/v1/cases")).json()["cases"]}
+    assert listed == {anchored["id"]: "evidence", fallback["id"]: "fallback", legacy["id"]: None}
+    detail = (await api_client.get(f"/api/v1/cases/{fallback['id']}")).json()
+    assert detail["signature_source"] == "fallback"

@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 
-from embry0.services.healing.lifecycle import Verdict
+from embry0.services.healing.lifecycle import SignatureSource, Verdict
 
 #: Occurrences we would expect to see in the observation window if the fault
 #: were still live. Three is the smallest number that is not comfortably
@@ -150,6 +150,7 @@ def judge(
     plan: VerificationPlan,
     last_seen_at: datetime | None = None,
     deployed_at: datetime | None = None,
+    signature_source: str | None = None,
 ) -> Judgement:
     """Healed, not healed, or inconclusive — with the counts behind it.
 
@@ -165,6 +166,13 @@ def judge(
     keeps no per-range history, so the exact number since the deploy is not
     recoverable; the evidence names the field accordingly rather than
     presenting a bound as a measurement.
+
+    ``signature_source`` is how the watcher chose the signature (#657). A
+    ``fallback`` signature is the window's loudest line, not one the case's
+    evidence quotes: whether it stopped says nothing about this fix, so the
+    verdict is ``inconclusive`` and the counts stay in the evidence for a
+    person to read. ``None`` (any other origin, or a case opened before the
+    source was recorded) is judged as before.
 
     The evidence dict is counts and rates only, never log lines: it is served
     by the API and the ledger refuses anything over 16 KiB.
@@ -182,6 +190,7 @@ def judge(
         "after_at_least": occurrences_after_at_least if seen_since_deploy else 0,
         "last_seen_at": last_seen_at.isoformat() if last_seen_at else None,
         "deployed_at": deployed_at.isoformat() if deployed_at else None,
+        "signature_source": signature_source,
         # Named so a reader knows the counts came from the signature ledger and
         # not from re-running a query against Loki.
         "source": "log_signatures",
@@ -190,6 +199,13 @@ def judge(
     if signature_id is None:
         evidence["reason"] = "the case carries no signature id, so nothing can be counted"
         return Judgement(Verdict.INCONCLUSIVE, evidence, "no signature to verify against")
+
+    if signature_source == SignatureSource.FALLBACK:
+        evidence["reason"] = (
+            "the signature is the loudest line of the window the finding was detected in, not a line its "
+            "evidence quotes, so the counts describe that line and not this case's error"
+        )
+        return Judgement(Verdict.INCONCLUSIVE, evidence, "the signature is not one the finding's evidence quotes")
 
     if plan.readiness is Readiness.UNJUDGEABLE:
         evidence["reason"] = plan.reason
