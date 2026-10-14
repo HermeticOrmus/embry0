@@ -434,6 +434,13 @@ async def run_agent_node(
     except AuthConfigError as exc:
         return _stamp_loaded_preferences(_auth_error_updates(agent_type, exc, state), state, loaded_prefs)
 
+    # Repo records: read-only tools for the job's own repository, granted only
+    # when init_node recorded that the records-proxy confirmed this sandbox.
+    if state.get("records_tool"):
+        from embry0.orchestration.records_tool import grant_records_tool
+
+        invocation = grant_records_tool(invocation)
+
     # RAV-1260: turn-budget awareness. Agents with investigation tools kept
     # investigating until the harness killed them at max_turns with no
     # decision emitted (review job-54a05ee073d6, triage job-9a889c7c42c5).

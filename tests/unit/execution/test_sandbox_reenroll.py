@@ -200,3 +200,21 @@ async def test_a_failed_enrollment_is_retryable():
             "cid-1", job_id="job-1", repo="acme/widgets", forge="github", xai_credential_id=None, context_scope=None
         )
     assert exc.value.error_code == ErrorCode.SANDBOX_INIT
+
+
+@pytest.mark.parametrize("confirmed", [True, False], ids=["confirmed", "unconfirmed"])
+async def test_reenroll_rewrites_the_records_token_only_when_the_proxy_confirmed(confirmed):
+    docker, calls = _docker()
+    pm = _proxy()
+    pm.records_proxy_url = "http://records-proxy:9108"
+    pm.records_access = MagicMock(return_value=confirmed)
+    mgr = _manager(docker, pm)
+
+    await mgr.reenroll(
+        "cid-1", job_id="job-1", repo="acme/widgets", forge="github", xai_credential_id=None, context_scope=None
+    )
+
+    pm.records_access.assert_called_once_with("cid-1")
+    execs = [" ".join(c) for c in calls if c and c[0] == "exec"]
+    written = any(NEW_TOKEN in c and "records_proxy_token" in c for c in execs)
+    assert written is confirmed, f"records token written={written}, proxy confirmed={confirmed}: {execs}"

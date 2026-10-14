@@ -499,6 +499,12 @@ class JobState(TypedDict, total=False):
     # provisioning; the developer node grants mcp__context__logs_query when it
     # is non-empty. Same last-write semantics as watcher_log_tool above.
     case_log_containers: Annotated[list[str], FoldingLastValue]
+    # Repo records: set True by init_node ONLY when the records-proxy confirmed
+    # this job's sandbox for the job's repository and the bearer file was
+    # written. run_agent_node then grants every agent of the job the read-only
+    # mcp__records__* tools. Top-level key: MUST stay declared here or
+    # LangGraph's state-merge silently drops it.
+    records_tool: Annotated[bool, FoldingLastValue]
     # Structured QA-specific state populated by Phase 2's QA pipeline nodes.
     # Present when pipeline=qa OR (Phase 5) triage sets needs_qa=True.
     # RAV-1142: six files write this block; the qa_rerun superstep produced

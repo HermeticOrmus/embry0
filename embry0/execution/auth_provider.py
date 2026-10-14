@@ -41,6 +41,9 @@ RESERVED_ENV_KEYS: Final[frozenset[str]] = frozenset(
         # RAV-1140: base URL of the mediated log-query proxy; injected by
         # init_node for watcher analysis jobs only — never user-settable.
         "EMBRY0_CONTEXT_PROXY_URL",
+        # Repo records: base URL of the records-proxy; injected by init_node
+        # for jobs with a repository — never user-settable.
+        "EMBRY0_RECORDS_PROXY_URL",
         # #166: forge credentials are injected by the proxies, never by the
         # user's environment — the same rule GITHUB_TOKEN already follows.
         "GITLAB_TOKEN",

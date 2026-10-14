@@ -801,7 +801,8 @@ class SandboxManager:
         ``git_push_branches`` as the job's state names them now), then
         writes the new bearer where the sandbox reads it: the xAI token file,
         git's proxy config (which also replaces the credential helper of a
-        sandbox created before #521), and the context-proxy token when the job
+        sandbox created before #521), the records-proxy token when the proxy
+        confirmed the sandbox, and the context-proxy token when the job
         had log access (``context_scope`` is True for a watcher job, the
         granted container list otherwise). The token is minted here and
         written in; nothing stores it.
@@ -873,6 +874,17 @@ class SandboxManager:
                 f"sandbox {container} could not be re-enrolled with the proxies: {exc}",
                 error_code=ErrorCode.SANDBOX_INIT,
             ) from exc
+
+        if getattr(proxy, "records_proxy_url", "") and proxy.records_access(container):
+            # Fail-open, as at init: the new bearer must reach the records tool's file.
+            from embry0.sandbox.records_mcp import build_records_token_write_cmd
+
+            try:
+                await self._docker.run_cmd(
+                    self._docker.build_exec_cmd(container, build_records_token_write_cmd(sandbox_token)), timeout=10
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("sandbox_reenroll_records_failed", job_id=job_id, container=container, error=str(exc))
 
         if context_scope:
             # Fail-open, as at init: log access is a tool the job can do without.

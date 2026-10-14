@@ -257,6 +257,13 @@ async def init_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, 
         if wants_log_tool:
             env["EMBRY0_CONTEXT_PROXY_URL"] = context_proxy_url
 
+        # Repo records: every job with a repository may read that repository's
+        # records through the records-proxy (enrolled by sandbox_mgr.create).
+        records_proxy_url = getattr(proxy_mgr, "records_proxy_url", "") if proxy_mgr else ""
+        wants_records = bool(records_proxy_url) and bool(repo)
+        if wants_records:
+            env["EMBRY0_RECORDS_PROXY_URL"] = records_proxy_url
+
         # RAV-1058: honour a job-create sandbox_profile. Resolved by name via
         # profiles_repo (the QA acquire_sandbox pattern); an unknown name fails
         # the job loudly here rather than silently running on the default
@@ -329,6 +336,23 @@ async def init_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, 
             except Exception as exc:
                 logger.warning("context_proxy_provisioning_failed", job_id=job_id, error=str(exc))
 
+        # Repo records: deliver the bearer only when the records-proxy confirmed
+        # this sandbox for the job's repository. Fail-open: records are context
+        # the job can do without, and the flag is set only on full success.
+        records_ready = False
+        if wants_records and docker and proxy_mgr and proxy_mgr.records_access(container_id):
+            try:
+                from embry0.sandbox.records_mcp import build_records_token_write_cmd
+
+                await docker.run_cmd(
+                    docker.build_exec_cmd(container_id, build_records_token_write_cmd(sandbox_token)),
+                    timeout=10,
+                )
+                records_ready = True
+                logger.info("records_proxy_provisioned", job_id=job_id, repo=repo)
+            except Exception as exc:
+                logger.warning("records_proxy_provisioning_failed", job_id=job_id, error=str(exc))
+
         init_update = await initializer.initialize(
             InitContext(
                 job_id=job_id,
@@ -382,4 +406,6 @@ async def init_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, 
         update["case_log_containers"] = list(granted_scope)
     if case_evidence:
         update["case_evidence"] = case_evidence
+    if records_ready:
+        update["records_tool"] = True
     return update

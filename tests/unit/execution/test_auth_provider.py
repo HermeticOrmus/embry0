@@ -29,6 +29,8 @@ def test_reserved_env_keys_export_expected_set() -> None:
         "EMBRY0_XAI_DIRECT_EXECUTOR",
         # RAV-1140: mediated log-query proxy URL for watcher analysis jobs.
         "EMBRY0_CONTEXT_PROXY_URL",
+        # Repo records: the records-proxy URL, injected by init_node.
+        "EMBRY0_RECORDS_PROXY_URL",
         # #240: re-enabling MCP tool-search deferral would strip agents of
         # their MCP tools (embry0 denies ToolSearch, so deferred = unreachable).
         "ENABLE_TOOL_SEARCH",
