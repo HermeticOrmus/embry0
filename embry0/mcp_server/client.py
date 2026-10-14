@@ -13,6 +13,7 @@ import os
 import re
 from contextvars import ContextVar
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -566,6 +567,35 @@ class Embry0Client:
                 headers={"Content-Type": "application/yaml"},
             )
         )
+
+    # ---------------------------------------------------------------- repo records
+
+    @staticmethod
+    def _record_path(repo: str, slug: str = "") -> str:
+        base = f"/api/v1/repos/{_repo_path(repo)}/records"
+        # The slug is one path segment; quote it so a stray "/" cannot reach another route.
+        return f"{base}/{quote(slug, safe='')}" if slug else base
+
+    async def record_list(
+        self, repo: str, *, kind: str | None = None, query: str | None = None, limit: int = 200
+    ) -> dict[str, Any]:
+        params = _drop_none({"kind": kind or None, "q": query or None, "limit": limit})
+        return _as_dict(await self._request("GET", self._record_path(repo), params=params))
+
+    async def record_get(self, repo: str, slug: str, *, revision: int | None = None) -> dict[str, Any]:
+        params = _drop_none({"revision": revision})
+        return _as_dict(await self._request("GET", self._record_path(repo, slug), params=params))
+
+    async def record_revisions(self, repo: str, slug: str) -> dict[str, Any]:
+        return _as_dict(await self._request("GET", f"{self._record_path(repo, slug)}/revisions"))
+
+    async def record_put(
+        self, repo: str, slug: str, *, kind: str, body: str, title: str | None = None
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"kind": kind, "body": body}
+        if title:
+            payload["title"] = title
+        return _as_dict(await self._request("PUT", self._record_path(repo, slug), body=payload))
 
     # ----------------------- credentials (spec 2026-09-29 §3.9) — never creates or reveals a secret
 

@@ -643,3 +643,25 @@ async def test_job_logs_pages_to_the_tail():
     assert result == {"events": [{"n": 1}, {"n": 2}, {"n": 3}]}, f"did not page to the tail: {result}"
     cursors = [r.url.params.get("since_seq") for r in handler.seen]
     assert cursors == ["0", "20"]
+
+
+async def test_record_paths_keep_a_subgroup_whole_and_quote_the_slug():
+    nested = "group/sub/project"
+    handler = capture(
+        {
+            ("GET", f"/api/v1/repos/{nested}/records"): {"repo": nested, "records": []},
+            ("GET", f"/api/v1/repos/{nested}/records/outage"): {"slug": "outage"},
+            ("PUT", f"/api/v1/repos/{nested}/records/outage"): {"slug": "outage", "created": True},
+        }
+    )
+    client = make_client(handler)
+    await client.record_list(nested, kind="rca", query="cache")
+    assert handler.seen[-1].url.params["kind"] == "rca" and handler.seen[-1].url.params["q"] == "cache"
+    await client.record_get(nested, "outage", revision=3)
+    assert handler.seen[-1].url.params["revision"] == "3"
+    await client.record_put(nested, "outage", kind="rca", body="# x")
+    assert json.loads(handler.seen[-1].content) == {"kind": "rca", "body": "# x"}
+    assert handler.seen[-1].headers["X-Requested-With"] == "XMLHttpRequest"
+    with pytest.raises(Embry0APIError):
+        await client.record_get(nested, "../../other/records/x")
+    assert handler.seen[-1].url.raw_path.decode().endswith("/records/..%2F..%2Fother%2Frecords%2Fx")

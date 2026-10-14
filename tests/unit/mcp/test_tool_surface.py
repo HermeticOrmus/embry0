@@ -141,6 +141,16 @@ EXPECTED_PARAMETERS: dict[str, list[str]] = {
     ],
     "qa_config_get": ["repo: string"],
     "qa_config_set": ["confirm: boolean = false", "repo: string", "yaml_text: string"],
+    "record_get": ["repo: string", "revision: integer|null = null", "slug: string"],
+    "record_list": ["kind: string|null = null", "query: string|null = null", "repo: string"],
+    "record_put": [
+        "body: string",
+        "confirm: boolean = false",
+        "kind: string",
+        "repo: string",
+        "slug: string",
+        "title: string|null = null",
+    ],
     "repo_get": ["repo: string"],
     "repo_list": ["include_inactive: boolean = false"],
     "repo_register": ["confirm: boolean = false", 'forge: string = ""', 'notes: string = ""', "repo: string"],
@@ -212,6 +222,7 @@ async def test_every_confirm_gated_tool_defaults_to_refusing():
         "job_resume",
         "merge_decide",
         "qa_config_set",
+        "record_put",
         "repo_register",
     }
     for name in gated:

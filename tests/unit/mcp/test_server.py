@@ -48,6 +48,9 @@ EXPECTED_TOOLS = {
     "credential_list",
     "credential_resolve",
     "credential_bind",
+    "record_list",
+    "record_get",
+    "record_put",
 }
 
 CONFIRM_GATED = {
@@ -64,6 +67,7 @@ CONFIRM_GATED = {
     "repo_register",
     "qa_config_set",
     "credential_bind",
+    "record_put",
 }
 
 
@@ -304,3 +308,24 @@ def test_case_accept_says_a_linear_draft_is_accepted_here():
     # The one tracker still left to its label, and the promise the route keeps.
     assert "A GitLab draft is still accepted by adding the label in GitLab" in doc
     assert "there is no success without one" in doc
+
+
+async def test_record_put_is_confirm_gated(fake_client):
+    refusal = await server.record_put("acme/widgets", "outage", "rca", "# Outage")
+    assert refusal["error"] == "confirmation_required"
+    assert "outage" in refusal["message"] and "acme/widgets" in refusal["message"]
+    assert fake_client.calls == [], "record_put must not write without confirm=true"
+    out = await server.record_put("acme/widgets", "outage", "rca", "# Outage", title="T", confirm=True)
+    assert out == {"called": "record_put"}
+    assert fake_client.calls[-1] == (
+        "record_put",
+        ("acme/widgets", "outage"),
+        {"kind": "rca", "body": "# Outage", "title": "T"},
+    )
+
+
+async def test_record_read_tools_pass_through(fake_client):
+    assert await server.record_list("group/sub/project", kind="rca", query="cache") == {"called": "record_list"}
+    assert fake_client.calls[-1] == ("record_list", ("group/sub/project",), {"kind": "rca", "query": "cache"})
+    assert await server.record_get("group/sub/project", "outage", revision=2) == {"called": "record_get"}
+    assert fake_client.calls[-1] == ("record_get", ("group/sub/project", "outage"), {"revision": 2})

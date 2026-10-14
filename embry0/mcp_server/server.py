@@ -6,7 +6,7 @@ Run via the ``embry0-mcp`` console script (stdio transport). Configure with
 Destructive or mutating-sensitive tools (``job_cancel``, ``job_resume``,
 ``job_answer``, ``agent_update``, ``agent_reset``, ``env_set``, ``env_delete``,
 ``merge_decide``, ``case_accept``, ``case_close``, ``repo_register``,
-``qa_config_set``, ``credential_bind``) require ``confirm=true``; without it
+``qa_config_set``, ``credential_bind``, ``record_put``) require ``confirm=true``; without it
 they return an instructive refusal instead of acting.
 """
 
@@ -32,7 +32,8 @@ mcp = MCPServer(
         "Tools for driving the embry0 issue-to-PR / QA / research automation platform: "
         "issues, jobs (create/wait/logs/deliverables), agent definitions, pipeline "
         "templates, the log watcher, healing cases, merge approvals, per-repo environment "
-        "variables, and forge credentials (list, resolve, bind). "
+        "variables, forge credentials (list, resolve, bind), and per-repo records "
+        "(RCAs, audits, runbooks and other documents kept out of git). "
         "Destructive tools require confirm=true after explicit user approval. "
         'Two lists answer "what is open?", and they are different things: '
         'issue_list(status="open") is the work on the Issues page of the dashboard; '
@@ -718,6 +719,35 @@ async def qa_config_set(repo: str, yaml_text: str, confirm: bool = False) -> dic
     if not confirm:
         return _confirmation_refusal("qa_config_set", f"replace the stored QA config for {repo!r}")
     return await _get_client().qa_config_set(repo, yaml_text)
+
+
+@_tool
+async def record_list(repo: str, kind: str | None = None, query: str | None = None) -> dict[str, Any]:
+    """List a repo's records (Markdown documents stored in embry0, never in a git tree:
+    RCAs, audits, runbooks, deployment-specific specs and plans), newest first.
+    repo is "group/name" or a GitLab subgroup path; kind is one of rca, audit, spec,
+    plan, spike, runbook, note; query is a case-insensitive substring of title or body."""
+    return await _get_client().record_list(repo, kind=kind, query=query)
+
+
+@_tool
+async def record_get(repo: str, slug: str, revision: int | None = None) -> dict[str, Any]:
+    """One record with its Markdown body: the current revision, or `revision`. The
+    reply's current_revision says how many revisions exist."""
+    return await _get_client().record_get(repo, slug, revision=revision)
+
+
+@_tool
+async def record_put(
+    repo: str, slug: str, kind: str, body: str, title: str | None = None, confirm: bool = False
+) -> dict[str, Any]:
+    """Create a record or add a revision to it (identical title and body add nothing).
+    slug: lowercase letters, digits, '.', '_', '-'. kind is fixed when the record is
+    created. title defaults to the body's first '# ' heading. Body at most 512 KiB.
+    Every agent working on this repo can read its records. Requires confirm=true."""
+    if not confirm:
+        return _confirmation_refusal("record_put", f"write record {slug!r} ({kind}) for {repo!r}")
+    return await _get_client().record_put(repo, slug, kind=kind, body=body, title=title)
 
 
 @_tool
