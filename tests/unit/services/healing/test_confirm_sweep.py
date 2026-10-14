@@ -66,7 +66,8 @@ class _Service:
 
     async def reopen(self, case_id, *, reason, at=None, event_key=None):
         self.reopens.append((case_id, reason, event_key))
-        return {"id": case_id, "stage": "accepted"}
+        # Where HealingCaseService.reopen lands a case: back with a person (#658).
+        return {"id": case_id, "stage": "tracked"}
 
 
 def _sweep(cases, row, *, comments=None, retry=(), **cfg):
@@ -387,7 +388,10 @@ async def test_a_not_healed_case_with_retries_left_is_reopened() -> None:
     assert case_id == "hc-1"
     assert "retry 1 of 1" in reason, reason
     assert key and "hc-1" in key
-    assert any("another fix attempt" in body for _k, body in comments), comments
+    # The ticket is told that nothing started and what a person can do (#658).
+    assert any("Nothing has been dispatched" in body and "accept the case again" in body for _k, body in comments), (
+        comments
+    )
 
 
 @pytest.mark.asyncio

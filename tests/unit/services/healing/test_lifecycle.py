@@ -11,6 +11,7 @@ from embry0.services.healing.lifecycle import (
     Effect,
     IllegalTransitionError,
     Stage,
+    Transition,
     fix_deployed,
     transition,
 )
@@ -47,7 +48,7 @@ EXPECTED: dict[tuple[CaseEvent, bool, bool, bool], Row] = {
     (E.VERDICT_RECORDED, False, True, True): [(S.VERIFIED, _A), (S.VERIFIED, _A), (S.VERIFIED, _A), (S.VERIFIED, _A), (S.VERIFIED, _A), (S.VERIFIED, _A), (S.VERIFIED, _R), _POST],
     (E.RECURRENCE, False, True, True): [(S.DETECTED, _N), (S.TRACKED, _N), (S.ACCEPTED, _N), (S.PR_OPEN, _N), (S.MERGED, _N), (S.DEPLOYED, _N), (S.VERIFIED, _N), _POST],
     (E.ABANDONED, False, True, True): [(S.DETECTED, _N), (S.TRACKED, _N), (S.CLOSED, _A), (S.PR_OPEN, _N), (S.MERGED, _N), (S.DEPLOYED, _N), (S.VERIFIED, _N), _POST],
-    (E.REOPENED, False, True, True): [_X, _X, (S.ACCEPTED, _R), _X, _X, _X, (S.ACCEPTED, _A), _X],
+    (E.REOPENED, False, True, True): [_X, (S.TRACKED, _R), _X, _X, _X, _X, (S.TRACKED, _A), _X],
     (E.CLOSED, False, True, True): [(S.CLOSED, _A)] * 7 + [(S.CLOSED, _R)],
 }  # fmt: skip
 
@@ -136,6 +137,17 @@ def test_only_a_reopen_or_a_closed_pr_moves_a_case_backwards() -> None:
         expected = _expected(stage, event, others, anchors, current)
         if expected is not None and _STAGES.index(expected[0]) < _STAGES.index(stage):
             assert event in (CaseEvent.REOPENED, CaseEvent.PR_CLOSED)
+
+
+def test_a_reopen_hands_the_retry_to_a_person_and_never_to_the_dispatch_alert() -> None:
+    """#658: `accepted` means a job should be starting, and a critical alert
+    pages on a case that sits there. A reopen dispatches nothing, so landing
+    on `accepted` paged on every retry; it waits at `tracked` for a yes."""
+    landed = transition(Stage.VERIFIED, E.REOPENED)
+    assert landed.stage is Stage.TRACKED, f"a reopen landed on {landed.stage.value!r}, not on 'tracked'"
+    assert landed.stage in OPEN_UNACCEPTED_STAGES
+    # Accepting it again is the ordinary acceptance, applied.
+    assert transition(landed.stage, E.ACCEPTED) == Transition(Stage.ACCEPTED, Effect.APPLIED, Stage.ACCEPTED)
 
 
 def test_a_transition_names_the_stage_its_event_stands_for() -> None:

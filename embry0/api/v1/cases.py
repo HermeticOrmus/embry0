@@ -9,7 +9,9 @@ instead of in its tracker, and the acceptance is the same dispatch the label
 webhook would have run — the case is linked and accepted by the job. How the
 draft is dispatched is its tracker's business (``_ACCEPTORS``): a GitHub
 draft is read back and dispatched; a Linear draft gets the trigger label and
-goes through the Linear trigger path, label webhook and all.
+goes through the Linear trigger path, label webhook and all. A case a
+``not_healed`` verdict sent back (#658) is accepted here too, and its retry is
+dispatched on the issue the failed attempt ran on (``_accept_retry``).
 
 ``POST /cases/{id}/close`` (#410): the other end. A case whose fix nobody
 will ship — already fixed elsewhere, out of scope, a false positive found
@@ -40,6 +42,7 @@ from embry0.api.trigger_context import current_linear_sync, linear_trigger_conte
 from embry0.audit.helpers import emit_audit
 from embry0.services.healing.lifecycle import Origin, ResolutionPath, Stage, Verdict
 from embry0.storage.repositories.healing_cases import HealingCasesRepository
+from embry0.storage.repositories.jobs import StatusTransitionConflict
 from embry0.storage.schemas import IssueStatus
 from embry0.trackers.dispatch import create_tracked_issue, dispatch_open_issue
 from embry0.trackers.models import TrackerIssue
@@ -87,9 +90,11 @@ async def list_cases(
     drops closed cases; ``total`` counts every case matching the filters.
 
     ``awaiting_decision`` is "what is waiting for a person": watcher drafts
-    with a ticket that nobody has accepted or rejected. ``open_only`` is not
-    that — it also returns alerts, findings with no ticket yet, and every
-    merged, deployed and verified case, none of which anyone can act on here.
+    with a ticket that nobody has accepted or rejected, and findings a
+    ``not_healed`` verdict sent back for a retry nobody has accepted yet.
+    ``open_only`` is not that — it also returns alerts, findings with no
+    ticket yet, and every merged, deployed and verified case, none of which
+    anyone can act on here.
 
     To ask "did a fix ship?" filter on ``fix_deployed``, not on ``stage``:
     ``verified`` and ``closed`` also hold cases that healed with no fix."""
@@ -367,6 +372,58 @@ async def _accept_linear(request: Request, case: dict[str, Any], actor: str) -> 
     return str(result.get("issue_id") or ""), job_id
 
 
+async def _accept_retry(request: Request, case: dict[str, Any], actor: str) -> tuple[str, str]:
+    """Dispatch the retry of a case a ``not_healed`` verdict sent back (#658).
+
+    Such a case already links the embry0 issue its failed attempt ran on,
+    and that issue was closed when the attempt's PR merged. Its tracker's
+    own path refuses it for good reasons: a label never repeats delivered
+    work (``trackers.redispatch``), and the ticket itself is often finished
+    by then. Accepting the case is the person's explicit "try again", so the
+    retry is dispatched here, on that same issue — reopened, then handed to
+    the executor like a retry from the dashboard. The executor links the job
+    to the case, which accepts it; the ticket is not touched. Returns
+    ``(issue_id, job_id)``.
+
+    Only a ``closed`` issue is reopened. One that is ``cancelled`` was
+    stopped by a person, and one in any other status has a job on it.
+    """
+    issue_id = str(case.get("issue_id") or "")
+    issues_repo = request.app.state.issues_repo
+    executor = getattr(request.app.state, "issue_executor", None)
+    if executor is None:
+        raise HTTPException(status_code=503, detail="executor not initialized")
+    issue = await issues_repo.get(issue_id)
+    if issue is None:
+        raise HTTPException(status_code=409, detail=f"the case's issue {issue_id} no longer exists")
+    status = str(issue.get("status") or "")
+    if status == IssueStatus.CLOSED:
+        try:
+            await issues_repo.update(issue_id, status=IssueStatus.OPEN)
+        except (ValueError, StatusTransitionConflict):
+            raise HTTPException(
+                status_code=409, detail=f"issue {issue_id} changed while it was being reopened; accept again"
+            ) from None
+        status = IssueStatus.OPEN
+    if status != IssueStatus.OPEN:
+        raise HTTPException(
+            status_code=409, detail=f"issue {issue_id} is {status}: a job is already active or it was cancelled"
+        )
+
+    job_id = await dispatch_open_issue(
+        issue_id,
+        status,
+        issues_repo,
+        executor,
+        tracker=str(case.get("tracker") or ""),
+        reason="case_retry_accepted",
+        actor=actor,
+    )
+    if job_id is None:
+        raise HTTPException(status_code=502, detail="the dispatch failed; the issue was returned to open, accept again")
+    return issue_id, job_id
+
+
 #: How a draft is dispatched, per tracker: ``(request, case, actor)`` →
 #: ``(issue_id, job_id)``, or an HTTPException that says what, if anything,
 #: was left behind.
@@ -397,13 +454,19 @@ async def accept_case(
     advance it from there. A GitLab draft is not accepted here yet: 409, add
     the label in GitLab.
 
+    A case a ``not_healed`` verdict sent back to ``tracked`` already links
+    the issue of its failed attempt. Accepting it dispatches the retry on
+    that issue, whatever the tracker (``_accept_retry``): the tracker's own
+    path would refuse delivered work.
+
     Refused — no job, and no label left on the ticket — unless the case is a
     watcher finding at stage ``tracked``, its draft is in a tracker this
-    route dispatches, and its repo is a stack this orchestrator watches and
-    has enabled. The last condition is what lets a narrowly scoped key (the
-    chat bot's) hold this route: it can accept this deployment's own
-    findings and nothing else. The one exception to "no label left" is said
-    in the error itself: a label that went on and could not be removed.
+    route dispatches (a retry needs none), and its repo is a stack this
+    orchestrator watches and has enabled. The last condition is what lets a
+    narrowly scoped key (the chat bot's) hold this route: it can accept this
+    deployment's own findings and nothing else. The one exception to "no
+    label left" is said in the error itself: a label that went on and could
+    not be removed.
     """
     case = await cases.get(case_id)
     if case is None:
@@ -422,13 +485,16 @@ async def accept_case(
         if stage == Stage.CLOSED:
             raise HTTPException(status_code=409, detail="the case is closed")
         raise HTTPException(status_code=409, detail=f"already accepted (stage {stage})")
-    acceptor = _ACCEPTORS.get(tracker)
+    # At `tracked` a case links an issue only when a reopen sent it back
+    # there: every other way of linking one accepts the case.
+    retry = bool(case.get("issue_id"))
+    acceptor = _accept_retry if retry else _ACCEPTORS.get(tracker)
     if acceptor is None:
         raise HTTPException(
             status_code=409,
             detail=f"a {tracker or 'trackerless'} draft is accepted in its tracker: add the trigger label to {key or 'the ticket'}",
         )
-    if not key:
+    if not key and not retry:
         raise HTTPException(status_code=409, detail="the case names no draft ticket")
 
     stacks = getattr(request.app.state, "watcher_stacks_repo", None)
@@ -453,10 +519,13 @@ async def accept_case(
             "issue_id": issue_id,
             "job_id": job_id,
             "accepted_by": actor,
+            "retry": retry,
         },
         audit_log_path=getattr(config, "audit_log_path", None),
     )
-    logger.info("case_accepted", case_id=case_id, repo=repo, tracker_key=key, issue_id=issue_id, job_id=job_id)
+    logger.info(
+        "case_accepted", case_id=case_id, repo=repo, tracker_key=key, issue_id=issue_id, job_id=job_id, retry=retry
+    )
     return {
         "case_id": case_id,
         "repo": repo,

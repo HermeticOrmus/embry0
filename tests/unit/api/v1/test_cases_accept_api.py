@@ -168,3 +168,139 @@ async def test_the_acceptance_is_audited(api_client: AsyncClient, wired: dict[st
     assert row is not None
     details = row["details"] if isinstance(row["details"], dict) else __import__("json").loads(row["details"])
     assert details["case_id"] == case_id and details["job_id"] == "job-1" and details["accepted_by"] == "Alex"
+
+
+# ---- #658: accepting a case a not_healed verdict sent back --------------------
+
+
+@pytest.fixture
+async def dispatching(api_client: AsyncClient) -> dict[str, Any]:
+    """Like ``wired``, with the real executor: it creates the job row and
+    links it to the case, as production does; only the pipeline run is
+    dropped. The draft is closed on GitHub: the failed attempt's merge closed it."""
+    app = api_client.app
+    await app.state.db.execute("TRUNCATE TABLE healing_cases, issues, jobs, watcher_stacks CASCADE")
+    await app.state.db.execute("TRUNCATE TABLE repos CASCADE")
+    await app.state.repos_repo.register(REPO, forge="github")
+    stacks = WatcherStacksRepository(app.state.db)
+    await stacks.upsert(WatcherStack(repo=REPO, logql='{compose_project="x"}', tracker="github"))
+    app.state.watcher_stacks_repo = stacks
+    app.state.github_issues_client = _FakeGitHub(_issue(state="closed"))
+    app.state.issue_executor._track_task = lambda coro, **_: coro.close()
+    return {"app": app, "cases": app.state.healing_cases}
+
+
+async def _reopened_case(app: Any, cases: HealingCaseService, tracker: TrackerRef) -> tuple[str, str, str]:
+    """A draft accepted by its job, whose PR merged and deployed and did not
+    stop the error, sent back by the confirm sweep's reopen: the rows merge
+    sync, the deploy marker and the sweep leave. Returns (case, issue, job)."""
+    from datetime import UTC, datetime, timedelta
+
+    case_id = str((await cases.open_case(repo=REPO, origin="watcher", title="a finding", tracker=tracker))["id"])
+    issue_id = await app.state.issues_repo.create(
+        title="a finding",
+        repo=REPO,
+        labels=["embry0"],
+        created_by="case-accept",
+        tracker=tracker.kind,
+        tracker_key=tracker.key,
+        tracker_url=tracker.url,
+    )
+    job_id = await app.state.jobs_repo.create(repo=REPO, task="the first fix", issue_id=issue_id)
+    await cases.attach_job(case_id, job_id, event_key=f"job:{job_id}")
+    pr = f"https://github.com/{REPO}/pull/9"
+    await app.state.jobs_repo.update(job_id, status="running")
+    await app.state.jobs_repo.update(job_id, status="completed", pr_url=pr)
+    await app.state.jobs_repo.update(job_id, status="pr_merged")
+    await app.state.issues_repo.update(issue_id, status="closed")
+    now = datetime.now(UTC)
+    await cases.record_merge(case_id, merge_sha="m1", resolution_path="embry0", pr_url=pr, at=now - timedelta(hours=7))
+    await cases.record_deploy(case_id, sha="d1", marker_at=now - timedelta(hours=6))
+    await cases.record_verdict(case_id, "not_healed", evidence={"seen_since_deploy": True})
+    await cases.reopen(case_id, reason="not_healed after the deploy of d1: retry 1 of 1")
+    return case_id, issue_id, job_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["github", "gitlab"])
+async def test_accepting_a_reopened_case_dispatches_the_retry_on_its_issue(
+    api_client: AsyncClient, dispatching: dict[str, Any], kind: str
+) -> None:
+    """The case links the closed issue of its failed attempt, whose job
+    delivered a merged PR, and its draft is closed: everything the first
+    acceptance refuses. Accepting it again is the person's "try again", so it
+    starts a new job on that issue, for any tracker, and the job's link
+    accepts the case."""
+    app = dispatching["app"]
+    case_id, issue_id, first_job = await _reopened_case(app, dispatching["cases"], TrackerRef(kind, "397", URL))
+
+    r = await api_client.post(f"/api/v1/cases/{case_id}/accept", json={"accepted_by": "Alex"})
+
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["issue_id"] == issue_id, "the retry must run on the failed attempt's issue"
+    assert body["job_id"] and body["job_id"] != first_job
+    retry = await app.state.jobs_repo.get(body["job_id"])
+    assert retry is not None and retry["issue_id"] == issue_id and retry["dispatched_by"] == "Alex"
+    assert (await app.state.issues_repo.get(issue_id))["status"] == "triaging"
+    detail = (await api_client.get(f"/api/v1/cases/{case_id}")).json()
+    assert detail["stage"] == "accepted", detail["stage"]
+    assert [job["job_id"] for job in detail["jobs"]] == [first_job, body["job_id"]]
+    # The issue is retried; the draft is not read back.
+    assert app.state.github_issues_client.asked == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["cancelled", "in_progress"])
+async def test_a_reopened_case_whose_issue_is_not_closed_and_not_open_is_409(
+    api_client: AsyncClient, dispatching: dict[str, Any], status: str
+) -> None:
+    """Only the closed issue of a delivered attempt is reopened. A cancelled
+    one was stopped by a person; one in any other status has a job on it."""
+    app = dispatching["app"]
+    case_id, issue_id, first_job = await _reopened_case(app, dispatching["cases"], TrackerRef("github", "397", URL))
+    await app.state.db.execute("UPDATE issues SET status = $2 WHERE id = $1", issue_id, status)
+
+    r = await api_client.post(f"/api/v1/cases/{case_id}/accept", json={})
+
+    assert r.status_code == 409 and status in r.json()["detail"], r.text
+    rows, _total = await app.state.jobs_repo.list_all(issue_id=issue_id, limit=10, offset=0)
+    assert [row["job_id"] for row in rows] == [first_job]
+    assert (await app.state.issues_repo.get(issue_id))["status"] == status
+
+
+@pytest.mark.asyncio
+async def test_a_reopened_github_case_is_also_accepted_by_its_label(
+    api_client: AsyncClient, dispatching: dict[str, Any]
+) -> None:
+    """The label path needs nothing new: a person reopens the GitHub issue the
+    merged fix closed and labels it again, the webhook dispatches on the same
+    issue, and the job's link accepts the case."""
+    from embry0.services.github_sync import GitHubSyncService
+    from embry0.trackers import TriggerContext
+
+    app = dispatching["app"]
+    case_id, issue_id, first_job = await _reopened_case(app, dispatching["cases"], TrackerRef("github", "397", URL))
+    waiting = (await api_client.get(f"/api/v1/cases/{case_id}")).json()["stage"]
+    assert waiting == "tracked", f"a reopened case is at {waiting!r} before anyone accepted the retry"
+    sync = GitHubSyncService(github_token="t")
+
+    async def deliver(action: str, labels: list[str]) -> dict[str, Any]:
+        payload = {"repository": {"full_name": REPO}, "issue": {**_issue(), "labels": [{"name": n} for n in labels]}}
+        ctx = TriggerContext(
+            issues_repo=app.state.issues_repo,
+            issue_executor=app.state.issue_executor,
+            trigger_labels={"embry0"},
+            event_type="issues",
+            action=action,
+        )
+        return await sync.handle_webhook_event(payload, ctx)
+
+    await deliver("reopened", ["embry0"])
+    await deliver("unlabeled", [])
+    labeled = await deliver("labeled", ["embry0"])
+
+    assert labeled.get("dispatched") is True and labeled.get("issue_id") == issue_id, labeled
+    detail = (await api_client.get(f"/api/v1/cases/{case_id}")).json()
+    assert detail["stage"] == "accepted", detail["stage"]
+    assert len(detail["jobs"]) == 2 and detail["jobs"][0]["job_id"] == first_job

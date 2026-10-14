@@ -338,8 +338,31 @@ async def test_falling_back_to_accepted_keeps_the_first_acceptance_time(
     accepted = (await service.attach_job(cid, await seed.job(), at=T))["accepted_at"]
     await service.attach_pr(cid, url=PR)
     assert (await service.close_pr(cid, url=PR, at=T + timedelta(days=2)))["accepted_at"] == accepted
-    await service.record_verdict(cid, Verdict.NOT_HEALED, evidence={})
-    assert (await service.reopen(cid, reason="again", at=T + timedelta(days=3)))["accepted_at"] == accepted
+
+
+async def test_a_reopen_waits_for_a_decision_and_starts_the_wait_over(service: HealingCaseService, seed: Seed) -> None:
+    """#658: a reopen dispatches nothing, so the case waits at `tracked` for a
+    person, aged from the reopen, and the re-acceptance is aged from itself —
+    never from the failed attempt's acceptance."""
+    cid = await _open(service, tracker=LINEAR, at=T)
+    issue_id = await seed.issue()
+    await service.attach_job(cid, await seed.job(issue_id), at=T + timedelta(hours=1))
+    await service.record_merge(cid, merge_sha="m1", resolution_path=EMBRY0, at=T + timedelta(hours=2))
+    await service.record_deploy(cid, sha="d1", marker_at=T + timedelta(hours=3))
+    await service.record_verdict(cid, Verdict.NOT_HEALED, evidence={"after": 30})
+
+    reopen_at = T + timedelta(days=2)
+    reopened = await service.reopen(cid, reason="still firing", at=reopen_at)
+    assert reopened["stage"] == Stage.TRACKED, f"a reopen parked the case at {reopened['stage']!r}, not 'tracked'"
+    assert reopened["accepted_at"] is None, "a reopened case kept the failed attempt's accepted_at"
+    assert reopened["tracked_at"] == reopen_at, "the wait for the new decision must start at the reopen"
+    # The ticket and the issue stay linked: the retry runs on them.
+    assert (reopened["tracker_key"], reopened["issue_id"]) == (LINEAR.key, issue_id)
+
+    accepted_again = T + timedelta(days=3)
+    retry = await service.attach_job(cid, await seed.job(issue_id), at=accepted_again)
+    assert (retry["stage"], retry["accepted_at"]) == (Stage.ACCEPTED, accepted_again)
+    assert len((await _detail(service, cid))["jobs"]) == 2
 
 
 async def test_closing_one_of_two_open_prs_holds_the_stage(service: HealingCaseService) -> None:
@@ -565,7 +588,7 @@ async def test_a_redelivered_merge_of_the_failed_attempt_is_not_the_retrys_merge
     ]
     for stale in redeliveries:
         case = await service.record_merge(cid, resolution_path=EMBRY0, **stale)  # type: ignore[arg-type]
-        assert (case["stage"], case["merge_sha"], case["merged_at"]) == (Stage.ACCEPTED, None, None), stale
+        assert (case["stage"], case["merge_sha"], case["merged_at"]) == (Stage.TRACKED, None, None), stale
     # ... and so the failed attempt's deploy, redelivered, anchors nothing.
     case = await service.record_deploy(cid, sha="d1", marker_at=T + timedelta(hours=1), event_key="dep-1-again")
     assert case["deploy_sha"] is None
@@ -573,7 +596,7 @@ async def test_a_redelivered_merge_of_the_failed_attempt_is_not_the_retrys_merge
 
     noted = [e for e in (await _detail(service, cid))["events"] if e["event"] == "merged"][1:]
     assert noted
-    assert all(e["detail"]["effect"] == "noted" and e["to_stage"] == "accepted" for e in noted)
+    assert all(e["detail"]["effect"] == "noted" and e["to_stage"] == "tracked" for e in noted)
     # The real second merge still lands — here with its sha not yet known ...
     case = await service.record_merge(cid, merge_sha=None, resolution_path=EMBRY0, at=T + timedelta(days=2))
     assert (case["stage"], case["merge_sha"]) == (Stage.MERGED, None)
@@ -611,7 +634,7 @@ async def test_a_retry_is_never_judged_from_the_failed_attempts_deploy(service: 
     await service.record_verdict(cid, Verdict.NOT_HEALED, evidence={"after": 30})
 
     reopened = await service.reopen(cid, reason="still firing", at=T + timedelta(hours=12))
-    assert reopened["stage"] == Stage.ACCEPTED
+    assert reopened["stage"] == Stage.TRACKED
     for column in ("merge_sha", "merged_at", "deploy_sha", "deploy_marker_at", "deploy_services", "deployed_at"):
         assert reopened[column] is None, column
     assert not await _fix_deployed(service, cid)
@@ -711,7 +734,7 @@ async def test_not_healed_earns_a_reopen(service: HealingCaseService) -> None:
     await service.record_verdict(cid, Verdict.NOT_HEALED, evidence={"after": 38})
     reopened = await service.reopen(cid, reason="still firing", at=T + timedelta(hours=6))
     assert (reopened["stage"], reopened["healed_verdict"], reopened["resolution_path"]) == (
-        Stage.ACCEPTED,
+        Stage.TRACKED,
         Verdict.PENDING,
         None,
     )
@@ -783,15 +806,19 @@ async def test_abandoning_never_closes_a_case_whose_fix_is_out_there(service: He
 
 
 async def test_abandoning_a_reopened_retry_closes_it(service: HealingCaseService, seed: Seed) -> None:
-    # A `not_healed` verdict sends a case back to `accepted` for another
-    # attempt. Giving up on THAT attempt is an abandon like any other — the
-    # case arrives at the stage backwards, and the close still applies.
+    # A `not_healed` verdict sends a case back to `tracked` for a person to
+    # accept another attempt (#658). Until someone does there is no attempt
+    # to give up; once the retry's job is linked, giving up on THAT attempt is
+    # an abandon like any other.
     cid = await _open(service)
-    await service.attach_job(cid, await seed.job())
+    issue_id = await seed.issue()
+    await service.attach_job(cid, await seed.job(issue_id))
     await service.record_verdict(cid, Verdict.NOT_HEALED, evidence={"occurrences": 12})
     await service.reopen(cid, reason="it came back")
-    assert (await service.get(cid))["stage"] == Stage.ACCEPTED
+    assert (await service.get(cid))["stage"] == Stage.TRACKED
+    assert (await service.abandon(cid, note="the old job"))["stage"] == Stage.TRACKED
 
+    await service.attach_job(cid, await seed.job(issue_id))
     closed = await service.abandon(cid, note="nothing left to try")
     assert (closed["stage"], closed["resolution_path"]) == (Stage.CLOSED, ResolutionPath.ABANDONED)
 

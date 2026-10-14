@@ -304,7 +304,10 @@ async def test_a_reopened_case_is_not_rewound_to_its_first_attempt(
     await service.reopen(case["id"], reason="still firing")
 
     await backfill_watcher_proposals(cases_repo, default_repo=WATCHED)
-    assert (await _case_for(cases_repo, run_id))["stage"] == Stage.ACCEPTED
+    # Nor re-accepted by the replay: a reopened case waits for a person (#658),
+    # and the backfill runs on every restart.
+    stage = (await _case_for(cases_repo, run_id))["stage"]
+    assert stage == Stage.TRACKED, f"a restart's backfill moved a reopened case to {stage!r}"
 
 
 async def test_a_job_that_appears_later_is_linked_on_the_next_pass(

@@ -134,8 +134,12 @@ is the loop finding nothing; `skipped_backlog`, `skipped_analysis_cap`,
 | `embry0_healing_case_events_total` | counter | `event`, `effect` |
 | `embry0_healing_cases_resolved_total` | counter | `resolution_path` |
 
-Age is measured from `<stage>_at`, so a case sent back to an earlier stage
-includes the round trip. `awaiting_verdict` uses `fix_deployed` — the merge
+Age is measured from `<stage>_at`. A case whose PR closed unmerged goes back
+to `accepted` with its first `accepted_at`, so its age there includes the
+round trip. A case a `not_healed` verdict reopens waits at `tracked`, aged
+from the reopen, and its `accepted_at` is cleared: the `accepted` age never
+measures a failed attempt's acceptance, and a reopened case is not in it
+until a person accepts the retry. `awaiting_verdict` uses `fix_deployed` — the merge
 is deployed and the verdict is still `pending` — never the stage.
 `resolved_total{resolution_path="embry0"}` against the rest is the **bypass
 rate**: how often a finding was fixed by someone other than the pipeline.
