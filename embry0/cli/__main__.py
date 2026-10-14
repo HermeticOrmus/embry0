@@ -824,6 +824,14 @@ def cmd_init(args: argparse.Namespace) -> None:
     _info("    the pipeline picks it up from there.")
 
 
+def cmd_records(args: argparse.Namespace) -> None:
+    """Handle ``embry0 records`` — a thin client of the repo records API."""
+    from embry0.cli.records import RecordsApi, run
+
+    base = args.api_url or os.environ.get("EMBRY0_API_URL") or "http://localhost:8200"
+    sys.exit(run(args, RecordsApi(base, _resolve_api_key(args.api_key))))
+
+
 # ── Argparse ─────────────────────────────────────────────────────────────────
 
 
@@ -980,6 +988,40 @@ def main() -> None:
         help="Bearer key (default: EMBRY0_API_KEY / API_KEY env, then ./.env)",
     )
 
+    # records
+    records_p = subparsers.add_parser(
+        "records",
+        help="Repo records: Markdown documents stored in embry0 per repo (RCAs, audits, runbooks)",
+    )
+    records_sub = records_p.add_subparsers(dest="action", required=True)
+    rec_list = records_sub.add_parser("list", help="List a repo's records, newest first")
+    rec_list.add_argument("--kind", default=None, help="Only this kind (rca, audit, spec, plan, spike, runbook, note)")
+    rec_list.add_argument("--query", default=None, help="Case-insensitive substring of title or body")
+    rec_list.add_argument("--json", action="store_true", help="Print JSON")
+    rec_get = records_sub.add_parser("get", help="Print one record's Markdown body")
+    rec_get.add_argument("slug")
+    rec_get.add_argument("--revision", type=int, default=None, help="An older revision (default: current)")
+    rec_get.add_argument("--json", action="store_true", help="Print the whole record as JSON")
+    rec_put = records_sub.add_parser("put", help="Create a record or add a revision from a Markdown file")
+    rec_put.add_argument("slug")
+    rec_put.add_argument("--kind", required=True, help="rca, audit, spec, plan, spike, runbook or note")
+    rec_put.add_argument("--file", required=True, help="Markdown file to store, or - for stdin")
+    rec_put.add_argument("--title", default=None, help="Title (default: the first '# ' heading)")
+    rec_imp = records_sub.add_parser(
+        "import",
+        help="Import a directory of Markdown files, one record per file (idempotent)",
+    )
+    rec_imp.add_argument("directory")
+    rec_imp.add_argument("--dry-run", action="store_true", help="Show what would be written; write nothing")
+    for sub in (rec_list, rec_get, rec_put, rec_imp):
+        sub.add_argument("--repo", required=True, help="Registered repo: owner/name or group/subgroup/name")
+        sub.add_argument(
+            "--api-url", default=None, help="Orchestrator base URL (default: EMBRY0_API_URL or http://localhost:8200)"
+        )
+        sub.add_argument(
+            "--api-key", default=None, help="Bearer key (default: EMBRY0_API_KEY / API_KEY env, then ./.env)"
+        )
+
     args = parser.parse_args()
 
     commands = {
@@ -996,6 +1038,7 @@ def main() -> None:
         "build-qa-image": cmd_build_qa_image,
         "onboard": cmd_onboard,
         "init": cmd_init,
+        "records": cmd_records,
     }
     commands[args.command](args)
 
