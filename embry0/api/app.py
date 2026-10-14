@@ -38,6 +38,7 @@ from embry0.storage.repositories.qa_run_metadata import QARunMetadataRepository
 from embry0.storage.repositories.qa_volume_state import QAVolumeStateRepository
 from embry0.storage.repositories.repo_preferences import RepoPreferencesRepository
 from embry0.storage.repositories.repo_qa_configs import RepoQAConfigsRepository
+from embry0.storage.repositories.repo_records import RepoRecordsRepository
 from embry0.storage.repositories.repos import ReposRepository
 from embry0.storage.repositories.sandbox_profiles import SandboxProfilesRepository
 from embry0.storage.repositories.traces import TracesRepository
@@ -728,6 +729,7 @@ async def _init_app_state(
     configure_repo_renames(app_config.repo_renames)
     app.state.repos_repo = ReposRepository(db, default_forge=app_config.default_forge)
     app.state.qa_configs_repo = RepoQAConfigsRepository(db, default_forge=app_config.default_forge)
+    app.state.repo_records_repo = RepoRecordsRepository(db)
     app.state.qa_app_results_repo = QAAppResultsRepository(db)
     app.state.qa_image_tags_repo = QAImageTagsRepository(db)
     app.state.qa_volume_state_repo = QAVolumeStateRepository(db)
@@ -2161,6 +2163,7 @@ def _register_routers(app: FastAPI) -> None:
         qa_events,
         qa_images,
         queue,
+        records,
         repo_preferences,
         repos,
         sandbox_profiles,
@@ -2235,6 +2238,8 @@ def _register_routers(app: FastAPI) -> None:
     # RAV-1251: repo registry + unified per-repo detail.
     app.include_router(qa_config.router, prefix="/api/v1", tags=["qa-config"], dependencies=auth_deps)
     app.include_router(bootstrap.router, prefix="/api/v1", tags=["bootstrap"], dependencies=auth_deps)
+    # Repo records: Markdown documents with history, per registered repo.
+    app.include_router(records.router, prefix="/api/v1", tags=["records"], dependencies=auth_deps)
     # MUST come after every router owning a /repos/{repo}/<suffix> route:
     # repos exposes a `{full_repo:path}` catch-all (#162, for GitLab nested
     # subgroups) which would otherwise shadow them. Pinned by

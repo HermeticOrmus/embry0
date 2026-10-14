@@ -167,6 +167,16 @@ async def set_repo_docker_access(full_repo: str, req: RepoDockerAccessRequest, r
 async def delete_repo(full_repo: str, request: Request) -> None:
     """Hard delete: registry row + QA config (CASCADE). Env vars and
     preferences are deliberately untouched — they predate the registry and
-    other repos' rows must never be collateral."""
+    other repos' rows must never be collateral. A repo that still has
+    records is refused (409): deleting it must not take its RCAs with it."""
+    records = await request.app.state.repo_records_repo.count_for_repo(full_repo)
+    if records:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{full_repo} has {records} record(s); delete them first "
+                "(DELETE /repos/<repo>/records/<slug>) or keep the repo registered"
+            ),
+        )
     repos_repo = request.app.state.repos_repo
     await repos_repo.delete(full_repo)
