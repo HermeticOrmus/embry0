@@ -488,3 +488,58 @@ async def test_write_config_accepts_a_nested_repo_path():
     out = await write_config_node(state, {"configurable": {"qa_configs_repo": configs}})
     assert out["onboard"]["final_status"] == "completed"
     assert "acme/group/backend" in configs.rows
+
+
+async def test_analyze_shows_the_agent_this_deployments_profiles(monkeypatch):
+    """The agent cannot know a deployment's profile names; analyze must list them.
+
+    Built on the real SandboxProfilesRepository so a call to a method it does
+    not have fails here as it did in production, where a swallowed
+    AttributeError left the agent guessing a profile name for three rounds.
+    """
+    from embry0.storage.repositories.sandbox_profiles import SandboxProfilesRepository
+    from embry0.workflows.onboard.nodes import analyze_node
+
+    class _Db:
+        async def fetch(self, query, *args):
+            return [
+                {
+                    "name": "qa-external",
+                    "base_image": "embry0-sandbox-qa:latest",
+                    "extra_networks": ["sandbox-internet"],
+                },
+                {"name": "slim", "base_image": "embry0-sandbox:latest", "extra_networks": ["sandbox-internet"]},
+            ]
+
+    class _Defs:
+        def __init__(self, db):
+            pass
+
+        async def get(self, agent_type):
+            return {"agent_type": agent_type}
+
+    prompts: list[str] = []
+
+    async def fake_run_agent_node(**kwargs):
+        prompts.append(kwargs["prompt"])
+        return {"agent_outputs": []}
+
+    monkeypatch.setattr("embry0.storage.repositories.agent_definitions.AgentDefinitionsRepository", _Defs)
+    monkeypatch.setattr("embry0.orchestration.nodes.agent.run_agent_node", fake_run_agent_node)
+
+    await analyze_node(
+        {"job_id": "job-1", "repo": "acme/widgets", "onboard": {"round": 0}},
+        {
+            "configurable": {
+                "agent_runner": object(),
+                "db": object(),
+                "profiles_repo": SandboxProfilesRepository(_Db()),
+            }
+        },
+    )
+
+    assert prompts, "analyze never ran the agent"
+    assert "- qa-external: QA-capable (has browser)" in prompts[0], (
+        f"the agent was not shown this deployment's profiles:\n{prompts[0]}"
+    )
+    assert "- slim: boot-only, NO browser" in prompts[0]
