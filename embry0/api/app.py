@@ -1308,6 +1308,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("context_proxy_service_key_rotation_failed", error=str(exc))
 
+    # Repo records for job agents: the records-proxy reads them with its own
+    # boot-rotated read-scope service key. Unlike the context-proxy there is
+    # no fallback to the master key: without a service key the proxy is not
+    # launched and agents simply get no records tool.
+    records_proxy_key = ""
+    try:
+        records_proxy_key = await ApiKeysRepository(db).rotate_service_key("svc-records-proxy", scope="read")
+        logger.info("records_proxy_service_key_rotated")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("records_proxy_service_key_rotation_failed", error=str(exc))
+
     # Start proxy services. A forge counts as present when the registry or the
     # environment holds any credential for it, so a registry-only deployment
     # still gets its proxies.
@@ -1332,6 +1343,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         context_container_allowlist=config.context_proxy_container_allowlist,
         context_query_quota=config.context_proxy_query_quota,
         log_redaction_fields=config.log_redaction_fields,
+        records_api_key=records_proxy_key,
     )
 
     # #554, #568: a sandbox may reach the proxies just launched and no other

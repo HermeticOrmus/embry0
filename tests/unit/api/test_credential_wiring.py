@@ -211,3 +211,12 @@ def test_xai_refresh_loop_uses_the_registry():
     assert "xai_enabled = False" not in src[disabled : disabled + 400], (
         "a missing CLI credential file must not stop the proxy the registry accounts need"
     )
+
+
+def test_startup_hands_the_records_proxy_its_service_key():
+    """The records-proxy is launched only with records_api_key, an optional argument:
+    a lifespan that stopped passing it would silently leave every agent without records."""
+    src = _src()
+    assert 'rotate_service_key("svc-records-proxy", scope="read")' in src, "no read-scope records service key"
+    [(_, start)] = _call_windows(src, r"await proxy_mgr\.start\(")
+    assert "records_api_key=records_proxy_key" in _top_level(start), start

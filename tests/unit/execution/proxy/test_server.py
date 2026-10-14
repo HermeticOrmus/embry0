@@ -292,3 +292,28 @@ def test_build_app_context_registers_the_redaction_fields(monkeypatch):
     finally:
         redaction.register_redacted_fields([])
     assert out == f"phone={redaction.REDACTED}", out
+
+
+def test_build_app_records_returns_records_app(monkeypatch):
+    monkeypatch.setenv("PROXY_TYPE", "records")
+    monkeypatch.setenv("UPSTREAM_URL", "http://10.0.0.1:8000")
+    monkeypatch.setenv("ORCHESTRATOR_API_KEY", "svc-key")
+    monkeypatch.setenv("PROXY_ADMIN_TOKEN", "admin-secret")
+    app = server.build_app_from_env()
+    routes = [r.resource.canonical for r in app.router.routes() if r.resource is not None]
+    assert "/records" in routes and "/records/{slug}" in routes
+
+
+def test_build_app_records_refuses_without_a_key(monkeypatch):
+    monkeypatch.setenv("PROXY_TYPE", "records")
+    monkeypatch.setenv("UPSTREAM_URL", "http://10.0.0.1:8000")
+    monkeypatch.delenv("ORCHESTRATOR_API_KEY", raising=False)
+    monkeypatch.setenv("PROXY_ADMIN_TOKEN", "admin-secret")
+    with pytest.raises(ValueError, match="ORCHESTRATOR_API_KEY"):
+        server.build_app_from_env()
+
+
+def test_listen_port_records_default(monkeypatch):
+    monkeypatch.delenv("LISTEN_PORT", raising=False)
+    monkeypatch.setenv("PROXY_TYPE", "records")
+    assert server.listen_port_from_env() == 9108

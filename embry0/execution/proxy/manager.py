@@ -20,6 +20,10 @@ host-side IPs of minio and orchestrator):
   RAV-1140: mediated read-only log drill-down for watcher analysis jobs. Holds
   the orchestrator API key and enforces container allowlist + query quota.
   Enrollment is per-job opt-in via enroll_context(), NOT the broadcast.
+- records-proxy → forwards to host orchestrator:8000 (GET /api/v1/repos/<repo>/records),
+  read-only repo records for the agents of the job's own repository. The
+  repository comes from each enrollment's ``allowed_repos``, never from the
+  request. Rides the enroll_sandbox broadcast, fail-open.
 
 The per-job embry0 API proxy (CreateIssue / RequestInput / UpdateStatus)
 is deferred — it has DB coupling that needs separate rework. Workflow
@@ -51,6 +55,8 @@ from embry0.execution.proxy.git_scope import (
     normalize_push_branch,
     normalize_upstream,
 )
+from embry0.execution.proxy.records_proxy import SCOPE_FIELD as RECORDS_SCOPE_FIELD
+from embry0.execution.proxy.records_proxy import normalize_records_repo
 
 logger = structlog.get_logger(__name__)
 
@@ -72,6 +78,7 @@ _PROXY_CONTAINER_NAMES: tuple[str, ...] = (
     "minio-proxy",
     "presign-proxy",
     "context-proxy",
+    "records-proxy",
 )
 
 # Connection failures only. A name conflict or a permission error will not
@@ -200,6 +207,9 @@ class ProxyManager:
         self.minio_proxy_url: str = ""
         self.presign_proxy_url: str = ""
         self.context_proxy_url: str = ""
+        self.records_proxy_url: str = ""
+        # sandbox_id -> the repository the records-proxy CONFIRMED it may read.
+        self._records_repo_by_id: dict[str, str] = {}
 
     async def start(
         self,
@@ -217,6 +227,7 @@ class ProxyManager:
         log_redaction_fields: str = "",
         has_github_credential: bool | None = None,
         has_gitlab_credential: bool | None = None,
+        records_api_key: str = "",
     ) -> None:
         """Start the credential proxies as DinD containers.
 
@@ -228,6 +239,10 @@ class ProxyManager:
         Idempotent: any pre-existing containers with the same names are removed first.
 
         ``has_*_credential`` come from the credential registry; None falls back to the token arguments.
+
+        ``records_api_key`` is the read-scope service key the records-proxy
+        presents upstream. Empty: the records-proxy is not launched, and job
+        agents get no records tool.
         """
         if self._http is None:
             self._http = aiohttp.ClientSession()
@@ -402,6 +417,26 @@ class ProxyManager:
             logger.info("context_proxy_started", allowlist=allowlist)
         elif enable_context_proxy:
             logger.info("context_proxy_skipped", reason="CONTEXT_PROXY_CONTAINER_ALLOWLIST is empty")
+
+        # Repo records for job agents (docs/records.md). Only with the
+        # read-scope service key: the master key never leaves the orchestrator.
+        self._records_repo_by_id.clear()
+        if records_api_key:
+            await self._launch(
+                name="records-proxy",
+                env={
+                    "PROXY_TYPE": "records",
+                    "UPSTREAM_URL": _resolve_backend_url("orchestrator", 8000),
+                    "ORCHESTRATOR_API_KEY": records_api_key,
+                    "LISTEN_PORT": "9108",
+                    "PROXY_ADMIN_TOKEN": self._proxy_admin_token,
+                },
+                attach_internet=True,
+            )
+            self.records_proxy_url = "http://records-proxy:9108"
+            logger.info("records_proxy_started")
+        else:
+            logger.warning("records_proxy_skipped", reason="no records service key")
 
         # Only leftovers we did not just launch. A name in ``_launched`` is the
         # live shared proxy; the sweep must not remove it.
@@ -593,6 +628,8 @@ class ProxyManager:
             if name == "git-proxy":
                 await self._confirm_git_grant(port, sandbox_id, git_grant, response)
 
+        await self._enroll_records(sandbox_id, sandbox_token, repo)
+
         if xai_credential_id:
             logger.info("sandbox_xai_credential", sandbox_id=sandbox_id, credential_id=xai_credential_id)
         logger.info(
@@ -601,6 +638,61 @@ class ProxyManager:
             proxies=[t[0] for t in targets],
         )
         return sandbox_token
+
+    async def _enroll_records(self, sandbox_id: str, sandbox_token: str, repo: str | None) -> None:
+        """Enroll the sandbox with the records-proxy for ``repo``'s records. Never raises.
+
+        Records are context, not a credential: a job ran without them before,
+        so a records-proxy that is down, refuses, or does not echo the scope
+        (an image older than the records-proxy) costs the job its records
+        tool and nothing else. A proxy that answered without the scope is
+        unenrolled again, so it serves nothing to this sandbox.
+        """
+        self._records_repo_by_id.pop(sandbox_id, None)
+        if not self.records_proxy_url:
+            return
+        normalized = normalize_records_repo(repo) if repo else None
+        if repo and normalized is None:
+            logger.warning("records_proxy_scope_repo_invalid", repo=repo[:200])
+        scope = [normalized] if normalized else []
+        body = {
+            "sandbox_id": sandbox_id,
+            "sandbox_token": sandbox_token,
+            "ttl_seconds": self._enroll_ttl_seconds,
+            RECORDS_SCOPE_FIELD: scope,
+        }
+        try:
+            response = await self._exec_admin_request(
+                container="records-proxy", method="POST", path="/admin/enroll", port=9108, body=body
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-open, see the docstring
+            logger.warning("records_proxy_enroll_failed", sandbox_id=sandbox_id, error=str(exc))
+            return
+        granted = response.get(RECORDS_SCOPE_FIELD) if isinstance(response, dict) else None
+        if granted != scope:
+            logger.error(
+                "records_proxy_scope_unconfirmed",
+                sandbox_id=sandbox_id,
+                detail="the records-proxy did not confirm the repository scope; rebuild the proxy image",
+            )
+            try:
+                await self._exec_admin_request(
+                    container="records-proxy",
+                    method="DELETE",
+                    path=f"/admin/enroll/{sandbox_id}",
+                    port=9108,
+                    body=None,
+                    accept_404=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — the TTL is the backstop
+                logger.warning("records_proxy_unenroll_failed", sandbox_id=sandbox_id, error=str(exc))
+            return
+        if normalized:
+            self._records_repo_by_id[sandbox_id] = normalized
+
+    def records_access(self, sandbox_id: str) -> bool:
+        """Whether the records-proxy confirmed ``sandbox_id`` may read its repository's records."""
+        return sandbox_id in self._records_repo_by_id
 
     @staticmethod
     def _repo_scope(proxy: str, repo: str | None, forge: str | None) -> list[str] | None:
@@ -827,6 +919,9 @@ class ProxyManager:
             # accept_404 tolerates the common never-enrolled case, and a
             # watcher-enrolled sandbox must be revoked with the rest.
             targets.append(("context-proxy", 9107))
+        if self.records_proxy_url:
+            targets.append(("records-proxy", 9108))
+        self._records_repo_by_id.pop(sandbox_id, None)
 
         for name, port in targets:
             for attempt in range(3):
@@ -1121,6 +1216,8 @@ class ProxyManager:
         self.minio_proxy_url = ""
         self.presign_proxy_url = ""
         self.context_proxy_url = ""
+        self.records_proxy_url = ""
+        self._records_repo_by_id.clear()
         session = self._http
         self._http = None
         if session is not None:

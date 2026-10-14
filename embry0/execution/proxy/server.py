@@ -12,10 +12,12 @@ Dispatches to one of the stateless proxy apps based on PROXY_TYPE env:
 - context -> context_proxy.create_context_proxy_app(UPSTREAM_URL, ORCHESTRATOR_API_KEY,
              PROXY_ADMIN_TOKEN, CONTAINER_ALLOWLIST, QUERY_QUOTA)  # RAV-1140
              (LOG_REDACTION_FIELDS: payload fields its redaction also removes, #294)
+- records -> records_proxy.create_records_proxy_app(UPSTREAM_URL, ORCHESTRATOR_API_KEY,
+             PROXY_ADMIN_TOKEN)  # read-only repo records, scoped per enrollment
 
 Listens on 0.0.0.0:LISTEN_PORT (default depends on proxy type).
 PROXY_ADMIN_TOKEN must be set for credential-injection proxies (git/github/auth)
-and for the context proxy (per-sandbox enrollment); the network-plumbing proxies
+and for the context and records proxies (per-sandbox enrollment); the network-plumbing proxies
 (minio/presign) do not require it.
 """
 
@@ -33,6 +35,7 @@ from embry0.execution.proxy.git_proxy import create_git_proxy_app
 from embry0.execution.proxy.github_proxy import create_github_proxy_app
 from embry0.execution.proxy.minio_proxy import create_minio_proxy_app
 from embry0.execution.proxy.presign_proxy import create_presign_proxy_app
+from embry0.execution.proxy.records_proxy import create_records_proxy_app
 from embry0.execution.proxy.xai_proxy import create_xai_proxy_app
 from embry0.execution.tls import build_ssl_context
 from embry0.safety.redaction import register_redacted_fields
@@ -47,8 +50,9 @@ DEFAULT_PORTS = {
     "minio": 9100,
     "presign": 9104,
     "context": 9107,
-    # 9105 and 9108+ are free; 9100/9101/9103/9104/9106/9107 are taken.
     "gitlab": 9105,
+    "records": 9108,
+    # 9109+ are free; 9100/9101/9103-9108 are taken.
 }
 
 
@@ -160,6 +164,16 @@ def build_app_from_env() -> web.Application:
             admin_token,
             allowlist,
             quota,
+        )
+
+    if proxy_type == "records":
+        # Unlike the context proxy, no key means no proxy: ProxyManager never
+        # launches it without the read-scope service key, and the master key
+        # is never a fallback.
+        return create_records_proxy_app(
+            _require_env("UPSTREAM_URL"),
+            _require_env("ORCHESTRATOR_API_KEY"),
+            admin_token,
         )
 
     msg = f"Unknown PROXY_TYPE: {proxy_type!r}"
