@@ -336,6 +336,19 @@ docker images --format "{{.Repository}}:{{.Tag}}" \
 
 ### Start
 
+The sandbox isolation chain needs the `br_netfilter` kernel module on the
+host: without it iptables in DinD does not see traffic between containers on
+one bridge, the orchestrator logs `sandbox_isolation_unavailable`, and it
+refuses to create any sandbox. The example cloud-init loads it; on a host
+provisioned some other way, load it now and at every boot:
+
+```bash
+sudo modprobe br_netfilter
+echo br_netfilter | sudo tee /etc/modules-load.d/br_netfilter.conf
+```
+
+Then start the stack:
+
 ```bash
 docker compose up -d
 docker compose ps -a --format "{{.Service}}\t{{.State}}\t{{.Status}}"
@@ -346,18 +359,18 @@ initialisers (`registry-auth-init`, `init-sandbox-networks`, `init-push-images`)
 `exited (0)`. A non-zero exit from `init-push-images` means a profile image is
 missing — go back to pass 1.
 
-**Startup errors that resolve themselves.** In the first seconds the
-orchestrator logs `proxy_image_missing_in_dind` and `docker_cmd_failed` for
-`embry0-egress-helper`. It is checking for images before Docker-in-Docker has
-pulled them from the in-stack registry and built the egress helper. (The
-sandbox image it pulls itself when DinD lacks it, so
-`sandbox_image_unavailable_no_build_context` means the registry lacks it too,
-and is a real error, #622.) Judge health
-from a *recent* window rather than the whole log:
+**A fresh start logs no errors.** The images Docker-in-Docker does not hold
+yet are pulled from the in-stack registry, and the egress helper is built;
+their absence is logged at debug, not as an error (#655). So an error at
+startup is real: `proxy_image_missing_in_dind` or
+`sandbox_image_unavailable_no_build_context` means the registry lacks that
+image too (#622), and `sandbox_isolation_unavailable` means `br_netfilter` is
+not loaded (above).
 
 ```bash
-docker compose logs --since 45s orchestrator 2>&1 | grep -c '"level": "error"'   # expect 0
-curl -sS localhost:8200/api/v1/health/ready                                      # {"status": "ok"}
+docker compose logs orchestrator 2>&1 | grep -c '"level": "error"'   # expect 0
+docker exec embry0-dind iptables -L EMBRY0-SANDBOX-ISOLATION -n | head -3   # the chain exists
+curl -sS localhost:8200/api/v1/health/ready                          # {"status": "ok"}
 ```
 
 Migrations run automatically at orchestrator startup — there is no manual step.

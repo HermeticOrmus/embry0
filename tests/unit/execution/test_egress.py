@@ -198,6 +198,31 @@ async def test_ensure_helper_image_skips_build_when_present():
     assert "image" in docker.run_cmd.await_args.args[0]
 
 
+@pytest.mark.asyncio
+async def test_a_fresh_daemon_without_the_helper_image_logs_no_error():
+    """#655: on a fresh host the helper image does not exist yet, so the probe's
+    "No such image" is the normal first-run answer, not an error to heal."""
+    from unittest.mock import patch
+
+    from structlog.testing import capture_logs
+
+    from embry0.execution.docker_client import DockerClient
+
+    def _proc(rc: int, err: bytes) -> AsyncMock:
+        process = AsyncMock()
+        process.communicate = AsyncMock(return_value=(b"", err))
+        process.returncode = rc
+        return process
+
+    probe, build = _proc(1, b"Error response from daemon: No such image: x\n"), _proc(0, b"")
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, side_effect=[probe, build]):
+        with capture_logs() as logs:
+            await EgressEnforcer(DockerClient()).ensure_helper_image()
+
+    errors = [entry for entry in logs if entry["log_level"] == "error"]
+    assert not errors, f"an absent helper image must not log at error: {errors}"
+
+
 # ---------------------------------------------------------------------------
 # the shared proxy chain (#568), on the fake filter table
 # ---------------------------------------------------------------------------

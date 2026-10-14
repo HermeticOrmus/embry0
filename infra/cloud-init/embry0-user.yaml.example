@@ -23,7 +23,15 @@ packages:
   - git
   - curl
   - ca-certificates
+# The sandbox isolation chain needs br_netfilter: without it iptables in DinD
+# does not see traffic between containers on one bridge, and embry0 refuses
+# to create any sandbox. Loaded now and at every boot.
+write_files:
+  - path: /etc/modules-load.d/br_netfilter.conf
+    content: |
+      br_netfilter
 runcmd:
+  - modprobe br_netfilter
   - systemctl enable --now qemu-guest-agent
   - systemctl enable --now docker
   - systemctl enable --now prometheus-node-exporter
