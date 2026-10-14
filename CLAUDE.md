@@ -32,11 +32,11 @@ So:
 .venv/bin/python -m pytest tests/unit -q
 ```
 
-A clean checkout with **`TEST_DATABASE_URL` unset** and no Postgres on the default `postgresql://embry0:embry0@localhost:5432/embry0_test` gives **9 failed, 50 errors and about 850 skipped** (`ConnectionRefused`). About 800 of those skips are database tests reporting `PostgreSQL unavailable`: they measured nothing. That is the expected floor for a bare local run — anything beyond it is yours. Confirm by running the same suite on `origin/main` and diffing the failure sets.
+A clean checkout with **`TEST_DATABASE_URL` unset** and no Postgres on the default `postgresql://embry0:embry0@localhost:5432/embry0_test` gives **9 failed, 52 errors and about 945 skipped** (`ConnectionRefused`). About 930 of those skips are database tests reporting `PostgreSQL unavailable`: they measured nothing. That is the expected floor for a bare local run — anything beyond it is yours. Confirm by running the same suite on `origin/main` and diffing the failure sets.
 
 **Set `TEST_DATABASE_URL` and an unreachable database fails instead of skipping** (#509, one helper: `tests/fixtures/postgres.py`): pointed at a dead port the run reports about 880 errors and 14 skips, so a misconfigured or slow database can never pass as a green run with the SQL layer silently skipped. Any run that is meant to test SQL, and every CI run, sets it.
 
-**Given a database, the suite is fully green: 9129 passed, 12 skipped, 0 failed** (measured 2026-10-09 on `main` at `226135ec`; the 9 failed, 50 errors floor was re-measured the same day). So those 9 failures and 50 errors are entirely the missing-Postgres condition, not latent breakage — which also means CI (#272) needs a Postgres service container, not test repairs.
+**Given a database, the suite is fully green: 9938 passed, 13 skipped, 0 failed** (measured 2026-10-14 on `main`; the 9 failed, 52 errors floor was re-measured the same day). So those 9 failures and 52 errors are entirely the missing-Postgres condition, not latent breakage — which also means CI (#272) needs a Postgres service container, not test repairs.
 
 `db_with_migrations` runs `DROP SCHEMA public CASCADE` per test, so point the suite at a **throwaway Postgres**, never a deployment's database. One server on tmpfs with `fsync` off serves any number of runs, each in a database of its own:
 
@@ -145,4 +145,6 @@ The five canonical roles, unmodified: `needs-triage`, `needs-info`, `ready-for-a
 
 Single-context: `docs/glossary.md` (the one glossary — used in place of a root `CONTEXT.md`) and `docs/adr/`. See `docs/agents/domain.md`.
 
-Internal material — audits, RCAs, design specs, implementation plans, and anything that names a customer, deployment, person, host, cost or job id — goes under `internal/`, which the public export drops; the README in that directory says what goes where. Specs and plans from the superpowers skills go in `internal/superpowers/specs/` and `internal/superpowers/plans/`, not the skills' default `docs/superpowers/`.
+**A spec or plan ships with the work it describes.** Specs and plans from the superpowers skills go in `docs/superpowers/specs/` and `docs/superpowers/plans/`, committed on the feature branch next to the code, so they arrive in the same pull request. A spec never gets a pull request of its own.
+
+This repository is public, so nothing that names a customer, deployment, person, host, cost or job id enters it: audits, RCAs and anything else of that kind stay in the deployment's own private records. A spec written for one deployment is that kind of document. The name-denylist CI check refuses a tree that carries a listed name.

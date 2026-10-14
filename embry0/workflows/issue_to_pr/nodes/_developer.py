@@ -252,6 +252,10 @@ def _build_developer_full_prompt(
     prompt_parts.append("2. Implement the changes")
     prompt_parts.append("3. Write or update tests")
     prompt_parts.append("4. Commit your changes")
+    prompt_parts.append(
+        "   If you write a design spec or plan, commit it on this branch with the code it describes: "
+        "it ships in this pull request, never in one of its own."
+    )
     prompt_parts.append(f"5. Push to branch {branch_name}" if existing_pr_url else "5. Push the branch")
     prompt_parts.append(
         f"   The git remote accepts pushes to {branch_name} only. It refuses any other branch or tag, "
