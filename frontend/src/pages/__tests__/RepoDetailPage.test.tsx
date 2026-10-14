@@ -98,6 +98,7 @@ describe("RepoDetailPage (RAV-1253)", () => {
       "href",
       "/environments?repo=acme%2Fwidgets",
     );
+    expect(screen.getByTestId("repo-records-link")).toHaveAttribute("href", "/records?repo=acme%2Fwidgets");
   });
 
   it("masks secret env values and links runs", async () => {

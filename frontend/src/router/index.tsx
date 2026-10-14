@@ -31,6 +31,7 @@ const QaRepoFlakePage = lazy(() => import("../pages/QaRepoFlakePage").then(m => 
 const QaRepoConfigPage = lazy(() => import("../pages/QaRepoConfigPage").then(m => ({ default: m.QaRepoConfigPage })));
 const OnboardRepoPage = lazy(() => import("../pages/OnboardRepoPage").then(m => ({ default: m.OnboardRepoPage })));
 const ReposPage = lazy(() => import("../pages/ReposPage").then(m => ({ default: m.ReposPage })));
+const RecordsPage = lazy(() => import("../pages/RecordsPage").then(m => ({ default: m.RecordsPage })));
 const RepoDetailPage = lazy(() => import("../pages/RepoDetailPage").then(m => ({ default: m.RepoDetailPage })));
 const ProvidersPage = lazy(() => import("../pages/ProvidersPage").then(m => ({ default: m.ProvidersPage })));
 const WatcherPage = lazy(() => import("../pages/WatcherPage").then(m => ({ default: m.WatcherPage })));
@@ -69,6 +70,7 @@ export const router = createBrowserRouter([
       { path: "qa/repos/:repo", element: <ErrorBoundary inline><Suspense fallback={fallback}><QaRepoDetailPage /></Suspense></ErrorBoundary> },
       { path: "repos", element: <ErrorBoundary inline><Suspense fallback={fallback}><ReposPage /></Suspense></ErrorBoundary> },
       { path: "repos/onboard", element: <ErrorBoundary inline><Suspense fallback={fallback}><OnboardRepoPage /></Suspense></ErrorBoundary> },
+      { path: "records", element: <ErrorBoundary inline><Suspense fallback={fallback}><RecordsPage /></Suspense></ErrorBoundary> },
       { path: "repos/*", element: <ErrorBoundary inline><Suspense fallback={fallback}><RepoDetailPage /></Suspense></ErrorBoundary> },
       { path: "qa/runs/:runId", element: <ErrorBoundary inline><Suspense fallback={fallback}><QaRunDetailPage /></Suspense></ErrorBoundary> },
       { path: "qa/runs/:runId/affected", element: <ErrorBoundary inline><Suspense fallback={fallback}><QaAffectedSetPage /></Suspense></ErrorBoundary> },

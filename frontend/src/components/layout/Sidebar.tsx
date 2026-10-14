@@ -5,6 +5,7 @@ import {
   Container,
   Cpu,
   Eye,
+  FileText,
   FolderGit2,
   Gauge,
   KeyRound,
@@ -67,6 +68,8 @@ const NAV_GROUPS: readonly NavGroup[] = [
       { path: "/pipelines", label: "Pipelines", icon: Workflow },
       // RAV-1301: central registry + token-discovered Add-repo flow.
       { path: "/repos", label: "Repos", icon: FolderGit2 },
+      // Repo records: per-repository documents with revision history.
+      { path: "/records", label: "Records", icon: FileText },
       { path: "/qa/repos", label: "QA", icon: ShieldCheck },
     ],
   },

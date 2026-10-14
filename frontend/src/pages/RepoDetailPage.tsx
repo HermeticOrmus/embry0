@@ -1,6 +1,6 @@
 import { Link, useParams } from "react-router";
 import { useQuery } from "@tanstack/react-query";
-import { FileCode2, KeyRound, ListChecks, Settings2, ShieldAlert } from "lucide-react";
+import { FileCode2, FileText, KeyRound, ListChecks, Settings2, ShieldAlert } from "lucide-react";
 import { fetchRepoDetail } from "@/api/repos";
 import { useRepoEnv } from "@/hooks/useEnvironments";
 import { useQaRunsForRepo } from "@/hooks/useQaDashboard";
@@ -69,6 +69,23 @@ export function RepoDetailPage() {
           </p>
         )}
       </div>
+
+      <section className="space-y-2">
+        <div className="flex items-center gap-2">
+          <FileText className="h-4 w-4 text-white/50" />
+          <h2 className="text-lg font-semibold">Records</h2>
+        </div>
+        <p className="text-sm text-white/60">
+          RCAs, audits, specs, plans and runbooks kept for this repo.{" "}
+          <Link
+            to={`/records?repo=${encodeURIComponent(full)}`}
+            className="text-cyan-400 hover:underline"
+            data-testid="repo-records-link"
+          >
+            Open records
+          </Link>
+        </p>
+      </section>
 
       <section className="space-y-2">
         <div className="flex items-center gap-2">
