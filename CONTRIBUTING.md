@@ -17,7 +17,7 @@ Tests that need Postgres connect to `TEST_DATABASE_URL` (default `postgresql://e
 
 Optional: `uv tool install pre-commit && pre-commit install` runs ruff and some basic file checks on each commit ([.pre-commit-config.yaml](.pre-commit-config.yaml)).
 
-Frontend (Node 20+):
+Frontend (Node 22.13+):
 
 ```bash
 cd frontend

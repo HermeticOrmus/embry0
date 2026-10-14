@@ -41,7 +41,7 @@ export function TabsList({ children, className }: { children: ReactNode; classNa
     );
     const idx = triggers.indexOf(document.activeElement as HTMLButtonElement);
     if (idx === -1) return;
-    let next = idx;
+    let next: number;
     if (e.key === "ArrowRight" || e.key === "ArrowDown") {
       next = (idx + 1) % triggers.length;
       e.preventDefault();
