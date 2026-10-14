@@ -205,6 +205,13 @@ The PUT replaces every field it does not mention — except `verification`
 (the orchestrator-run test gate and tier path rules, `docs/verification.md`):
 omitted or `null` keeps the stored value, `{}` clears it.
 
+## Repo records
+
+Per-repo Markdown documents with revision history (RCAs, audits, runbooks)
+under `/api/v1/repos/{repo}/records`: list, get (current or `?revision=N`),
+`/revisions`, `PUT` to create or revise, `DELETE` (admin). Full reference,
+tiers and the importer: [`docs/records.md`](records.md).
+
 ## Docker access (admin)
 
 A sandbox profile with `dind_enabled` only *asks* for the shared Docker daemon

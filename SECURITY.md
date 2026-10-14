@@ -42,7 +42,7 @@ Target-repository code is an asset too. It is cloned only inside a sandbox and d
 | **Read and merge keys** | Reading; a merge key may also decide merge approvals, accept watcher findings and answer agent questions. | Every other mutation is refused. |
 | **Issue authors and repository content** | Nothing. Whoever can put the trigger label on an issue starts a job whose task is that issue's text, and the repository's code, tests and dependencies run in the sandbox. | Everything they influence runs inside a sandbox. |
 | **The sandbox**: the agent, and every process it or the repository starts | Nothing. Treated as hostile code. | Ring 1, the proxies' enrollment and scope, the egress drop and sandbox isolation, the reserved environment variables. |
-| **The proxies** (`git-proxy`, `github-proxy`, `gitlab-proxy`, `auth-proxy`, `xai-proxy`, `context-proxy`, `minio-proxy`, `presign-proxy`) | The credentials they inject. | Reached by sandboxes on the `sandbox-restricted` network; every credential proxy authenticates each request by its per-sandbox enrollment. |
+| **The proxies** (`git-proxy`, `github-proxy`, `gitlab-proxy`, `auth-proxy`, `xai-proxy`, `context-proxy`, `records-proxy`, `minio-proxy`, `presign-proxy`) | The credentials they inject. | Reached by sandboxes on the `sandbox-restricted` network; every credential proxy authenticates each request by its per-sandbox enrollment. |
 | **DinD** | Every proxy and every sandbox. It runs privileged. | Its daemon is reachable only with its TLS client certificates: the orchestrator's, and those of a sandbox granted Docker access. |
 | **The rootless sandbox daemon** (`AGENT_RUNTIME=rootless`, instead of DinD) | Every proxy and every sandbox. It runs as an unprivileged account, in its own user and network namespaces. | Its unix socket only, mode 0660, mounted into the orchestrator; no sandbox is ever given it. The orchestrator refuses to start unless the daemon reports rootless. |
 | **The in-stack registry** | The proxy and sandbox images DinD runs. | A login, and digest pins ([below](#the-in-stack-image-registry)). |
@@ -60,6 +60,7 @@ Target-repository code is an asset too. It is cloned only inside a sandbox and d
 | `github-proxy`, `gitlab-proxy` | the forge token | read calls on the job's repository |
 | `xai-proxy` | the xAI subscription token | grok model calls |
 | `context-proxy` | a service-scoped orchestrator API key | log queries, for jobs enrolled for them (opt-in) |
+| `records-proxy` | a read-scope service key | read-only [repo records](docs/records.md) of the job's own repository; the repository comes from the enrollment, never from the request |
 | `auth-proxy` | an Anthropic API key | nothing: only with `AUTH_PROXY_ENABLED`, and no sandbox uses it |
 | `minio-proxy`, `presign-proxy` | no credential | QA artifact uploads and presigned-URL refreshes |
 

@@ -115,6 +115,7 @@ Open the dashboard at **http://localhost:8200** and sign in with your `API_KEY`.
 | [Onboarding a repo](docs/onboarding.md) | `embry0 init` (new projects) and `embry0 onboard` (existing repos) — zero-to-pipeline in one command |
 | [Running QA](docs/running-qa.md) | Integrating a target repo, `qa.yaml`, gotchas, triggering and watching runs |
 | [`qa.yaml` v2 reference](docs/qa-yaml-reference.md) | Field-by-field schema reference with monorepo examples |
+| [Repo records](docs/records.md) | Per-repo RCAs, audits and runbooks kept in embry0 instead of git: CLI, API, import, what agents read |
 | [Webhook setup](docs/webhooks.md) | Cloudflare Tunnel (production) and smee.io relay (local dev) |
 | [Glossary](docs/glossary.md) | Domain vocabulary |
 | [Decision records](docs/adr/) | ADRs — the decisions the codebase embodies and the evidence behind them |

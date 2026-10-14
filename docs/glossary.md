@@ -37,6 +37,9 @@ One account embry0 acts as: a forge token (GitHub or GitLab), an LLM OAuth token
 ### Binding
 The link from a scope — a repo, an owner or group, a [forge](#forge) host, or the whole deployment — to a [credential](#credential) for one role (`forge`, `llm`, `deploy`). The resolver walks repo, owner, host, global, then the environment. A `pinned` LLM binding never falls back to the pool. (2026-09)
 
+### Record
+A Markdown document about one registered repository that embry0 stores itself and never in a git tree: an RCA, audit, spec, plan, spike, runbook or note, addressed by `(repo, slug)`, with every revision kept (`repo_records`, `repo_record_revisions`). Operators write records; the agents of a job read their own repository's records through the `records-proxy`. See [`docs/records.md`](records.md). (2026-10)
+
 ### Pool
 The global-scope LLM bindings of one provider. A job with no repo or owner binding takes the first `ok` member by priority, then least recently used. Quarantine removes a member until its `quarantined_until` passes or an operator clears it. (2026-09)
 
