@@ -83,18 +83,33 @@ _CAP_PREDICATE = """
     )
 """
 
-# A watcher draft a human has not answered yet: _CAP_PREDICATE without its age
-# window and repo, with the stages inlined so it composes with list_page's own
-# numbered filters. The window is dropped for the reason reconcile drops it —
-# a draft that aged out of the cap is still waiting for its answer. A test
-# holds this and the cap count to the same rows inside the window.
+# How many times a case was sent back for another fix attempt (#451).
+_REOPENS = "(SELECT COUNT(*) FROM healing_case_events e WHERE e.case_id = c.id AND e.event = 'reopened')"
+
+# A watcher finding a human has not answered yet: _CAP_PREDICATE without its
+# age window and repo, with the stages inlined so it composes with list_page's
+# own numbered filters, plus one kind of case the cap does not count. The
+# window is dropped for the reason reconcile drops it — a draft that aged out
+# of the cap is still waiting for its answer. A test holds this and the cap
+# count to the same drafts inside the window.
+#
+# The extra kind: a case a `not_healed` verdict sent back to `tracked` (#658)
+# waits for a person to accept the retry or close it, but holds no draft slot.
+# Its draft was answered once — that acceptance released the watcher run — and
+# the watcher filed nothing new, so it is a question for a person without
+# being a draft that limits the watcher's filing. Only a reopen leaves a case
+# at `tracked` after an acceptance, so "reopened and at a cap stage" is exactly
+# "sent back and not accepted again".
 _AWAITING_DECISION = f"""(
     c.origin = 'watcher'
     AND c.tracker_key IS NOT NULL
     AND c.stage IN ({", ".join(f"'{stage}'" for stage in CAP_STAGES)})
-    AND NOT EXISTS (
-        SELECT 1 FROM watcher_runs w
-        WHERE w.id = c.watcher_run_id AND w.released_at IS NOT NULL
+    AND (
+        NOT EXISTS (
+            SELECT 1 FROM watcher_runs w
+            WHERE w.id = c.watcher_run_id AND w.released_at IS NOT NULL
+        )
+        OR {_REOPENS} > 0
     )
 )"""
 
@@ -104,9 +119,6 @@ _FIX_DEPLOYED = (
     "(c.merge_sha IS NOT NULL AND c.merged_at IS NOT NULL AND c.deployed_at IS NOT NULL"
     " AND c.deployed_at >= c.merged_at)"
 )
-
-# How many times a case was sent back for another fix attempt (#451).
-_REOPENS = "(SELECT COUNT(*) FROM healing_case_events e WHERE e.case_id = c.id AND e.event = 'reopened')"
 
 # The PR that stands for a case in a one-line view: the merged one, else the
 # newest open one, else the newest.
@@ -587,10 +599,12 @@ class HealingCasesRepository:
     ) -> tuple[list[dict[str, Any]], int]:
         """One keyset page, newest first. Returns ``(page, total matching the filters)``.
 
-        ``awaiting_decision`` keeps only watcher drafts nobody has accepted or
-        rejected (``_AWAITING_DECISION``) — not ``stage = 'tracked'``, which
-        also holds a human's ticket mid-dispatch and a draft whose ticket was
-        finished or deleted in its tracker.
+        ``awaiting_decision`` keeps only watcher findings waiting for a
+        person's answer (``_AWAITING_DECISION``): drafts nobody has accepted
+        or rejected, and cases a ``not_healed`` verdict sent back for a retry
+        nobody has accepted yet. Not ``stage = 'tracked'``, which also holds a
+        human's ticket mid-dispatch and a draft whose ticket was finished or
+        deleted in its tracker.
 
         ``after`` is the ``(created_at, id)`` of the last row of the previous
         page. ``(created_at, id)`` is a total order, so pages never repeat or
@@ -650,8 +664,10 @@ class HealingCasesRepository:
 
         ``open``: open cases per (stage, origin). ``oldest_age_seconds``: per
         stage, how long the longest-waiting open case has been in it, measured
-        from ``<stage>_at`` (a case sent back to an earlier stage keeps that
-        stage's first timestamp, so its age there includes the round trip).
+        from ``<stage>_at`` (a case whose PR closed unmerged goes back to
+        ``accepted`` with its first timestamp, so its age there includes the
+        round trip; a reopen restarts the wait: it stamps ``tracked_at`` and
+        clears ``accepted_at``, so a re-acceptance is aged from itself).
         ``awaiting_verdict``: open cases with a deployed fix and no verdict
         yet. ``closed``: closed cases per resolution path.
         """
@@ -827,7 +843,7 @@ class HealingCasesRepository:
         """
         rows = await self._db.fetch(
             f"""
-            SELECT c.id, c.repo, c.title, c.signature_id, c.signature, c.tracker, c.tracker_key,
+            SELECT c.id, c.repo, c.title, c.signature_id, c.signature, c.signature_source, c.tracker, c.tracker_key,
                    c.tracker_url, c.stage, c.merge_sha, c.merged_at, c.deployed_at,
                    c.deploy_sha, c.deploy_marker_at, c.healed_verdict, c.occurrence_count,
                    {_REOPENS} AS reopens

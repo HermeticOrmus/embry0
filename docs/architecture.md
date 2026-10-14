@@ -1091,6 +1091,7 @@ erDiagram
         string fixability
         int occurrence_count "with last_seen_at"
         string signature_id "FK-ready for log_signatures (#289)"
+        string signature_source "evidence | fallback: how the watcher chose signature_id (#657)"
         string watcher_run_id FK
         string tracker_key "with tracker + tracker_url; one OPEN case per ticket"
         string issue_id FK

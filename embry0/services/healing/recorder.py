@@ -102,6 +102,7 @@ class CaseRecorder:
         tracker: TrackerRef | None,
         signature_id: str | None = None,
         signature: str | None = None,
+        signature_source: str | None = None,
         parent_case_id: str | None = None,
     ) -> str | None:
         """The watcher analysed a window to a proposal. With ``tracker`` the
@@ -110,8 +111,10 @@ class CaseRecorder:
 
         ``signature_id`` is #290's deterministic dedup key: the clustered log
         line the finding is about, stable across however the model happened to
-        word the title. ``parent_case_id`` links a regression back to the
-        closed case that carried the same signature.
+        word the title. ``signature_source`` says whether that line is one
+        the proposal's evidence quotes or only the window's loudest (#657).
+        ``parent_case_id`` links a regression back to the closed case that
+        carried the same signature.
         """
 
         async def write() -> CaseResult:
@@ -122,6 +125,7 @@ class CaseRecorder:
                 fingerprint=fingerprint,
                 signature_id=signature_id,
                 signature=signature,
+                signature_source=signature_source,
                 parent_case_id=parent_case_id,
                 severity=severity,
                 watcher_run_id=watcher_run_id,

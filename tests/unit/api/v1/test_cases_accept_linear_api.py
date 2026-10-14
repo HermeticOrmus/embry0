@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -630,3 +630,74 @@ async def test_a_merge_scope_key_accepts_a_linear_draft_of_an_enabled_stack_only
         app.state.config.auth_dev_mode = True
         app.state.config.api_key = ""
         bust_api_key_cache()
+
+
+# ---- #658: a case a not_healed verdict sent back ----------------------------
+
+
+async def _fix_that_did_not_heal(app: Any, cases: HealingCaseService, case_id: str, accepted: dict[str, Any]) -> None:
+    """The accepted job's PR merged and deployed and the error kept firing:
+    what merge sync, the deploy marker and the confirm sweep leave behind."""
+    pr = f"https://github.com/{REPO}/pull/9"
+    await app.state.jobs_repo.update(accepted["job_id"], status="running")
+    await app.state.jobs_repo.update(accepted["job_id"], status="completed", pr_url=pr)
+    await app.state.jobs_repo.update(accepted["job_id"], status="pr_merged")
+    await app.state.issues_repo.update(accepted["issue_id"], status="closed")
+    now = datetime.now(UTC)
+    await cases.record_merge(case_id, merge_sha="m1", resolution_path="embry0", pr_url=pr, at=now - timedelta(hours=7))
+    await cases.record_deploy(case_id, sha="d1", marker_at=now - timedelta(hours=6))
+    await cases.record_verdict(case_id, "not_healed", evidence={"seen_since_deploy": True})
+    await cases.reopen(case_id, reason="not_healed after the deploy of d1: retry 1 of 1")
+
+
+@pytest.mark.asyncio
+async def test_accepting_a_reopened_linear_case_dispatches_the_retry_on_its_issue(
+    api_client: AsyncClient, wired: dict[str, Any]
+) -> None:
+    """The ticket is finished and its issue's job delivered a merged PR, so
+    the Linear trigger path refuses it — rightly, for a label. Accepting the
+    case is the person's "try again": a new job on the failed attempt's
+    issue, and the ticket is not touched."""
+    app, linear = wired["app"], wired["linear"]
+    case_id = await _draft(wired["cases"])
+    first = await _accept(api_client, case_id)
+    await _fix_that_did_not_heal(app, wired["cases"], case_id, first)
+    linear.state_type = "completed"
+    mutations, comments = list(linear.mutations), list(linear.comments)
+
+    r = await api_client.post(f"/api/v1/cases/{case_id}/accept", json={"accepted_by": "Alex"})
+
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["issue_id"] == first["issue_id"], "the retry must run on the failed attempt's issue"
+    assert body["job_id"] and body["job_id"] != first["job_id"]
+    jobs = {job["job_id"]: job for job in await _jobs(app)}
+    assert set(jobs) == {first["job_id"], body["job_id"]}
+    assert jobs[body["job_id"]]["issue_id"] == first["issue_id"] and jobs[body["job_id"]]["dispatched_by"] == "Alex"
+    detail = (await api_client.get(f"/api/v1/cases/{case_id}")).json()
+    assert detail["stage"] == "accepted", detail["stage"]
+    assert [job["job_id"] for job in detail["jobs"]] == [first["job_id"], body["job_id"]]
+    assert (linear.mutations, linear.comments) == (mutations, comments), "the retry wrote to the ticket"
+
+
+@pytest.mark.asyncio
+async def test_a_label_on_a_reopened_cases_ticket_starts_nothing_by_itself(
+    api_client: AsyncClient, wired: dict[str, Any]
+) -> None:
+    """The retry is a person's decision on the case. A label — or the
+    reconciler's sweep, which takes the same decision — still refuses
+    delivered work, so a trigger label left on the ticket can never start
+    the retry unasked, and the case keeps waiting."""
+    app, linear = wired["app"], wired["linear"]
+    case_id = await _draft(wired["cases"])
+    first = await _accept(api_client, case_id)
+    await _fix_that_did_not_heal(app, wired["cases"], case_id, first)
+    linear_sync._OWN_LABELS.clear()
+    linear.apply_label_by_hand()
+
+    delivered = await api_client.post("/api/v1/webhook/linear", json=linear.label_webhook())
+
+    assert delivered.status_code == 200, delivered.text
+    assert delivered.json().get("skip") == "dedupe:work_delivered", delivered.json()
+    assert [job["job_id"] for job in await _jobs(app)] == [first["job_id"]]
+    assert await _stage(api_client, case_id) == "tracked"

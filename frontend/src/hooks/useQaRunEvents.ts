@@ -43,7 +43,7 @@ export function useQaRunEvents(runId: string | undefined): void {
         es = new EventSource(url, { withCredentials: false });
 
         es.onmessage = (ev: MessageEvent) => {
-          let event: { type?: string } = {};
+          let event: { type?: string };
           try {
             event = JSON.parse(ev.data) as { type?: string };
           } catch {

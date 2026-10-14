@@ -21,9 +21,14 @@ Three properties worth keeping:
 
 A ``not_healed`` verdict earns the case another fix attempt (#451): after
 judging, the sweep reopens every ``not_healed`` case that has been reopened
-fewer than ``MAX_NOT_HEALED_RETRIES`` times, sending it back to ``accepted``.
-A verdict that finds the budget spent says so in its evidence and on the
-ticket, and the case stays ``verified`` for a person to decide.
+fewer than ``MAX_NOT_HEALED_RETRIES`` times, sending it back to ``tracked``
+(#658). The attempt is offered, not started: the case waits there for a
+person to accept it again — which dispatches the new fix job — or to close
+it. Not ``accepted``, which means a job should be starting and is watched
+by a critical alert, and not an automatic dispatch: a verdict can be wrong
+about which error it measured, and a retry is paid for. A verdict that
+finds the budget spent says so in its evidence and on the ticket, and the
+case stays ``verified`` for a person to decide.
 """
 
 from __future__ import annotations
@@ -34,15 +39,17 @@ from typing import Any, Protocol
 import structlog
 
 from embry0.services.healing.confirm import Judgement, Readiness, judge, plan_verification
-from embry0.services.healing.lifecycle import Verdict
+from embry0.services.healing.lifecycle import Stage, Verdict
 from embry0.services.loop_schedule import seconds_until_next_run
 
 logger = structlog.get_logger(__name__)
 
 #: A not-healed verdict earns the case this many further fix attempts
-#: (``reopen``) before a human is asked — the plan's "one retry, then human".
-#: Counted from the case's own history (its ``reopened`` events) rather than
-#: kept in memory, so a restart does not reset it (#451).
+#: (``reopen``) — the plan's "one retry, then human". Each one is offered to a
+#: person, who accepts it to dispatch the fix (#658); past the budget the case
+#: stays ``verified`` and the person decides what else to do. Counted from the
+#: case's own history (its ``reopened`` events) rather than kept in memory, so
+#: a restart does not reset it (#451).
 MAX_NOT_HEALED_RETRIES = 1
 
 
@@ -132,7 +139,8 @@ class ConfirmHealedSweep:
         return tally
 
     async def _reopen_not_healed(self, repo: str | None) -> int:
-        """Send every ``not_healed`` case with retries left back to ``accepted``.
+        """Send every ``not_healed`` case with retries left back to ``tracked``,
+        where it waits for a person to accept the retry (#658).
 
         A separate pass, not a step of ``_judge_case``: it also picks up a
         case whose verdict was recorded before this existed, or by a pass
@@ -162,15 +170,15 @@ class ConfirmHealedSweep:
             except Exception:
                 logger.warning("confirm_healed_reopen_failed", case_id=case_id, exc_info=True)
                 continue
-            if str((result or {}).get("stage")) != "accepted":
+            if str((result or {}).get("stage")) != Stage.TRACKED:
                 continue
             reopened += 1
             logger.info("confirm_healed_reopened", case_id=case_id, attempt=attempt, limit=MAX_NOT_HEALED_RETRIES)
             await self._post(
                 case,
-                f"**🔁 Sent back for another fix attempt** — retry {attempt} of {MAX_NOT_HEALED_RETRIES}."
-                f" The fix deployed in {case.get('deploy_sha') or 'unknown sha'} did not stop the error,"
-                f" so the case is accepted again and waits for a new fix.\n\n"
+                f"**🔁 Back for a decision** — retry {attempt} of {MAX_NOT_HEALED_RETRIES}."
+                f" The fix deployed in {case.get('deploy_sha') or 'unknown sha'} did not stop the error."
+                " Nothing has been dispatched: accept the case again to start a new fix attempt, or close it.\n\n"
                 f"<sub>embry0 confirm-healed (#451) · case `{case_id}`</sub>",
             )
         return reopened
@@ -218,6 +226,7 @@ class ConfirmHealedSweep:
             plan=plan,
             last_seen_at=last_seen,
             deployed_at=deployed_at,
+            signature_source=case.get("signature_source"),
         )
 
         # Keyed on the deploy anchor and the verdict, so a second sweep over

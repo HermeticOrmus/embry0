@@ -14,7 +14,8 @@ in one transaction. How the data lands follows the transition's effect:
 
 * ``APPLIED``    — the stage changes; the call's data replaces what was
   there and ``<stage>_at`` is stamped (a move BACK to a stage keeps the
-  first stamp, so funnel timings survive a closed PR or a retry).
+  first stamp, so funnel timings survive a closed PR; a reopen restarts
+  the wait and writes its own).
 * ``REPEAT``     — a redelivery. Values that differ are written, except the
   call's *sticky* columns (a merge's sha and resolution path, a deploy's
   anchor): those are only ever filled, never replaced. A redelivery that
@@ -68,6 +69,7 @@ from embry0.services.healing.lifecycle import (
     Effect,
     Origin,
     ResolutionPath,
+    SignatureSource,
     Stage,
     Verdict,
     transition,
@@ -242,6 +244,7 @@ class HealingCaseService:
         title: str,
         signature: str | None = None,
         signature_id: str | None = None,
+        signature_source: SignatureSource | str | None = None,
         fingerprint: str | None = None,
         severity: str | None = None,
         fixability: str | None = None,
@@ -260,10 +263,13 @@ class HealingCaseService:
         ``parent_case_id`` unless the caller names a different parent.
         ``signature`` is a query (LogQL), not log output; it will be
         executed, so one longer than ``MAX_SIGNATURE`` is refused, never
-        truncated. Timestamps on every write must be timezone-aware and not
-        in the future (``MAX_CLOCK_SKEW`` tolerated).
+        truncated. ``signature_source`` says how the watcher chose
+        ``signature_id`` (#657); confirm-healed answers ``inconclusive`` for
+        a ``fallback`` one. Timestamps on every write must be timezone-aware
+        and not in the future (``MAX_CLOCK_SKEW`` tolerated).
         """
         origin = Origin(origin)
+        source = SignatureSource(signature_source) if signature_source is not None else None
         if signature is not None and len(signature) > MAX_SIGNATURE:
             raise ValueError(
                 f"signature is {len(signature)} characters (limit {MAX_SIGNATURE}): it is executed as a query, "
@@ -286,6 +292,7 @@ class HealingCaseService:
             "fixability": _cap("fixability", fixability),
             "signature": signature,
             "signature_id": signature_id,
+            "signature_source": source.value if source is not None else None,
             "fingerprint": fingerprint,
             "occurrence_count": 1,
             "last_seen_at": when,
@@ -746,13 +753,26 @@ class HealingCaseService:
     async def reopen(
         self, case_id: str, *, reason: str, at: datetime | None = None, event_key: str | None = None
     ) -> CaseResult:
-        """Send a ``not_healed`` case back for another fix attempt.
+        """Send a ``not_healed`` case back for a person to decide on another
+        fix attempt.
+
+        The case returns to ``tracked``, not ``accepted`` (#658). This write
+        dispatches nothing, and ``accepted`` means a job should be starting:
+        it is the stage the accepted-case dead-man alert watches. Accepting
+        the case again dispatches the retry, and that job's link accepts it
+        as the first one did.
 
         The row then describes the NEW attempt: verdict, resolution, merge
         and deploy anchor are all cleared, so nothing can judge the retry
         from the failed attempt's deploy (``fix_deployed`` is false until the
-        retry's own deploy lands). The failed attempt stays in the history
-        and its PRs keep their rows. A regression after close is a new case
+        retry's own deploy lands). ``accepted_at`` is cleared too, so no age
+        is ever measured from the failed attempt's acceptance, and
+        ``tracked_at`` becomes the reopen: the wait for the new decision
+        starts here. The ticket and the issue stay linked. ``verified_at`` is
+        kept: the startup backfill leaves a judged case alone, and would
+        otherwise replay the failed attempt's job and re-accept the case on
+        every restart. The failed attempt stays in the history and its PRs
+        keep their rows. A regression after close is a new case
         (``open_case`` on the same ticket, or with ``parent_case_id``), not a
         reopen.
         """
@@ -769,7 +789,8 @@ class HealingCaseService:
                 )
             if transition(case.row["stage"], CaseEvent.REOPENED).effect is not Effect.APPLIED:
                 return CaseResult(case.row, WriteOutcome.UNCHANGED)
-            fields: dict[str, Any] = {"healed_verdict": Verdict.PENDING.value}
+            when = at or datetime.now(UTC)
+            fields: dict[str, Any] = {"healed_verdict": Verdict.PENDING.value, "tracked_at": when}
             cleared = (
                 "verdict_evidence",
                 "verdict_checked_at",
@@ -778,9 +799,10 @@ class HealingCaseService:
                 "merged_at",
                 *_DEPLOY_COLUMNS,
                 "deployed_at",
+                "accepted_at",
             )
             return await self._apply(
-                case, CaseEvent.REOPENED, fields, at, detail={"reason": reason}, clears=cleared, delivery=delivery
+                case, CaseEvent.REOPENED, fields, when, detail={"reason": reason}, clears=cleared, delivery=delivery
             )
 
     async def abandon(

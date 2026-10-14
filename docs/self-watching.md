@@ -277,6 +277,41 @@ entry that labels through the GitLab client and dispatches through
 `gitlab_sync`; until then a GitLab draft answers `409` and is accepted by
 its label.
 
+### A finding sent back by a `not_healed` verdict
+
+When an accepted finding's fix ships and the confirm-healed sweep still sees
+its error after the deploy, the verdict is `not_healed` and the sweep
+reopens the case, once per case (`MAX_NOT_HEALED_RETRIES`). The reopen
+dispatches nothing. The case goes back to `tracked`, the ticket is told,
+and the retry waits for a person, as the first attempt did:
+
+- It is listed by `awaiting_decision` (the Proposals list, and
+  `case_list(awaiting_decision=true)`). It holds no slot of the watcher's
+  draft cap: its draft was answered once, and the watcher filed nothing new.
+- Its age in `tracked` starts at the reopen, and the failed attempt's
+  `accepted_at` is cleared.
+- Accepting it through this route starts a new job on the issue the failed
+  attempt ran on, whatever the tracker. That issue was closed when the
+  attempt's PR merged; it is reopened and dispatched like a retry from the
+  dashboard, and the ticket is not touched. The job's link accepts the case.
+- `POST /api/v1/cases/{case_id}/close` settles it instead.
+
+The tracker's own trigger does not start a retry: a label never repeats
+delivered work, so a trigger label left on the ticket, or a reconciler
+sweep, cannot dispatch it unasked. A GitHub issue a person reopens and
+labels again is the exception, because reopening it there is the same
+decision.
+
+Why not straight back to `accepted`: that stage means a job should be
+starting, and `Embry0HealingAcceptedCaseNotDispatched` pages on a case that
+waits there. Why not an automatic dispatch: the sweep is a ledger write by
+design, and a verdict that measured the wrong error would pay for a fix of
+the wrong thing.
+
+Refusals specific to a retry: `409` when the issue was `cancelled` (a person
+stopped it) or a job is already on it, and `502` when the dispatch failed
+(the issue is left `open`; accept again).
+
 ### What the narrow key can do
 
 The `403` is the point of the design. The route is on the merge-scope

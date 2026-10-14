@@ -2572,6 +2572,24 @@ MIGRATIONS: list[tuple[int, str, str]] = [
         ALTER TABLE qa_app_results DROP COLUMN IF EXISTS trace_url;
         """,
     ),
+    (
+        94,
+        "healing_cases.signature_source — how the watcher chose a case's signature (#657)",
+        # #290 anchored every watcher case to the window's loudest cluster,
+        # whatever the proposal was about; #657 anchors it to a cluster the
+        # proposal's own evidence quotes and falls back to the loudest only
+        # when nothing does. Confirm-healed must tell the two apart, because a
+        # fallback signature says nothing about whether this case's fix
+        # worked. NULL: not a watcher anchor, or opened before this column.
+        # The vocabulary is SignatureSource in services/healing/lifecycle.py.
+        """
+        ALTER TABLE healing_cases ADD COLUMN IF NOT EXISTS signature_source TEXT
+            CHECK (signature_source IN ('evidence', 'fallback'));
+
+        COMMENT ON COLUMN healing_cases.signature_source IS
+            '#657: how the watcher chose signature_id. evidence = a window cluster the proposal quotes; fallback = nothing it quotes is in the window, so the window''s loudest line (confirm-healed answers inconclusive). NULL = not a watcher anchor, or opened before #657.';
+        """,
+    ),
 ]
 
 

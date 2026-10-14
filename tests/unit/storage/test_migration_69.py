@@ -5,7 +5,7 @@ import re
 import asyncpg
 import pytest
 
-from embry0.services.healing.lifecycle import ResolutionPath, Stage, Verdict
+from embry0.services.healing.lifecycle import ResolutionPath, SignatureSource, Stage, Verdict
 from embry0.storage.database import DatabasePool
 from embry0.storage.migrations.runner import MIGRATIONS
 
@@ -40,7 +40,12 @@ def test_migrations_stay_gapless() -> None:
 
 @pytest.mark.parametrize(
     ("column", "vocabulary"),
-    [("stage", Stage), ("resolution_path", ResolutionPath), ("healed_verdict", Verdict)],
+    [
+        ("stage", Stage),
+        ("resolution_path", ResolutionPath),
+        ("healed_verdict", Verdict),
+        ("signature_source", SignatureSource),
+    ],
 )
 def test_check_constraints_match_the_lifecycle_vocabulary(column: str, vocabulary: type) -> None:
     assert _check_values(column) == {member.value for member in vocabulary}

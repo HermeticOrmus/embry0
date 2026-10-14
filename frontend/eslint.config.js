@@ -18,7 +18,13 @@ export default tseslint.config(
       "react-refresh": reactRefresh,
     },
     rules: {
-      ...reactHooks.configs.recommended.rules,
+      // eslint 10 needs eslint-plugin-react-hooks 7, whose recommended
+      // preset adds the React Compiler rules (set-state-in-effect, refs,
+      // purity and others) to these two. They flag existing components and
+      // are a change of their own, so this keeps the two rules, at the same
+      // levels, that the preset held before.
+      "react-hooks/rules-of-hooks": "error",
+      "react-hooks/exhaustive-deps": "warn",
       "react-refresh/only-export-components": [
         "warn",
         { allowConstantExport: true },
@@ -27,6 +33,17 @@ export default tseslint.config(
         "error",
         { varsIgnorePattern: "^_", argsIgnorePattern: "^_", caughtErrorsIgnorePattern: "^_" },
       ],
+    },
+  },
+  {
+    // The router module declares its lazy() page components next to the
+    // router it exports, so Fast Refresh reloads the page when it changes.
+    // That is all it needs: each page lives in its own file, which Fast
+    // Refresh does swap. eslint-plugin-react-refresh 0.5 counts lazy()
+    // results as components and would flag every route here.
+    files: ["src/router/index.tsx"],
+    rules: {
+      "react-refresh/only-export-components": "off",
     },
   }
 );

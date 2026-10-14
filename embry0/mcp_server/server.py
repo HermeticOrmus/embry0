@@ -513,7 +513,8 @@ async def case_list(
     (pending|healed|not_healed|inconclusive|regressed), fix_deployed (true/false — use
     THIS, not stage=verified, to find findings a shipped fix healed), awaiting_decision
     (use THIS for "what needs a decision?": watcher drafts with a ticket that nobody has
-    accepted or rejected), open_only (every case whose stage is not closed — that
+    accepted or rejected, and findings whose shipped fix did not heal them, sent back
+    for a retry nobody has accepted yet), open_only (every case whose stage is not closed — that
     includes merged, deployed and verified cases, alerts and findings with no ticket, so
     it answers neither "what is open on the dashboard?", which is
     issue_list(status="open"), nor "what needs a decision?"). limit max 200."""
@@ -549,7 +550,9 @@ async def case_accept(case_id: str, accepted_by: str, confirm: bool = False) -> 
     Works for a GitHub draft and for a Linear draft. For a Linear draft embry0 puts the
     trigger label on the ticket itself and then dispatches it, so the ticket shows the
     acceptance; nobody needs to label it by hand. A GitLab draft is still accepted by
-    adding the label in GitLab (409 here).
+    adding the label in GitLab (409 here). A finding whose fix did not heal it and that
+    was sent back for a retry is accepted the same way, whatever its tracker: the retry
+    runs on the issue of the failed attempt, and the ticket is not touched.
 
     embry0 refuses (409/403) anything that is not a watcher finding at stage "tracked"
     on a stack this orchestrator watches, and a Linear ticket that cannot take a job

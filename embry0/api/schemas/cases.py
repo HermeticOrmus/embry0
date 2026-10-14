@@ -82,6 +82,9 @@ class CaseResponse(BaseModel):
     last_seen_at: datetime | None = None
     signature: str | None = None
     signature_id: str | None = None
+    # How the watcher chose signature_id (#657): "evidence" (a line the
+    # proposal quotes), "fallback" (the window's loudest line), or None.
+    signature_source: str | None = None
     fingerprint: str | None = None
     watcher_run_id: str | None = None
     tracker: CaseTracker | None = None
@@ -127,6 +130,8 @@ class CaseResponse(BaseModel):
                     "updated_at",
                 )
             },
+            # .get: a row built by hand (tests, older fixtures) may not carry it.
+            "signature_source": row.get("signature_source"),
             "tracker": (
                 CaseTracker(kind=row["tracker"], key=row["tracker_key"], url=row["tracker_url"])
                 if row["tracker"]

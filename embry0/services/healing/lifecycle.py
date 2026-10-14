@@ -41,7 +41,12 @@ merge takes a ``tracked`` case straight to ``merged``. The rules:
   because the acceptance still stands and a stalled pipeline is exactly what
   the accepted-case dead-man alert is for (#410).
 * ``reopened`` is the other way back, and only from ``verified`` — a
-  ``not_healed`` verdict earns the case another fix attempt.
+  ``not_healed`` verdict earns the case another fix attempt. It lands on
+  ``tracked``, not ``accepted`` (#658): the reopen dispatches nothing, so
+  the retry waits for a person's yes exactly as the first attempt did, and
+  ``accepted`` keeps meaning "a job should be starting" — the stage the
+  accepted-case dead-man alert watches. Accepting the case again is an
+  ordinary ``accepted``.
 * ``closed`` is terminal but not deaf: whatever still arrives (a cancelled
   ticket fixed out of band weeks later) lands as ``POST_CLOSE`` — history
   only, the case itself frozen. Only ``reopened`` is refused: a regression
@@ -112,6 +117,21 @@ class Verdict(StrEnum):
     REGRESSED = "regressed"
 
 
+class SignatureSource(StrEnum):
+    """How the watcher chose a case's ``signature_id`` (#657).
+
+    NULL on a case the watcher did not anchor: other origins, cases with no
+    signature, and every case opened before this was recorded.
+    """
+
+    # A window cluster the proposal's own evidence quotes.
+    EVIDENCE = "evidence"
+    # Nothing the proposal quotes is a line of the window: the window's
+    # loudest line (#290's rule), which says nothing about this finding, so
+    # confirm-healed answers ``inconclusive`` for it.
+    FALLBACK = "fallback"
+
+
 class Effect(StrEnum):
     """How an event landed on a case."""
 
@@ -130,7 +150,8 @@ class Transition:
     # a LATE event still dates ``<target>_at`` when nothing else has.
     target: Stage | None = None
     # The case moved to an EARLIER stage (pr_closed, reopened): the first
-    # <stage>_at is kept then, so funnel timings survive a retry.
+    # <stage>_at is kept then, so funnel timings survive a closed PR. A
+    # reopen writes its own `tracked_at` (the service's call, not this one's).
     backward: bool = False
 
 
@@ -207,9 +228,9 @@ def transition(
 
     if event is CaseEvent.REOPENED:
         if stage is Stage.VERIFIED:
-            return Transition(Stage.ACCEPTED, Effect.APPLIED, backward=True)
-        if stage is Stage.ACCEPTED:
-            return Transition(Stage.ACCEPTED, Effect.REPEAT)
+            return Transition(Stage.TRACKED, Effect.APPLIED, backward=True)
+        if stage is Stage.TRACKED:
+            return Transition(Stage.TRACKED, Effect.REPEAT)
         raise IllegalTransitionError(stage, event)
 
     if event is CaseEvent.PR_CLOSED:
