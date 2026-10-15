@@ -293,7 +293,9 @@ class EgressEnforcer:
         """Build the iptables helper image on the DinD daemon if absent."""
         base = self._docker._build_base_cmd()  # noqa: SLF001
         try:
-            await self._docker.run_cmd([*base, "image", "inspect", self._helper_image], timeout=15)
+            await self._docker.run_cmd(
+                [*base, "image", "inspect", self._helper_image], timeout=15, expected_failure=True
+            )
             return
         except Exception:  # noqa: BLE001 — absent image is the normal first-run case
             pass
